@@ -1234,6 +1234,24 @@ def check_mtf_alignment(
     return True, ""
 
 
+_INTERVAL_CATEGORY = {
+    "1m":  "Scalp", "3m":  "Scalp",  "5m":  "Scalp",  "15m": "Scalp",
+    "30m": "Intraday", "1h": "Intraday", "2h": "Intraday",
+    "4h": "Swing",  "6h": "Swing",   "8h": "Swing",
+    "12h": "Swing",  "1d": "Swing",
+}
+
+_CATEGORY_EMOJI = {
+    "Scalp":    "\u26a1",   # ⚡
+    "Intraday": "\U0001f4c6",  # 📆
+    "Swing":    "\U0001f4c8",  # 📈
+}
+
+
+def signal_category(interval: str) -> str:
+    return _INTERVAL_CATEGORY.get(interval, "Diger")
+
+
 def format_signal_message(signal: dict, interval: str) -> str:
     dt = signal["close_time"]
     if isinstance(dt, pd.Timestamp):
@@ -1241,8 +1259,10 @@ def format_signal_message(signal: dict, interval: str) -> str:
     else:
         dt_str = str(dt)
 
+    cat = signal_category(interval)
+    cat_emoji = _CATEGORY_EMOJI.get(cat, "\U0001f4cc")
     return (
-        "*Kripto Sinyal*\n"
+        f"*{cat_emoji} {cat} Sinyali*\n"
         f"Sembol: *{signal['symbol']}*\n"
         f"Yon: *{signal['side']}*\n"
         f"Zaman Dilimi: *{interval}*\n"
@@ -1389,6 +1409,158 @@ def send_telegram(bot_token: str, chat_id: str, text: str) -> None:
     r.raise_for_status()
 
 
+# ---------------------------------------------------------------------------
+# Telegram komut dinleyici (/status, /durum, /yardim)
+# ---------------------------------------------------------------------------
+
+_tg_update_offset: int = 0
+
+
+def format_portfolio_status(paper_trader: "PaperTrader", last_prices: dict) -> str:
+    """Tum acik paper pozisyonlari ve portfoy ozetini Markdown olarak dondurur."""
+    balance_change_pct = (
+        (paper_trader.balance - paper_trader.initial_balance)
+        / paper_trader.initial_balance
+        * 100
+    )
+    win_rate = (
+        (paper_trader.wins / paper_trader.total_trades * 100)
+        if paper_trader.total_trades > 0
+        else 0.0
+    )
+
+    lines = [
+        "\U0001f4ca *Portfoy Durumu*",
+        f"\U0001f4b0 Bakiye: `{paper_trader.balance:.2f}` USDT ({balance_change_pct:+.1f}%)",
+        (
+            f"\U0001f4c8 Toplam: {paper_trader.total_trades} islem | "
+            f"Kazanc: {paper_trader.wins} | Kayip: {paper_trader.losses} | "
+            f"WR: *{win_rate:.1f}%*"
+        ),
+        f"\U0001f4c9 Max Drawdown: `{paper_trader.max_drawdown_pct:.2f}%`",
+    ]
+
+    open_pos = list(paper_trader.open_positions.items())
+    if not open_pos:
+        lines.append("\n_Acik pozisyon yok._")
+    else:
+        lines.append(f"\n\U0001f513 *Acik Pozisyonlar* ({len(open_pos)})")
+        now_utc = datetime.now(timezone.utc)
+
+        # Pozisyonlari kategoriye gore grupla: Scalp → Intraday → Swing → Diger
+        def _pos_sort_key(item: tuple) -> tuple:
+            key, pos = item
+            parts = key.rsplit("_", 1)
+            iv = parts[1] if len(parts) == 2 else "?"
+            cat_order = {"Scalp": 0, "Intraday": 1, "Swing": 2, "Diger": 3}
+            return (cat_order.get(signal_category(iv), 3), pos.side, pos.symbol)
+
+        open_pos.sort(key=_pos_sort_key)
+
+        prev_cat = None
+        for i, (key, pos) in enumerate(open_pos, 1):
+            parts = key.rsplit("_", 1)
+            iv = parts[1] if len(parts) == 2 else "?"
+            cat = signal_category(iv)
+            if cat != prev_cat:
+                cat_emoji = _CATEGORY_EMOJI.get(cat, "\U0001f4cc")
+                lines.append(f"\n{cat_emoji} *{cat}*")
+                prev_cat = cat
+
+            yon_emoji = "\U0001f7e2" if pos.side == "LONG" else "\U0001f534"
+            lines.append(f"\n{i}. {yon_emoji} *{pos.symbol}* {pos.side} [{iv}]")
+            lines.append(
+                f"   Giris: `{pos.entry:.6g}` | TP: `{pos.take_profit:.6g}` | SL: `{pos.stop_loss:.6g}`"
+            )
+
+            cur_price = last_prices.get(pos.symbol)
+            if cur_price is not None:
+                if pos.side == "LONG":
+                    upnl_pct = (cur_price - pos.entry) / pos.entry * 100
+                    tp_dist = (pos.take_profit - cur_price) / cur_price * 100
+                    sl_dist = (cur_price - pos.stop_loss) / cur_price * 100
+                else:
+                    upnl_pct = (pos.entry - cur_price) / pos.entry * 100
+                    tp_dist = (cur_price - pos.take_profit) / cur_price * 100
+                    sl_dist = (pos.stop_loss - cur_price) / cur_price * 100
+
+                profit_emoji = "\U0001f49a" if upnl_pct >= 0 else "\u2764\ufe0f"
+                lines.append(
+                    f"   Su An: `{cur_price:.6g}` | {profit_emoji} Kar: `{upnl_pct:+.2f}%`"
+                )
+                lines.append(f"   TP'ye: `{tp_dist:.2f}%` | SL'ye: `{sl_dist:.2f}%`")
+            else:
+                lines.append("   _(fiyat henuz taranmadi)_")
+
+            # Pozisyon suresi
+            try:
+                opened_dt = pos.opened_at
+                if hasattr(opened_dt, "tz_convert"):
+                    opened_dt = opened_dt.tz_convert(timezone.utc).to_pydatetime()
+                elif hasattr(opened_dt, "tzinfo") and opened_dt.tzinfo is None:
+                    opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+                total_min = int((now_utc - opened_dt).total_seconds() // 60)
+                h, m = divmod(total_min, 60)
+                dur_str = f"{h}s {m}dk" if h > 0 else f"{m}dk"
+                lines.append(f"   \u23f1 Sure: {dur_str}")
+            except Exception:
+                pass
+
+    return "\n".join(lines)
+
+
+def poll_telegram_commands(
+    cfg: "Config",
+    paper_trader: "PaperTrader | None",
+    last_prices: dict,
+) -> None:
+    """getUpdates ile Telegram komutlarini oku; /status ve /yardim'a yanitla."""
+    global _tg_update_offset
+    if not cfg.telegram_bot_token or not cfg.telegram_chat_id:
+        return
+
+    url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/getUpdates"
+    try:
+        resp = requests.get(
+            url,
+            params={"offset": _tg_update_offset, "limit": 20, "timeout": 0},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        updates = resp.json().get("result", [])
+    except Exception as exc:
+        print(f"[WARN] Telegram getUpdates hatasi: {exc}")
+        return
+
+    for upd in updates:
+        _tg_update_offset = upd["update_id"] + 1
+        msg = upd.get("message") or upd.get("edited_message")
+        if not msg:
+            continue
+
+        text = msg.get("text", "").strip().lower().split()[0] if msg.get("text") else ""
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+        if chat_id != cfg.telegram_chat_id:
+            continue  # baska bir chatin mesajini yoksay
+
+        if text in ("/status", "/durum"):
+            if paper_trader is not None:
+                reply = format_portfolio_status(paper_trader, last_prices)
+            else:
+                reply = "Paper Trade kapali. Portfoy takibi aktif degil."
+            send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, reply)
+            print("[CMD] /status komutu yanitlandi")
+
+        elif text in ("/yardim", "/help"):
+            reply = (
+                "*Bot Komutlari*\n"
+                "/status ya da /durum \u2014 Acik pozisyonlar + portfoy ozeti\n"
+                "/yardim \u2014 Bu yardim mesaji"
+            )
+            send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, reply)
+            print("[CMD] /yardim komutu yanitlandi")
+
+
 def main() -> None:
     cfg = load_config()
     symbols_to_scan = resolve_symbols(cfg)
@@ -1420,10 +1592,16 @@ def main() -> None:
     # 451 / kalici hata alan sembolleri bu oturumda atla
     banned_symbols: set[str] = set()
 
+    # Her semboln son bilinen kapani fiyati (/status komutu icin)
+    last_prices: dict[str, float] = {}
+
     while True:
         cycle_started = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         active_symbols = [s for s in symbols_to_scan if s not in banned_symbols]
         print(f"\n[{cycle_started}] Tarama basliyor... ({len(active_symbols)} sembol x {len(cfg.intervals)} TF)")
+
+        # Telegram komutlarini kontrol et (/status, /durum, /yardim)
+        poll_telegram_commands(cfg, paper_trader, last_prices)
 
         # Fear & Greed Index her dongude bir kez guncellenir (1 saatlik onbellek)
         fng_text = fetch_fear_and_greed()
@@ -1488,6 +1666,7 @@ def main() -> None:
                     if not price_checked:
                         latest_price = float(raw_df.iloc[-2]["close"])
                         price_checked = True
+                        last_prices[symbol] = latest_price  # /status komutu icin guncelle
                         if latest_price > cfg.max_price_usd:
                             print(f"{symbol}: filtre disi, fiyat {latest_price:.4f} > {cfg.max_price_usd:.2f}")
                             price_ok = False
