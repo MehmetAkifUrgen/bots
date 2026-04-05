@@ -40,6 +40,15 @@ cp .env.example .env
 
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
+- `BINANCE_API_KEY`
+- `BINANCE_API_SECRET`
+- `BINANCE_API_FUTURES_BASE` (varsayilan: `https://fapi.binance.com`)
+- `USE_FUTURES` (`true`/`false`)
+- `FUTURES_ORDER_ENABLED` (`true`/`false`, varsayılan `false`). Sadece Telegram sinyal istiyorsan `false` olsun.
+- `FUTURES_LEVERAGE` (örn: `10`)
+- `FUTURES_MARGIN_TYPE` (`ISOLATED` veya `CROSSED`)
+- `FUTURES_RISK_PER_TRADE_PCT` (islem basi risk yuzdesi)
+- `MAX_NOTIONAL_PER_TRADE` (futures pozisyon notional siniri)
 - `SYMBOLS` (virgülle)
 - `INTERVAL` (örn: `15m`, `1h`)
 - `MAX_PRICE_USD` (sadece bu fiyat ve altindaki coinleri tara)
@@ -72,7 +81,36 @@ python bot.py
 1. Projeyi GitHub'a push et.
 2. Railway'de `New Project` -> `Deploy from GitHub Repo` ile bu repoyu sec.
 3. Servis ayarlarinda Start Command gerekirse `python -u bot.py` yaz.
-4. Railway `Variables` bolumune `.env` icindeki degiskenleri ekle.
+4. Railway `Variables` bolumune asagidaki degiskenleri tek tek ekle:
+   - `TELEGRAM_BOT_TOKEN`
+   - `TELEGRAM_CHAT_ID`
+   - `BINANCE_API_KEY`
+   - `BINANCE_API_SECRET`
+   - `BINANCE_API_FUTURES_BASE`
+   - `USE_FUTURES`
+   - `FUTURES_ORDER_ENABLED`
+   - `FUTURES_LEVERAGE`
+   - `FUTURES_MARGIN_TYPE`
+   - `FUTURES_RISK_PER_TRADE_PCT`
+   - `MAX_NOTIONAL_PER_TRADE`
+   - `SYMBOLS`
+   - `USE_DYNAMIC_SYMBOLS`
+   - `MIN_LISTING_YEAR`
+   - `MIN_QUOTE_VOLUME_USD`
+   - `MAX_QUOTE_VOLUME_USD`
+   - `DYNAMIC_SYMBOL_LIMIT`
+   - `MAX_PRICE_USD`
+   - `INTERVAL`
+   - `SCAN_EVERY_SECONDS`
+   - `LOOKBACK_BARS`
+   - `FIB_LOOKBACK`
+   - `RISK_REWARD`
+   - `MIN_CONFIDENCE`
+   - `PAPER_TRADE_ENABLED`
+   - `PAPER_INITIAL_BALANCE`
+   - `PAPER_RISK_PER_TRADE_PCT`
+   - `PAPER_FEE_RATE`
+   - `PAPER_LOG_FILE`
 5. Deploy sonrasi loglarda `Tarama basliyor...` satirini goruyorsan bot calisiyor demektir.
 
 Oneri:
@@ -80,11 +118,19 @@ Oneri:
 - Railway tarafinda localdeki `.env` dosyasini yukleme; degerleri `Variables` icine tek tek ekle.
 - Local testte `USE_DYNAMIC_SYMBOLS=true` ile basla; cok az sembol gelirse hacim limitlerini genislet.
 
+Not: Bu proje su an icin sadece teknik analiz temelli sinyal uretir. Haber, siyasi, savas gibi olaylar dogrudan entegre edilmedi; gelecekte ekleyebiliriz.
+
 Paper trade aciksa bot sinyal mesajina ek olarak:
 
 - "Paper Trade Acildi" mesaji yollar
 - TP/SL oldugunda "Paper Trade Kapandi" mesaji yollar
 - Islem sonucunu `paper_trades.csv` dosyasina yazar
+
+Eger `FUTURES_ORDER_ENABLED=true` yaparsan bu bot Binance futures hesabina market order gonderebilir. Bunun icin:
+
+- Binance futures API anahtarini kullan
+- API anahtari `Enable Futures` ve `Enable Trading` izinlerine sahip olmalidir
+- `FUTURES_ORDER_ENABLED` ilk once `false` olsun, local test sonrasi `true` yap
 
 ## Önemli Not
 

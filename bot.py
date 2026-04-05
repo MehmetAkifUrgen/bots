@@ -1,9 +1,13 @@
 import os
 import time
 import math
+import hmac
+import hashlib
 import csv
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
@@ -16,7 +20,7 @@ class Config:
     telegram_bot_token: str
     telegram_chat_id: str
     symbols: list[str]
-    interval: str
+    intervals: list[str]          # ornek: ["15m", "1h", "4h"]
     scan_every_seconds: int
     binance_api_base: str
     lookback_bars: int
@@ -29,11 +33,22 @@ class Config:
     min_quote_volume_usd: float
     max_quote_volume_usd: float
     dynamic_symbol_limit: int
+    binance_api_key: str
+    binance_api_secret: str
+    binance_api_futures_base: str
+    use_futures: bool
+    futures_order_enabled: bool
+    futures_leverage: int
+    futures_margin_type: str
+    futures_risk_per_trade_pct: float
+    max_notional_per_trade: float
     paper_trade_enabled: bool
     paper_initial_balance: float
     paper_risk_per_trade_pct: float
     paper_fee_rate: float
     paper_log_file: str
+    signal_state_file: str
+    symbol_refresh_hours: int
 
 
 @dataclass
@@ -53,6 +68,133 @@ def parse_bool(value: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def sign_futures_params(secret: str, params: dict) -> str:
+    query_string = urlencode(params, doseq=True)
+    return hmac.new(secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def send_futures_signed_request(cfg: Config, method: str, path: str, params: dict | None = None) -> dict | list:
+    if params is None:
+        params = {}
+    params["timestamp"] = int(time.time() * 1000)
+    query_string = urlencode(params, doseq=True)
+    signature = hmac.new(cfg.binance_api_secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
+    url = f"{cfg.binance_api_futures_base}{path}?{query_string}&signature={signature}"
+    headers = {"X-MBX-APIKEY": cfg.binance_api_key}
+
+    if method.upper() == "GET":
+        response = requests.get(url, headers=headers, timeout=20)
+    else:
+        response = requests.post(url, headers=headers, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+
+def get_futures_balance(cfg: Config) -> float:
+    data = send_futures_signed_request(cfg, "GET", "/fapi/v2/balance")
+    for item in data:
+        if item.get("asset") == "USDT":
+            return float(item.get("balance", 0.0))
+    return 0.0
+
+
+def set_futures_margin(cfg: Config, symbol: str) -> None:
+    try:
+        send_futures_signed_request(cfg, "POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": cfg.futures_margin_type})
+    except Exception as exc:
+        print(f"{symbol}: futures margin type ayarlanamadi - {exc}")
+
+
+def set_futures_leverage(cfg: Config, symbol: str) -> None:
+    try:
+        send_futures_signed_request(cfg, "POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": cfg.futures_leverage})
+    except Exception as exc:
+        print(f"{symbol}: futures leverage ayarlanamadi - {exc}")
+
+
+def place_futures_order(cfg: Config, symbol: str, side: str, quantity: float) -> dict:
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "MARKET",
+        "quantity": f"{quantity:.6f}",
+    }
+    return send_futures_signed_request(cfg, "POST", "/fapi/v1/order", params)
+
+
+def place_futures_close_order(cfg: Config, symbol: str, side: str, stop_price: float, order_type: str) -> dict:
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": order_type,
+        "stopPrice": f"{stop_price:.8f}",
+        "closePosition": "true",
+        "reduceOnly": "true",
+    }
+    return send_futures_signed_request(cfg, "POST", "/fapi/v1/order", params)
+
+
+def open_futures_position(cfg: Config, signal: dict) -> dict | None:
+    if not cfg.futures_order_enabled:
+        return None
+
+    if not cfg.binance_api_key or not cfg.binance_api_secret:
+        print("Futures API anahtarlariniz eksik, emir acilamadi.")
+        return None
+
+    symbol = signal["symbol"]
+    entry = float(signal["entry"])
+    stop_loss = float(signal["stop_loss"])
+    take_profit = float(signal["take_profit"])
+    side = "BUY" if signal["side"] == "LONG" else "SELL"
+    risk_amount = get_futures_balance(cfg) * (cfg.futures_risk_per_trade_pct / 100.0)
+    risk_per_unit = abs(entry - stop_loss)
+    if risk_amount <= 0 or risk_per_unit <= 0:
+        print(f"{symbol}: futures risk veya sl farki uygun degil.")
+        return None
+
+    quantity = risk_amount / risk_per_unit
+    if quantity <= 0:
+        return None
+
+    # Limit notional exposure
+    notional = quantity * entry
+    if cfg.max_notional_per_trade > 0 and notional > cfg.max_notional_per_trade:
+        quantity = cfg.max_notional_per_trade / entry
+
+    quantity = float(f"{quantity:.3f}")
+    if quantity <= 0:
+        return None
+
+    set_futures_margin(cfg, symbol)
+    set_futures_leverage(cfg, symbol)
+
+    try:
+        market_order = place_futures_order(cfg, symbol, side, quantity)
+        tp_side = "SELL" if side == "BUY" else "BUY"
+        sl_order = place_futures_close_order(cfg, symbol, tp_side, stop_loss, "STOP_MARKET")
+        tp_order = place_futures_close_order(cfg, symbol, tp_side, take_profit, "TAKE_PROFIT_MARKET")
+
+        return {
+            "symbol": symbol,
+            "side": signal["side"],
+            "quantity": quantity,
+            "entry": entry,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "order_id": market_order.get("orderId"),
+            "sl_order_id": sl_order.get("orderId"),
+            "tp_order_id": tp_order.get("orderId"),
+            "leverage": cfg.futures_leverage,
+            "order": market_order,
+            "stop_order": sl_order,
+            "take_profit_order": tp_order,
+        }
+    except Exception as exc:
+        print(f"{symbol}: futures emir acma hatasi - {exc}")
+        return None
 
 
 class PaperTrader:
@@ -107,13 +249,15 @@ class PaperTrader:
             drawdown_pct = (self.peak_balance - self.balance) / self.peak_balance * 100
             self.max_drawdown_pct = max(self.max_drawdown_pct, drawdown_pct)
 
-    def has_open_position(self, symbol: str) -> bool:
-        return symbol in self.open_positions
+    def has_open_position(self, key: str) -> bool:
+        """key = 'SYMBOL_interval' ornegi 'ARBUSDT_1h'"""
+        return key in self.open_positions
 
-    def open_position(self, signal: dict) -> dict | None:
-        symbol = signal["symbol"]
-        if symbol in self.open_positions:
+    def open_position(self, signal: dict, key: str) -> dict | None:
+        """key = 'SYMBOL_interval'"""
+        if key in self.open_positions:
             return None
+        symbol = signal["symbol"]
 
         entry = float(signal["entry"])
         stop_loss = float(signal["stop_loss"])
@@ -144,7 +288,7 @@ class PaperTrader:
             confidence=int(signal["confidence"]),
             fee_open=fee_open,
         )
-        self.open_positions[symbol] = position
+        self.open_positions[key] = position
 
         return {
             "symbol": symbol,
@@ -230,8 +374,9 @@ class PaperTrader:
                 ]
             )
 
-    def update_symbol(self, symbol: str, candle_row: pd.Series) -> dict | None:
-        position = self.open_positions.get(symbol)
+    def update_position(self, key: str, candle_row: pd.Series) -> dict | None:
+        """key = 'SYMBOL_interval'"""
+        position = self.open_positions.get(key)
         if position is None:
             return None
 
@@ -273,7 +418,7 @@ class PaperTrader:
                 exit_reason = "TAKE_PROFIT"
 
         trade = self._close_position(position, exit_price, exit_reason, close_time)
-        self.open_positions.pop(symbol, None)
+        self.open_positions.pop(key, None)
         return trade
 
 
@@ -282,11 +427,16 @@ def load_config() -> Config:
     symbols_raw = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT")
     symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
 
+    intervals_raw = os.getenv("INTERVALS", "15m,1h,4h")
+    intervals = [i.strip() for i in intervals_raw.split(",") if i.strip()]
+    if not intervals:
+        intervals = ["15m", "1h", "4h"]
+
     return Config(
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
         symbols=symbols,
-        interval=os.getenv("INTERVAL", "15m").strip(),
+        intervals=intervals,
         scan_every_seconds=int(os.getenv("SCAN_EVERY_SECONDS", "60")),
         binance_api_base=os.getenv("BINANCE_API_BASE", "https://api.binance.com").strip(),
         lookback_bars=int(os.getenv("LOOKBACK_BARS", "250")),
@@ -299,11 +449,22 @@ def load_config() -> Config:
         min_quote_volume_usd=float(os.getenv("MIN_QUOTE_VOLUME_USD", "100000")),
         max_quote_volume_usd=float(os.getenv("MAX_QUOTE_VOLUME_USD", "25000000")),
         dynamic_symbol_limit=int(os.getenv("DYNAMIC_SYMBOL_LIMIT", "120")),
+        binance_api_key=os.getenv("BINANCE_API_KEY", "").strip(),
+        binance_api_secret=os.getenv("BINANCE_API_SECRET", "").strip(),
+        binance_api_futures_base=os.getenv("BINANCE_API_FUTURES_BASE", "https://fapi.binance.com").strip(),
+        use_futures=parse_bool(os.getenv("USE_FUTURES", "true"), default=True),
+        futures_order_enabled=parse_bool(os.getenv("FUTURES_ORDER_ENABLED", "false"), default=False),
+        futures_leverage=int(os.getenv("FUTURES_LEVERAGE", "10")),
+        futures_margin_type=os.getenv("FUTURES_MARGIN_TYPE", "ISOLATED").strip().upper(),
+        futures_risk_per_trade_pct=float(os.getenv("FUTURES_RISK_PER_TRADE_PCT", "1.0")),
+        max_notional_per_trade=float(os.getenv("MAX_NOTIONAL_PER_TRADE", "1000")),
         paper_trade_enabled=parse_bool(os.getenv("PAPER_TRADE_ENABLED", "true"), default=True),
         paper_initial_balance=float(os.getenv("PAPER_INITIAL_BALANCE", "10000")),
         paper_risk_per_trade_pct=float(os.getenv("PAPER_RISK_PER_TRADE_PCT", "1.0")),
         paper_fee_rate=float(os.getenv("PAPER_FEE_RATE", "0.0004")),
         paper_log_file=os.getenv("PAPER_LOG_FILE", "paper_trades.csv").strip(),
+        signal_state_file=os.getenv("SIGNAL_STATE_FILE", "signal_state.json").strip(),
+        symbol_refresh_hours=int(os.getenv("SYMBOL_REFRESH_HOURS", "6")),
     )
 
 
@@ -388,11 +549,9 @@ def resolve_symbols(cfg: Config) -> list[str]:
             continue
 
         onboard_date = int(item.get("onboardDate", 0) or 0)
-        if onboard_date and onboard_date < min_listing_ts:
-            continue
-
-        if onboard_date == 0:
-            # Strict filter: if listing date is not known, skip to keep 2021+ rule.
+        # onboardDate artik Binance API tarafindan cogunlukla 0 olarak donuyor,
+        # bu durumda tarihe gore filtreleme yapamayiz; atlamamak icin devam ediyoruz.
+        if onboard_date != 0 and onboard_date < min_listing_ts:
             continue
 
         ticker = ticker_map.get(symbol)
@@ -614,6 +773,23 @@ def format_signal_message(signal: dict, interval: str) -> str:
     )
 
 
+def format_futures_order_message(order_event: dict, interval: str) -> str:
+    return (
+        "*Futures Pozisyonu Acildi*\n"
+        f"Sembol: *{order_event['symbol']}*\n"
+        f"Yon: *{order_event['side']}*\n"
+        f"Zaman Dilimi: *{interval}*\n"
+        f"Qty: `{order_event['quantity']:.3f}`\n"
+        f"Entry: `{order_event['entry']:.4f}`\n"
+        f"SL: `{order_event['stop_loss']:.4f}`\n"
+        f"TP: `{order_event['take_profit']:.4f}`\n"
+        f"Leverage: `{order_event['leverage']}x`\n"
+        f"Order Id: `{order_event['order_id']}`\n"
+        f"TP Order: `{order_event['tp_order_id']}`\n"
+        f"SL Order: `{order_event['sl_order_id']}`"
+    )
+
+
 def format_paper_open_message(event: dict, interval: str) -> str:
     dt = pd.Timestamp(event["opened_at"]).tz_convert(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return (
@@ -652,6 +828,30 @@ def format_paper_close_message(trade: dict, interval: str) -> str:
     )
 
 
+def load_signal_state(path: str) -> dict[str, str]:
+    """Son gonderilen sinyal anahtarlarini diskten yukle."""
+    if path and os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    return {}
+
+
+def save_signal_state(path: str, state: dict[str, str]) -> None:
+    """Son gonderilen sinyal anahtarlarini diske kaydet."""
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception as exc:
+        print(f"[WARN] Sinyal durumu kaydedilemedi: {exc}")
+
+
 def send_telegram(bot_token: str, chat_id: str, text: str) -> None:
     if not bot_token or not chat_id:
         print("[WARN] Telegram ayarlari yok, mesaj konsola yazdiriliyor:")
@@ -673,12 +873,13 @@ def send_telegram(bot_token: str, chat_id: str, text: str) -> None:
 def main() -> None:
     cfg = load_config()
     symbols_to_scan = resolve_symbols(cfg)
-    print(f"Basladi | Taranacak sembol sayisi: {len(symbols_to_scan)} | Interval: {cfg.interval}")
+    print(f"Basladi | Taranacak sembol sayisi: {len(symbols_to_scan)} | Zaman dilimleri: {', '.join(cfg.intervals)}")
     if not symbols_to_scan:
         print("[HATA] Taranacak sembol yok. .env ayarlarini kontrol et.")
         return
     print(f"Maksimum fiyat filtresi: {cfg.max_price_usd:.2f} USDT")
     print(f"Paper Trade: {'ACIK' if cfg.paper_trade_enabled else 'KAPALI'}")
+    print(f"Futures emir modu: {'ACIK' if cfg.futures_order_enabled else 'KAPALI'}")
 
     paper_trader = None
     if cfg.paper_trade_enabled:
@@ -689,70 +890,111 @@ def main() -> None:
             log_file=cfg.paper_log_file,
         )
 
-    last_sent_key: dict[str, str] = {}
+    # Diskten onceki sinyal durumunu yukle (yeniden baslatmada tekrar gonderimi onler)
+    last_sent_key: dict[str, str] = load_signal_state(cfg.signal_state_file)
+    print(f"Sinyal durumu yuklendi: {len(last_sent_key)} kayit ({cfg.signal_state_file})")
+
+    last_symbol_refresh = time.monotonic()
+    symbol_refresh_interval = cfg.symbol_refresh_hours * 3600
 
     while True:
         cycle_started = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        print(f"\n[{cycle_started}] Tarama basliyor...")
+        print(f"\n[{cycle_started}] Tarama basliyor... ({len(symbols_to_scan)} sembol x {len(cfg.intervals)} TF)")
+
+        # Sembol listesini periyodik olarak yenile
+        if cfg.use_dynamic_symbols and (time.monotonic() - last_symbol_refresh) >= symbol_refresh_interval:
+            print(f"[INFO] Sembol listesi yenileniyor ({cfg.symbol_refresh_hours}s arasinda bir)...")
+            new_symbols = resolve_symbols(cfg)
+            if new_symbols:
+                symbols_to_scan = new_symbols
+                last_symbol_refresh = time.monotonic()
+                print(f"[INFO] Yeni sembol sayisi: {len(symbols_to_scan)}")
 
         for symbol in symbols_to_scan:
-            try:
-                raw_df = fetch_klines(
-                    symbol=symbol,
-                    interval=cfg.interval,
-                    limit=cfg.lookback_bars,
-                    base_url=cfg.binance_api_base,
-                )
-                df = add_indicators(raw_df)
+            # Fiyat filtresi: herhangi bir TF'de fiyat yukse atla (tek klines cagrisiyla kontrol)
+            price_checked = False
+            price_ok = True
 
-                if paper_trader is not None:
-                    latest_closed = raw_df.iloc[-2]
-                    closed_trade = paper_trader.update_symbol(symbol, latest_closed)
-                    if closed_trade is not None:
-                        close_msg = format_paper_close_message(closed_trade, cfg.interval)
-                        send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, close_msg)
-                        print(
-                            f"{symbol}: paper pozisyon kapandi | PnL: {closed_trade['pnl_net']:.2f} | "
-                            f"Bakiye: {closed_trade['balance']:.2f}"
-                        )
+            for interval in cfg.intervals:
+                # Her (sembol, interval) cifti icin benzersiz anahtar
+                pt_key = f"{symbol}_{interval}"
 
-                latest_price = float(raw_df.iloc[-2]["close"])
-                if latest_price > cfg.max_price_usd:
-                    print(f"{symbol}: filtre disi, fiyat {latest_price:.4f} > {cfg.max_price_usd:.2f}")
-                    continue
+                try:
+                    raw_df = fetch_klines(
+                        symbol=symbol,
+                        interval=interval,
+                        limit=cfg.lookback_bars,
+                        base_url=cfg.binance_api_base,
+                    )
+                    df = add_indicators(raw_df)
 
-                signal = build_signal(symbol, df, cfg)
+                    # Paper trade: acik pozisyonu guncelle
+                    if paper_trader is not None:
+                        latest_closed = raw_df.iloc[-2]
+                        closed_trade = paper_trader.update_position(pt_key, latest_closed)
+                        if closed_trade is not None:
+                            close_msg = format_paper_close_message(closed_trade, interval)
+                            send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, close_msg)
+                            print(
+                                f"{symbol} [{interval}]: paper kapandi | PnL: {closed_trade['pnl_net']:.2f} | "
+                                f"Bakiye: {closed_trade['balance']:.2f}"
+                            )
 
-                if not signal:
-                    print(f"{symbol}: sinyal yok")
-                    continue
+                    # Fiyat filtresini yalnizca ilk TF'de kontrol et (fiyat TF'den bagimsiz)
+                    if not price_checked:
+                        latest_price = float(raw_df.iloc[-2]["close"])
+                        price_checked = True
+                        if latest_price > cfg.max_price_usd:
+                            print(f"{symbol}: filtre disi, fiyat {latest_price:.4f} > {cfg.max_price_usd:.2f}")
+                            price_ok = False
+                    if not price_ok:
+                        continue
 
-                close_time_key = pd.Timestamp(signal["close_time"]).isoformat()
-                dedupe_key = f"{signal['symbol']}|{signal['side']}|{close_time_key}"
+                    signal = build_signal(symbol, df, cfg)
 
-                if last_sent_key.get(symbol) == dedupe_key:
-                    print(f"{symbol}: ayni sinyal daha once gonderildi")
-                    continue
+                    if not signal:
+                        print(f"{symbol} [{interval}]: sinyal yok")
+                        continue
 
-                message = format_signal_message(signal, cfg.interval)
-                send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, message)
-                last_sent_key[symbol] = dedupe_key
-                print(f"{symbol}: {signal['side']} sinyali gonderildi (Guven: {signal['confidence']}%)")
+                    close_time_key = pd.Timestamp(signal["close_time"]).isoformat()
+                    dedupe_key = f"{symbol}|{signal['side']}|{interval}|{close_time_key}"
 
-                if paper_trader is not None and not paper_trader.has_open_position(symbol):
-                    open_event = paper_trader.open_position(signal)
-                    if open_event is not None:
-                        open_msg = format_paper_open_message(open_event, cfg.interval)
-                        send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, open_msg)
-                        print(
-                            f"{symbol}: paper pozisyon acildi | {open_event['side']} | "
-                            f"Qty: {open_event['quantity']:.6f}"
-                        )
+                    if last_sent_key.get(pt_key) == dedupe_key:
+                        print(f"{symbol} [{interval}]: ayni sinyal daha once gonderildi")
+                        continue
 
-            except requests.HTTPError as exc:
-                print(f"{symbol}: HTTP hata - {exc}")
-            except Exception as exc:
-                print(f"{symbol}: beklenmeyen hata - {exc}")
+                    message = format_signal_message(signal, interval)
+                    send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, message)
+                    last_sent_key[pt_key] = dedupe_key
+                    print(f"{symbol} [{interval}]: {signal['side']} sinyali gonderildi (Guven: {signal['confidence']}%)")
+
+                    if cfg.use_futures and cfg.futures_order_enabled:
+                        futures_event = open_futures_position(cfg, signal)
+                        if futures_event is not None:
+                            futures_msg = format_futures_order_message(futures_event, interval)
+                            send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, futures_msg)
+                            print(
+                                f"{symbol} [{interval}]: futures pozisyon acildi | {futures_event['side']} | "
+                                f"Qty: {futures_event['quantity']:.3f} | Leverage: {futures_event['leverage']}x"
+                            )
+
+                    if paper_trader is not None and not paper_trader.has_open_position(pt_key):
+                        open_event = paper_trader.open_position(signal, pt_key)
+                        if open_event is not None:
+                            open_msg = format_paper_open_message(open_event, interval)
+                            send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, open_msg)
+                            print(
+                                f"{symbol} [{interval}]: paper acildi | {open_event['side']} | "
+                                f"Qty: {open_event['quantity']:.6f}"
+                            )
+
+                except requests.HTTPError as exc:
+                    print(f"{symbol} [{interval}]: HTTP hata - {exc}")
+                except Exception as exc:
+                    print(f"{symbol} [{interval}]: beklenmeyen hata - {exc}")
+
+        # Her tarama dongusu sonunda sinyal durumunu kaydet (yeniden baslatmada duplikasyon onlenir)
+        save_signal_state(cfg.signal_state_file, last_sent_key)
 
         time.sleep(cfg.scan_every_seconds)
 

@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .env
+railway-variables.txt
+signal_state.json
+paper_trades.csv
