@@ -49,6 +49,7 @@ class Config:
     paper_log_file: str
     signal_state_file: str
     symbol_refresh_hours: int
+    whale_vol_multiplier: float
 
 
 @dataclass
@@ -465,6 +466,7 @@ def load_config() -> Config:
         paper_log_file=os.getenv("PAPER_LOG_FILE", "paper_trades.csv").strip(),
         signal_state_file=os.getenv("SIGNAL_STATE_FILE", "signal_state.json").strip(),
         symbol_refresh_hours=int(os.getenv("SYMBOL_REFRESH_HOURS", "6")),
+        whale_vol_multiplier=float(os.getenv("WHALE_VOL_MULTIPLIER", "4.0")),
     )
 
 
@@ -514,6 +516,34 @@ def fetch_ticker_24hr(base_url: str) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
+# Momentum onbellegi (5 dakika TTL)
+_momentum_cache: tuple[float, dict[str, float]] = (0.0, {})
+_MOMENTUM_CACHE_TTL = 300.0
+
+
+def fetch_symbol_momentum(base_url: str) -> dict[str, float]:
+    """24 saatlik fiyat degisim yuzdesini sembol bazinda dondurur (5 dk onbellek).
+    Sifir donus: API hatasi veya onbellek bos.
+    """
+    global _momentum_cache
+    now = time.monotonic()
+    if now - _momentum_cache[0] < _MOMENTUM_CACHE_TTL and _momentum_cache[1]:
+        return _momentum_cache[1]
+    try:
+        resp = requests.get(f"{base_url}/api/v3/ticker/24hr", timeout=15)
+        resp.raise_for_status()
+        mapping = {
+            row["symbol"]: float(row.get("priceChangePercent", 0.0))
+            for row in resp.json()
+            if isinstance(row, dict) and "symbol" in row
+        }
+        _momentum_cache = (now, mapping)
+        return mapping
+    except Exception as exc:
+        print(f"[WARN] Momentum verisi alinamadi: {exc}")
+        return _momentum_cache[1]
+
+
 def is_leveraged_token(symbol: str) -> bool:
     suffixes = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
     return symbol.endswith(suffixes)
@@ -531,6 +561,65 @@ def is_stablecoin(base_asset: str) -> bool:
     return base_asset.upper() in _STABLECOIN_BASES
 
 
+# Futures sembol seti onbellegi (12 saatte bir yenilenir)
+_futures_symbols_cache: tuple[float, frozenset[str]] = (0.0, frozenset())
+_FUTURES_SYMBOLS_TTL = 12 * 3600.0
+
+
+def fetch_futures_symbols(futures_base_url: str) -> frozenset[str]:
+    """Binance Futures'ta aktif olarak islem goren USDT-marjin sembol setini dondurur.
+    Sonuclar 12 saat onbelleklenir; hata durumunda bos set yerine son bilinen set kullanilir.
+    """
+    global _futures_symbols_cache
+    now = time.monotonic()
+    if now - _futures_symbols_cache[0] < _FUTURES_SYMBOLS_TTL and _futures_symbols_cache[1]:
+        return _futures_symbols_cache[1]
+    try:
+        resp = requests.get(f"{futures_base_url}/fapi/v1/exchangeInfo", timeout=15)
+        resp.raise_for_status()
+        symbols = frozenset(
+            s["symbol"]
+            for s in resp.json().get("symbols", [])
+            if s.get("status") == "TRADING" and s.get("contractType") == "PERPETUAL"
+        )
+        _futures_symbols_cache = (now, symbols)
+        print(f"[INFO] Futures sembol listesi guncellendi: {len(symbols)} coin")
+        return symbols
+    except Exception as exc:
+        print(f"[WARN] Futures sembol listesi alinamadi: {exc}")
+        return _futures_symbols_cache[1]
+
+
+# Funding rate onbellegi: symbol -> (monotonic_ts, rate_float)
+_funding_cache: dict[str, tuple[float, float]] = {}
+_FUNDING_CACHE_TTL = 300.0  # 5 dakika
+
+
+def fetch_funding_rate(symbol: str, futures_base_url: str) -> float | None:
+    """Guncel funding rate'i dondurur (5 dk onbellek).
+    Pozitif: longlar short'lara oduyor (asiri long -> zayif boga/short firsat).
+    Negatif: shortlar longlara oduyor (asiri short -> zayif ayi/long firsat).
+    """
+    now = time.monotonic()
+    if symbol in _funding_cache:
+        ts, rate = _funding_cache[symbol]
+        if now - ts < _FUNDING_CACHE_TTL:
+            return rate
+    try:
+        resp = requests.get(
+            f"{futures_base_url}/fapi/v1/premiumIndex",
+            params={"symbol": symbol},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        rate = float(resp.json().get("lastFundingRate", 0.0))
+        _funding_cache[symbol] = (now, rate)
+        return rate
+    except Exception:
+        cached = _funding_cache.get(symbol)
+        return cached[1] if cached else None
+
+
 def resolve_symbols(cfg: Config) -> list[str]:
     if not cfg.use_dynamic_symbols:
         return cfg.symbols
@@ -542,6 +631,10 @@ def resolve_symbols(cfg: Config) -> list[str]:
         print(f"[WARN] Dinamik sembol listesi alinamadi: {exc}")
         return cfg.symbols
 
+    # Futures'ta listeli olmayan coinlere sinyal verme
+    futures_symbols = fetch_futures_symbols(cfg.binance_api_futures_base)
+    futures_filter_active = bool(futures_symbols)
+
     ticker_map: dict[str, dict] = {row.get("symbol", ""): row for row in ticker_24h}
     min_listing_ts = int(datetime(cfg.min_listing_year, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
 
@@ -550,6 +643,10 @@ def resolve_symbols(cfg: Config) -> list[str]:
         symbol = str(item.get("symbol", "")).upper()
         base_asset = str(item.get("baseAsset", "")).upper()
         if not symbol or is_leveraged_token(symbol) or is_stablecoin(base_asset):
+            continue
+
+        # Futures'ta listelenmeyen coinleri atla
+        if futures_filter_active and symbol not in futures_symbols:
             continue
 
         if item.get("status") != "TRADING":
@@ -599,7 +696,8 @@ def resolve_symbols(cfg: Config) -> list[str]:
             "Dinamik sembol filtresi aktif | "
             f"Secilen: {len(symbols)} | "
             f"Yil>={cfg.min_listing_year}, Fiyat<={cfg.max_price_usd}, "
-            f"Hacim:[{cfg.min_quote_volume_usd:.0f}, {cfg.max_quote_volume_usd:.0f}]"
+            f"Hacim:[{cfg.min_quote_volume_usd:.0f}, {cfg.max_quote_volume_usd:.0f}] | "
+            f"Futures filtresi: {'ACIK' if futures_filter_active else 'KAPALI'}"
         )
         return symbols
 
@@ -627,6 +725,12 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     return atr
+
+
+def compute_obv(df: pd.DataFrame) -> pd.Series:
+    """On-Balance Volume: birikmeli alici/satici basinci."""
+    direction = np.sign(df["close"].diff()).fillna(0)
+    return (direction * df["volume"]).cumsum()
 
 
 def compute_macd(
@@ -673,6 +777,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["bb_upper"] = bb_upper
     out["bb_mid"] = bb_mid
     out["bb_lower"] = bb_lower
+    out["obv"] = compute_obv(out)
+    out["obv_ma20"] = out["obv"].rolling(20).mean()
     return out
 
 
@@ -714,12 +820,185 @@ def score_signal(base_conditions: list[bool], bonus_conditions: list[bool]) -> i
     return min(100, raw)
 
 
+def compute_pivots(
+    high: pd.Series,
+    low: pd.Series,
+    left: int = 5,
+    right: int = 5,
+) -> list[tuple[int, float, str]]:
+    """Pivot Yuksek ('H') ve Pivot Dusuk ('L') noktalarini saptar.
+    Bir bar, sol 'left' ve sag 'right' bardan daha yuksek/dusukse pivot kabul edilir.
+    """
+    h = high.values
+    l = low.values
+    n = len(h)
+    pivots: list[tuple[int, float, str]] = []
+    for i in range(left, n - right):
+        h_window = np.concatenate([h[i - left:i], h[i + 1:i + right + 1]])
+        if h[i] >= h_window.max():
+            pivots.append((i, float(h[i]), "H"))
+            continue
+        l_window = np.concatenate([l[i - left:i], l[i + 1:i + right + 1]])
+        if l[i] <= l_window.min():
+            pivots.append((i, float(l[i]), "L"))
+    return pivots
+
+
+def detect_market_structure(
+    df: pd.DataFrame,
+    lookback: int = 120,
+    left: int = 5,
+    right: int = 5,
+) -> dict:
+    """Piyasa yapisini ve trend kirilimini (Break of Structure) saptar.
+
+    Donus anahtarlari:
+      structure      : 'BULLISH' | 'BEARISH' | 'RANGING'
+      bos_bull       : True → ayı yapısında fiyat son Lower High'ı kırdı (trend donusu)
+      bos_bear       : True → boğa yapısında fiyat son Higher Low'un altına kırdı
+      last_resistance: son pivot yuksek degeri
+      last_support   : son pivot dusuk degeri
+    """
+    _default: dict = {
+        "structure": "RANGING",
+        "bos_bull": False,
+        "bos_bear": False,
+        "last_resistance": None,
+        "last_support": None,
+    }
+    analysis_df = df.iloc[-(lookback + right + 2):-2]
+    if len(analysis_df) < left + right + 2:
+        return _default
+
+    pivots = compute_pivots(analysis_df["high"], analysis_df["low"], left=left, right=right)
+    if len(pivots) < 4:
+        return _default
+
+    highs = [(idx, v) for idx, v, t in pivots if t == "H"]
+    lows = [(idx, v) for idx, v, t in pivots if t == "L"]
+
+    if len(highs) < 2 or len(lows) < 2:
+        return {
+            **_default,
+            "last_resistance": highs[-1][1] if highs else None,
+            "last_support": lows[-1][1] if lows else None,
+        }
+
+    prev_high, last_high = highs[-2][1], highs[-1][1]
+    prev_low, last_low = lows[-2][1], lows[-1][1]
+
+    hh = last_high > prev_high   # Higher High
+    hl = last_low > prev_low     # Higher Low
+    lh = last_high < prev_high   # Lower High
+    ll = last_low < prev_low     # Lower Low
+
+    if hh and hl:
+        structure = "BULLISH"
+    elif lh and ll:
+        structure = "BEARISH"
+    else:
+        structure = "RANGING"
+
+    close = float(df.iloc[-2]["close"])
+    # BOS Boga: ayi yapisinda fiyat son LH'yi gecti → trend kirilimi
+    bos_bull = lh and close > last_high
+    # BOS Ayi: boga yapisinda fiyat son HL'in altina kırıldı → trend kirilimi
+    bos_bear = hl and close < last_low
+
+    return {
+        "structure": structure,
+        "bos_bull": bos_bull,
+        "bos_bear": bos_bear,
+        "last_resistance": last_high,
+        "last_support": last_low,
+    }
+
+
+def detect_rsi_divergence(df: pd.DataFrame, lookback: int = 30) -> str:
+    """Son 'lookback' bardaki RSI-fiyat diverjansini tespit eder.
+    Donen deger: 'BULL' | 'BEAR' | ''
+      BULL: Fiyat LL yaparken RSI HL yapiyor → boga diverjans (zayifliyan satis baskisi)
+      BEAR: Fiyat HH yaparken RSI LH yapiyor → ayi diverjans (zayiflayan alis baskisi)
+    """
+    window = df.iloc[-(lookback + 2):-2]
+    if len(window) < 10:
+        return ""
+
+    close = window["close"].values
+    rsi = window["rsi14"].values
+
+    # Son iki lokal dip/zirve bulmak icin basit karsilastirma
+    close_min1_idx = int(np.argmin(close[: len(close) // 2]))
+    close_min2_idx = int(len(close) // 2 + np.argmin(close[len(close) // 2:]))
+    close_max1_idx = int(np.argmax(close[: len(close) // 2]))
+    close_max2_idx = int(len(close) // 2 + np.argmax(close[len(close) // 2:]))
+
+    # Boga diverjans: fiyat daha dusuk dip, RSI daha yuksek dip
+    if (close[close_min2_idx] < close[close_min1_idx]
+            and rsi[close_min2_idx] > rsi[close_min1_idx] + 2):
+        return "BULL"
+
+    # Ayi diverjans: fiyat daha yuksek zirve, RSI daha dusuk zirve
+    if (close[close_max2_idx] > close[close_max1_idx]
+            and rsi[close_max2_idx] < rsi[close_max1_idx] - 2):
+        return "BEAR"
+
+    return ""
+
+
+def detect_candle_patterns(row: pd.Series, prev_row: pd.Series) -> list[str]:
+    """Son kapanan mumun teknik formasyonlarini saptar (OHLCV).
+    Donen liste: eslesenlerin Turkce adlari.
+    """
+    patterns: list[str] = []
+    o = float(row["open"])
+    h = float(row["high"])
+    l = float(row["low"])
+    c = float(row["close"])
+    po = float(prev_row["open"])
+    ph = float(prev_row["high"])
+    pl = float(prev_row["low"])
+    pc = float(prev_row["close"])
+
+    body = abs(c - o)
+    candle_range = h - l
+    if candle_range <= 0:
+        return patterns
+
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+
+    # Doji: govde <= %5 aralik — belirsizlik
+    if body / candle_range <= 0.05:
+        patterns.append("Doji")
+        return patterns   # doji tespit edildi, diger formasyonlara bakilmaz
+
+    # Hammer (boğa): yesil govde, alt fitil >= 2× govde, ust fitil kucuk
+    if c > o and lower_wick >= 2.0 * body and upper_wick <= 0.3 * body:
+        patterns.append("Hammer")
+
+    # Shooting Star (ayi): kirmizi govde, ust fitil >= 2× govde, alt fitil kucuk
+    if c < o and upper_wick >= 2.0 * body and lower_wick <= 0.3 * body:
+        patterns.append("Shooting Star")
+
+    # Boga Yutmasi: onceki mum kirmizi, simdiki yesil ve oncekini tamamen yutuyor
+    if pc < po and c > o and o <= pc and c >= po:
+        patterns.append("Boga Yutmasi")
+
+    # Ayi Yutmasi: onceki mum yesil, simdiki kirmizi ve oncekini tamamen yutuyor
+    if pc > po and c < o and o >= pc and c <= po:
+        patterns.append("Ayi Yutmasi")
+
+    return patterns
+
+
 def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
     if len(df) < max(80, cfg.fib_lookback + 5):
         return None
 
     # Use last closed candle to avoid false trigger from live candle noise.
     row = df.iloc[-2]
+    prev_row = df.iloc[-3]
     recent = df.iloc[-(cfg.fib_lookback + 2):-2]
 
     if recent.empty or recent["high"].max() <= recent["low"].min():
@@ -735,6 +1014,8 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
     ema200 = float(row["ema200"])
     macd_hist_val = float(row["macd_hist"])
     bb_mid_val = float(row["bb_mid"])
+    obv_val = float(row["obv"])
+    obv_ma_val = float(row["obv_ma20"]) if not math.isnan(float(row["obv_ma20"])) else obv_val
 
     swing_high = float(recent["high"].max())
     swing_low = float(recent["low"].min())
@@ -745,6 +1026,10 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
     uptrend = ema20 > ema50 and close > ema20
     downtrend = ema20 < ema50 and close < ema20
     volume_ok = vol_ma20 > 0 and volume > vol_ma20
+    candle_patterns = detect_candle_patterns(row, prev_row)
+    ms = detect_market_structure(df)
+    rsi_div = detect_rsi_divergence(df)
+    funding_rate = fetch_funding_rate(symbol, cfg.binance_api_futures_base)
 
     if uptrend:
         fib = fib_levels_from_swing(swing_low, swing_high)
@@ -755,10 +1040,18 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
         macd_bull = not math.isnan(macd_hist_val) and macd_hist_val > 0
         above_ema200 = not math.isnan(ema200) and close > ema200
         bb_pullback = not math.isnan(bb_mid_val) and close <= bb_mid_val
+        whale_alert = vol_ma20 > 0 and volume > cfg.whale_vol_multiplier * vol_ma20
+        obv_rising = obv_val > obv_ma_val
+        bullish_candle = any(p in candle_patterns for p in ("Hammer", "Boga Yutmasi"))
+        bull_structure = ms["structure"] == "BULLISH"
+        bos_signal = ms["bos_bull"]
+        bull_div = rsi_div == "BULL"
+        # Funding pozitif ve cok yuksekse longlar asiri dolu → long icin zayif sinyal
+        funding_ok_long = funding_rate is None or funding_rate <= 0.0005
 
         score = score_signal(
             base_conditions=[uptrend, fib_ok, rsi_ok],
-            bonus_conditions=[volume_ok, atr_ok, close > fib["0.382"], macd_bull, above_ema200, bb_pullback],
+            bonus_conditions=[volume_ok, atr_ok, close > fib["0.382"], macd_bull, above_ema200, bb_pullback, whale_alert, obv_rising, bullish_candle, bull_structure, bos_signal, bull_div, funding_ok_long],
         )
 
         if score >= cfg.min_confidence and fib_ok and rsi_ok and atr_ok:
@@ -774,6 +1067,19 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
                 note_parts.append("EMA200 ustu")
             if bb_pullback:
                 note_parts.append("BB alt yari")
+            if whale_alert:
+                note_parts.append("Balina Hacmi")
+            if obv_rising:
+                note_parts.append("OBV+")
+            if bullish_candle:
+                note_parts.append(" | ".join(candle_patterns))
+            if bull_structure:
+                note_parts.append("Boga Yapisi")
+            if bos_signal:
+                note_parts.append("Trend Kirilimi")
+            if bull_div:
+                note_parts.append("RSI Boga Diverjans")
+            funding_str = f"{funding_rate*100:.4f}%" if funding_rate is not None else "?"
 
             return {
                 "symbol": symbol,
@@ -786,6 +1092,9 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
                 "rr": rr,
                 "close_time": row["close_time"],
                 "macd_hist": 0.0 if math.isnan(macd_hist_val) else macd_hist_val,
+                "market_structure": ms["structure"],
+                "bos": ms["bos_bull"],
+                "funding_rate": funding_str,
                 "notes": " | ".join(note_parts),
             }
 
@@ -798,10 +1107,18 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
         macd_bear = not math.isnan(macd_hist_val) and macd_hist_val < 0
         below_ema200 = not math.isnan(ema200) and close < ema200
         bb_rejection = not math.isnan(bb_mid_val) and close >= bb_mid_val
+        whale_alert = vol_ma20 > 0 and volume > cfg.whale_vol_multiplier * vol_ma20
+        obv_falling = obv_val < obv_ma_val
+        bearish_candle = any(p in candle_patterns for p in ("Shooting Star", "Ayi Yutmasi"))
+        bear_structure = ms["structure"] == "BEARISH"
+        bos_signal = ms["bos_bear"]
+        bear_div = rsi_div == "BEAR"
+        # Funding negatif ve cok dusukse shortlar asiri dolu → short icin zayif sinyal
+        funding_ok_short = funding_rate is None or funding_rate >= -0.0005
 
         score = score_signal(
             base_conditions=[downtrend, fib_ok, rsi_ok],
-            bonus_conditions=[volume_ok, atr_ok, close < fib["0.382"], macd_bear, below_ema200, bb_rejection],
+            bonus_conditions=[volume_ok, atr_ok, close < fib["0.382"], macd_bear, below_ema200, bb_rejection, whale_alert, obv_falling, bearish_candle, bear_structure, bos_signal, bear_div, funding_ok_short],
         )
 
         if score >= cfg.min_confidence and fib_ok and rsi_ok and atr_ok:
@@ -817,6 +1134,19 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
                 note_parts.append("EMA200 alti")
             if bb_rejection:
                 note_parts.append("BB ust yari")
+            if whale_alert:
+                note_parts.append("Balina Hacmi")
+            if obv_falling:
+                note_parts.append("OBV-")
+            if bearish_candle:
+                note_parts.append(" | ".join(candle_patterns))
+            if bear_structure:
+                note_parts.append("Ayi Yapisi")
+            if bos_signal:
+                note_parts.append("Trend Kirilimi")
+            if bear_div:
+                note_parts.append("RSI Ayi Diverjans")
+            funding_str = f"{funding_rate*100:.4f}%" if funding_rate is not None else "?"
 
             return {
                 "symbol": symbol,
@@ -829,6 +1159,9 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
                 "rr": rr,
                 "close_time": row["close_time"],
                 "macd_hist": 0.0 if math.isnan(macd_hist_val) else macd_hist_val,
+                "market_structure": ms["structure"],
+                "bos": ms["bos_bear"],
+                "funding_rate": funding_str,
                 "notes": " | ".join(note_parts),
             }
 
@@ -853,7 +1186,10 @@ def format_signal_message(signal: dict, interval: str) -> str:
         f"Tahmini R/R: `{signal['rr']:.2f}`\n"
         f"RSI: `{signal['rsi']:.1f}`\n"
         f"MACD Hist: `{signal.get('macd_hist', 0):.6f}`\n"
+        f"Yapi: `{signal.get('market_structure', '?')}`{'  *[BOS]*' if signal.get('bos') else ''}\n"
+        f"Funding: `{signal.get('funding_rate', '?')}`\n"
         f"Guven: *{signal['confidence']}%*\n"
+        f"Korku/Acgozluluk: `{signal.get('fng', '?')}`\n"
         f"Not: {signal['notes']}\n"
         f"Kapanis: {dt_str}"
     )
@@ -914,6 +1250,37 @@ def format_paper_close_message(trade: dict, interval: str) -> str:
     )
 
 
+# Fear & Greed Index onbellegi (alternative.me - ucretsiz, auth yok)
+_fng_cache: tuple[float, str] = (0.0, "")
+_FNG_CACHE_TTL = 3600.0  # gunluk guncelleniyor; 1 saatte bir kontrol yeterli
+
+
+def fetch_fear_and_greed() -> str:
+    """Alternative.me Fear & Greed Index'i getirir.
+    Ornek: '72 (Açgözlülük)'. Hata durumunda son bilinen degeri dondurur.
+    """
+    global _fng_cache
+    now = time.monotonic()
+    if now - _fng_cache[0] < _FNG_CACHE_TTL and _fng_cache[1]:
+        return _fng_cache[1]
+    try:
+        resp = requests.get(
+            "https://api.alternative.me/fng/",
+            params={"limit": 1},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        entry = resp.json()["data"][0]
+        value = entry["value"]
+        label = entry["value_classification"]
+        text = f"{value} ({label})"
+        _fng_cache = (now, text)
+        return text
+    except Exception as exc:
+        print(f"[WARN] Fear & Greed alinamadi: {exc}")
+        return _fng_cache[1] or "?"
+
+
 def load_signal_state(path: str) -> dict[str, str]:
     """Son gonderilen sinyal anahtarlarini diskten yukle."""
     if path and os.path.exists(path):
@@ -966,6 +1333,7 @@ def main() -> None:
     print(f"Maksimum fiyat filtresi: {cfg.max_price_usd:.2f} USDT")
     print(f"Paper Trade: {'ACIK' if cfg.paper_trade_enabled else 'KAPALI'}")
     print(f"Futures emir modu: {'ACIK' if cfg.futures_order_enabled else 'KAPALI'}")
+    print(f"Balina hacim esigi: {cfg.whale_vol_multiplier:.1f}x ortalama hacim")
 
     paper_trader = None
     if cfg.paper_trade_enabled:
@@ -990,6 +1358,18 @@ def main() -> None:
         cycle_started = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         active_symbols = [s for s in symbols_to_scan if s not in banned_symbols]
         print(f"\n[{cycle_started}] Tarama basliyor... ({len(active_symbols)} sembol x {len(cfg.intervals)} TF)")
+
+        # Fear & Greed Index her dongude bir kez guncellenir (1 saatlik onbellek)
+        fng_text = fetch_fear_and_greed()
+        print(f"[INFO] Fear & Greed: {fng_text}")
+
+        # Momentum siralaması: en cok haraket eden coinler once taransin
+        momentum_map = fetch_symbol_momentum(cfg.binance_api_base)
+        active_symbols.sort(key=lambda s: abs(momentum_map.get(s, 0.0)), reverse=True)
+        if momentum_map and active_symbols:
+            top5 = active_symbols[:5]
+            top5_info = ", ".join(f"{s}({momentum_map.get(s, 0.0):+.1f}%)" for s in top5)
+            print(f"[INFO] En hareketli 5 coin: {top5_info}")
 
         # Sembol listesini periyodik olarak yenile
         if cfg.use_dynamic_symbols and (time.monotonic() - last_symbol_refresh) >= symbol_refresh_interval:
@@ -1047,6 +1427,8 @@ def main() -> None:
                         print(f"{symbol} [{interval}]: sinyal yok")
                         continue
 
+                    signal["fng"] = fng_text
+
                     close_time_key = pd.Timestamp(signal["close_time"]).isoformat()
                     dedupe_key = f"{symbol}|{signal['side']}|{interval}|{close_time_key}"
 
@@ -1055,6 +1437,7 @@ def main() -> None:
                         continue
 
                     message = format_signal_message(signal, interval)
+
                     send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, message)
                     last_sent_key[pt_key] = dedupe_key
                     print(f"{symbol} [{interval}]: {signal['side']} sinyali gonderildi (Guven: {signal['confidence']}%)")
