@@ -897,9 +897,13 @@ def main() -> None:
     last_symbol_refresh = time.monotonic()
     symbol_refresh_interval = cfg.symbol_refresh_hours * 3600
 
+    # 451 / kalici hata alan sembolleri bu oturumda atla
+    banned_symbols: set[str] = set()
+
     while True:
         cycle_started = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        print(f"\n[{cycle_started}] Tarama basliyor... ({len(symbols_to_scan)} sembol x {len(cfg.intervals)} TF)")
+        active_symbols = [s for s in symbols_to_scan if s not in banned_symbols]
+        print(f"\n[{cycle_started}] Tarama basliyor... ({len(active_symbols)} sembol x {len(cfg.intervals)} TF)")
 
         # Sembol listesini periyodik olarak yenile
         if cfg.use_dynamic_symbols and (time.monotonic() - last_symbol_refresh) >= symbol_refresh_interval:
@@ -907,10 +911,11 @@ def main() -> None:
             new_symbols = resolve_symbols(cfg)
             if new_symbols:
                 symbols_to_scan = new_symbols
+                banned_symbols.clear()   # yeni listede yasaklar sifirlansin
                 last_symbol_refresh = time.monotonic()
                 print(f"[INFO] Yeni sembol sayisi: {len(symbols_to_scan)}")
 
-        for symbol in symbols_to_scan:
+        for symbol in active_symbols:
             # Fiyat filtresi: herhangi bir TF'de fiyat yukse atla (tek klines cagrisiyla kontrol)
             price_checked = False
             price_ok = True
@@ -948,7 +953,7 @@ def main() -> None:
                             print(f"{symbol}: filtre disi, fiyat {latest_price:.4f} > {cfg.max_price_usd:.2f}")
                             price_ok = False
                     if not price_ok:
-                        continue
+                        break   # bu sembol icin diger TF'leri de atla
 
                     signal = build_signal(symbol, df, cfg)
 
@@ -989,7 +994,14 @@ def main() -> None:
                             )
 
                 except requests.HTTPError as exc:
-                    print(f"{symbol} [{interval}]: HTTP hata - {exc}")
+                    status = exc.response.status_code if exc.response is not None else 0
+                    if status == 451:
+                        # Cografi kisitlama - bu sembolu kalici olarak atla
+                        banned_symbols.add(symbol)
+                        print(f"{symbol}: bolgesel kisitlama (451) - listeden cikarildi")
+                        break   # bu sembol icin diger TF'leri de deneme
+                    else:
+                        print(f"{symbol} [{interval}]: HTTP hata {status} - {exc}")
                 except Exception as exc:
                     print(f"{symbol} [{interval}]: beklenmeyen hata - {exc}")
 
