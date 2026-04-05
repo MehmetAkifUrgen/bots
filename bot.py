@@ -620,16 +620,36 @@ def fetch_funding_rate(symbol: str, futures_base_url: str) -> float | None:
         return cached[1] if cached else None
 
 
+def _base_from_symbol(symbol: str) -> str:
+    """Sembol adından baz varlığı çıkarır (BTCUSDT → BTC, TUSDUSDT → TUSD)."""
+    for quote in ("USDT", "BUSD", "USDC", "BTC", "ETH", "BNB"):
+        if symbol.endswith(quote):
+            return symbol[:-len(quote)]
+    return symbol
+
+
+def _filter_static_list(symbols: list[str]) -> list[str]:
+    """Statik sembol listesinden stablecoin ve kaldiraçlı token'ları temizler."""
+    filtered = []
+    for s in symbols:
+        base = _base_from_symbol(s)
+        if is_leveraged_token(s) or is_stablecoin(base):
+            print(f"[INFO] Statik listeden filtrelendi: {s}")
+            continue
+        filtered.append(s)
+    return filtered
+
+
 def resolve_symbols(cfg: Config) -> list[str]:
     if not cfg.use_dynamic_symbols:
-        return cfg.symbols
+        return _filter_static_list(cfg.symbols)
 
     try:
         exchange_info = fetch_exchange_info(cfg.binance_api_base)
         ticker_24h = fetch_ticker_24hr(cfg.binance_api_base)
     except Exception as exc:
         print(f"[WARN] Dinamik sembol listesi alinamadi: {exc}")
-        return cfg.symbols
+        return _filter_static_list(cfg.symbols)
 
     # Futures'ta listeli olmayan coinlere sinyal verme
     futures_symbols = fetch_futures_symbols(cfg.binance_api_futures_base)
@@ -1168,6 +1188,52 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
     return None
 
 
+# Zaman dilimleri kucukten buyuge sira numarasi
+_INTERVAL_RANK: dict[str, int] = {
+    "1m": 0, "3m": 1, "5m": 2, "15m": 3, "30m": 4,
+    "1h": 5, "2h": 6, "4h": 7, "6h": 8, "8h": 9, "12h": 10, "1d": 11,
+}
+
+
+def check_mtf_alignment(
+    side: str,
+    signal_interval: str,
+    dfs: dict[str, pd.DataFrame],
+) -> tuple[bool, str]:
+    """Sinyalin TF'sinden daha buyuk zaman dilimlerinin trendi teyit edip etmedigini kontrol eder.
+    Doner: (hizalanmis, aciklama)
+      True  -> tum ust TF'ler ayni yonü gosteriyor VEYA kontrol edilecek ust TF yok
+      False -> en az bir ust TF zit trendde
+    """
+    signal_rank = _INTERVAL_RANK.get(signal_interval, 99)
+    confirmations: list[str] = []
+    conflicts: list[str] = []
+
+    for tf, df in dfs.items():
+        tf_rank = _INTERVAL_RANK.get(tf, -1)
+        if tf_rank <= signal_rank or len(df) < 3:
+            continue
+        row = df.iloc[-2]
+        ema20 = float(row["ema20"])
+        ema50 = float(row["ema50"])
+        if side == "LONG":
+            if ema20 > ema50:
+                confirmations.append(tf)
+            elif ema20 < ema50:
+                conflicts.append(tf)
+        else:
+            if ema20 < ema50:
+                confirmations.append(tf)
+            elif ema20 > ema50:
+                conflicts.append(tf)
+
+    if conflicts:
+        return False, f"Zit TF: {','.join(sorted(conflicts))}"
+    if confirmations:
+        return True, f"MTF Hizali({','.join(sorted(confirmations))})"
+    return True, ""
+
+
 def format_signal_message(signal: dict, interval: str) -> str:
     dt = signal["close_time"]
     if isinstance(dt, pd.Timestamp):
@@ -1382,14 +1448,20 @@ def main() -> None:
                 print(f"[INFO] Yeni sembol sayisi: {len(symbols_to_scan)}")
 
         for symbol in active_symbols:
-            # Fiyat filtresi: herhangi bir TF'de fiyat yukse atla (tek klines cagrisiyla kontrol)
-            price_checked = False
+            # Stablecoin / kaldiraçlı token son savunma hattı (resolve_symbols bypass'larına karşı)
+            if is_leveraged_token(symbol) or is_stablecoin(_base_from_symbol(symbol)):
+                print(f"[SKIP] Stablecoin/kaldiraçlı token atlandı: {symbol}")
+                continue
+
+            # ── Faz 1: Tum TF verileri cekiliyor ──────────────────────────
+            dfs: dict[str, pd.DataFrame] = {}
+            raw_dfs: dict[str, pd.DataFrame] = {}
             price_ok = True
+            price_checked = False
+            banned_by_error = False
 
             for interval in cfg.intervals:
-                # Her (sembol, interval) cifti icin benzersiz anahtar
                 pt_key = f"{symbol}_{interval}"
-
                 try:
                     raw_df = fetch_klines(
                         symbol=symbol,
@@ -1398,6 +1470,8 @@ def main() -> None:
                         base_url=cfg.binance_api_base,
                     )
                     df = add_indicators(raw_df)
+                    raw_dfs[interval] = raw_df
+                    dfs[interval] = df
 
                     # Paper trade: acik pozisyonu guncelle
                     if paper_trader is not None:
@@ -1411,7 +1485,6 @@ def main() -> None:
                                 f"Bakiye: {closed_trade['balance']:.2f}"
                             )
 
-                    # Fiyat filtresini yalnizca ilk TF'de kontrol et (fiyat TF'den bagimsiz)
                     if not price_checked:
                         latest_price = float(raw_df.iloc[-2]["close"])
                         price_checked = True
@@ -1419,15 +1492,47 @@ def main() -> None:
                             print(f"{symbol}: filtre disi, fiyat {latest_price:.4f} > {cfg.max_price_usd:.2f}")
                             price_ok = False
                     if not price_ok:
-                        break   # bu sembol icin diger TF'leri de atla
+                        break
 
+                except requests.HTTPError as exc:
+                    status = exc.response.status_code if exc.response is not None else 0
+                    if status == 451:
+                        banned_symbols.add(symbol)
+                        print(f"{symbol}: bolgesel kisitlama (451) - listeden cikarildi")
+                        banned_by_error = True
+                    else:
+                        print(f"{symbol} [{interval}]: HTTP hata {status} - {exc}")
+                    break
+                except Exception as exc:
+                    print(f"{symbol} [{interval}]: veri cekme hatasi - {exc}")
+                    break
+
+            if not price_ok or banned_by_error:
+                continue
+
+            # ── Faz 2: Sinyal uret + Multi-TF hizalama kontrolu ───────────
+            for interval in cfg.intervals:
+                if interval not in dfs:
+                    continue
+                pt_key = f"{symbol}_{interval}"
+                df = dfs[interval]
+
+                try:
                     signal = build_signal(symbol, df, cfg)
 
                     if not signal:
                         print(f"{symbol} [{interval}]: sinyal yok")
                         continue
 
+                    # Ust TF'ler ayni yonu gostermiyorsa sinyali yayma
+                    aligned, align_info = check_mtf_alignment(signal["side"], interval, dfs)
+                    if not aligned:
+                        print(f"{symbol} [{interval}]: {signal['side']} - MTF hizalanmadi ({align_info})")
+                        continue
+
                     signal["fng"] = fng_text
+                    if align_info:
+                        signal["notes"] += f" | {align_info}"
 
                     close_time_key = pd.Timestamp(signal["close_time"]).isoformat()
                     dedupe_key = f"{symbol}|{signal['side']}|{interval}|{close_time_key}"
@@ -1462,15 +1567,6 @@ def main() -> None:
                                 f"Qty: {open_event['quantity']:.6f}"
                             )
 
-                except requests.HTTPError as exc:
-                    status = exc.response.status_code if exc.response is not None else 0
-                    if status == 451:
-                        # Cografi kisitlama - bu sembolu kalici olarak atla
-                        banned_symbols.add(symbol)
-                        print(f"{symbol}: bolgesel kisitlama (451) - listeden cikarildi")
-                        break   # bu sembol icin diger TF'leri de deneme
-                    else:
-                        print(f"{symbol} [{interval}]: HTTP hata {status} - {exc}")
                 except Exception as exc:
                     print(f"{symbol} [{interval}]: beklenmeyen hata - {exc}")
 
