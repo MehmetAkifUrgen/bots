@@ -519,6 +519,18 @@ def is_leveraged_token(symbol: str) -> bool:
     return symbol.endswith(suffixes)
 
 
+_STABLECOIN_BASES: frozenset[str] = frozenset({
+    "USDC", "BUSD", "DAI", "TUSD", "USDP", "FDUSD", "USDD",
+    "SUSD", "FRAX", "GUSD", "LUSD", "MIM", "USDN", "USDJ",
+    "HUSD", "USDK", "VAI", "USTC", "UST", "CUSD", "EURC",
+})
+
+
+def is_stablecoin(base_asset: str) -> bool:
+    """Dolar veya euro endeksli sabit coinleri filtreler (isim bazli)."""
+    return base_asset.upper() in _STABLECOIN_BASES
+
+
 def resolve_symbols(cfg: Config) -> list[str]:
     if not cfg.use_dynamic_symbols:
         return cfg.symbols
@@ -536,7 +548,8 @@ def resolve_symbols(cfg: Config) -> list[str]:
     candidates: list[tuple[str, float]] = []
     for item in exchange_info.get("symbols", []):
         symbol = str(item.get("symbol", "")).upper()
-        if not symbol or is_leveraged_token(symbol):
+        base_asset = str(item.get("baseAsset", "")).upper()
+        if not symbol or is_leveraged_token(symbol) or is_stablecoin(base_asset):
             continue
 
         if item.get("status") != "TRADING":
@@ -561,10 +574,16 @@ def resolve_symbols(cfg: Config) -> list[str]:
         try:
             last_price = float(ticker.get("lastPrice", 0.0))
             quote_volume = float(ticker.get("quoteVolume", 0.0))
+            high_24h = float(ticker.get("highPrice", 0.0))
+            low_24h = float(ticker.get("lowPrice", 0.0))
         except (TypeError, ValueError):
             continue
 
         if last_price <= 0 or last_price > cfg.max_price_usd:
+            continue
+
+        # 24 saatlik fiyat hareketi %0.5'ten azsa sabit coin gibi davraniyordur – atla.
+        if (high_24h - low_24h) / last_price < 0.005:
             continue
 
         if quote_volume < cfg.min_quote_volume_usd or quote_volume > cfg.max_quote_volume_usd:
@@ -610,13 +629,50 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return atr
 
 
+def compute_macd(
+    series: pd.Series,
+    fast: int = 12,
+    slow: int = 26,
+    signal_period: int = 9,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """MACD cizgisi, sinyal cizgisi ve histogram dondurur."""
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def compute_bollinger(
+    series: pd.Series,
+    period: int = 20,
+    std_dev: float = 2.0,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Bollinger Bands: (upper, mid, lower) dondurur."""
+    mid = series.rolling(period).mean()
+    std = series.rolling(period).std(ddof=0)
+    upper = mid + std_dev * std
+    lower = mid - std_dev * std
+    return upper, mid, lower
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["ema20"] = out["close"].ewm(span=20, adjust=False).mean()
     out["ema50"] = out["close"].ewm(span=50, adjust=False).mean()
+    out["ema200"] = out["close"].ewm(span=200, adjust=False).mean()
     out["rsi14"] = compute_rsi(out["close"], period=14)
     out["atr14"] = compute_atr(out, period=14)
     out["vol_ma20"] = out["volume"].rolling(20).mean()
+    macd_line, macd_sig, macd_hist = compute_macd(out["close"])
+    out["macd"] = macd_line
+    out["macd_signal"] = macd_sig
+    out["macd_hist"] = macd_hist
+    bb_upper, bb_mid, bb_lower = compute_bollinger(out["close"])
+    out["bb_upper"] = bb_upper
+    out["bb_mid"] = bb_mid
+    out["bb_lower"] = bb_lower
     return out
 
 
@@ -676,6 +732,9 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
     atr = float(row["atr14"])
     volume = float(row["volume"])
     vol_ma20 = float(row["vol_ma20"]) if not math.isnan(float(row["vol_ma20"])) else 0.0
+    ema200 = float(row["ema200"])
+    macd_hist_val = float(row["macd_hist"])
+    bb_mid_val = float(row["bb_mid"])
 
     swing_high = float(recent["high"].max())
     swing_low = float(recent["low"].min())
@@ -693,9 +752,13 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
         rsi_ok = 42 <= rsi <= 70
         atr_ok = atr > 0
 
+        macd_bull = not math.isnan(macd_hist_val) and macd_hist_val > 0
+        above_ema200 = not math.isnan(ema200) and close > ema200
+        bb_pullback = not math.isnan(bb_mid_val) and close <= bb_mid_val
+
         score = score_signal(
             base_conditions=[uptrend, fib_ok, rsi_ok],
-            bonus_conditions=[volume_ok, atr_ok, close > fib["0.382"]],
+            bonus_conditions=[volume_ok, atr_ok, close > fib["0.382"], macd_bull, above_ema200, bb_pullback],
         )
 
         if score >= cfg.min_confidence and fib_ok and rsi_ok and atr_ok:
@@ -703,6 +766,14 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
             stop_loss = min(fib["0.786"], entry - 1.2 * atr)
             take_profit = max(entry + (entry - stop_loss) * cfg.risk_reward, fib["1.272_ext"])
             rr = (take_profit - entry) / (entry - stop_loss) if entry > stop_loss else 0.0
+
+            note_parts = ["EMA yukari", "Fib 0.5-0.618"]
+            if macd_bull:
+                note_parts.append("MACD+")
+            if above_ema200:
+                note_parts.append("EMA200 ustu")
+            if bb_pullback:
+                note_parts.append("BB alt yari")
 
             return {
                 "symbol": symbol,
@@ -714,7 +785,8 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
                 "rsi": rsi,
                 "rr": rr,
                 "close_time": row["close_time"],
-                "notes": "EMA trend yukari, fiyat Fibonacci 0.5-0.618 bolgesinde",
+                "macd_hist": 0.0 if math.isnan(macd_hist_val) else macd_hist_val,
+                "notes": " | ".join(note_parts),
             }
 
     if downtrend:
@@ -723,9 +795,13 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
         rsi_ok = 30 <= rsi <= 58
         atr_ok = atr > 0
 
+        macd_bear = not math.isnan(macd_hist_val) and macd_hist_val < 0
+        below_ema200 = not math.isnan(ema200) and close < ema200
+        bb_rejection = not math.isnan(bb_mid_val) and close >= bb_mid_val
+
         score = score_signal(
             base_conditions=[downtrend, fib_ok, rsi_ok],
-            bonus_conditions=[volume_ok, atr_ok, close < fib["0.382"]],
+            bonus_conditions=[volume_ok, atr_ok, close < fib["0.382"], macd_bear, below_ema200, bb_rejection],
         )
 
         if score >= cfg.min_confidence and fib_ok and rsi_ok and atr_ok:
@@ -733,6 +809,14 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
             stop_loss = max(fib["0.786"], entry + 1.2 * atr)
             take_profit = min(entry - (stop_loss - entry) * cfg.risk_reward, fib["1.272_ext"])
             rr = (entry - take_profit) / (stop_loss - entry) if stop_loss > entry else 0.0
+
+            note_parts = ["EMA asagi", "Fib 0.5-0.618"]
+            if macd_bear:
+                note_parts.append("MACD-")
+            if below_ema200:
+                note_parts.append("EMA200 alti")
+            if bb_rejection:
+                note_parts.append("BB ust yari")
 
             return {
                 "symbol": symbol,
@@ -744,7 +828,8 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
                 "rsi": rsi,
                 "rr": rr,
                 "close_time": row["close_time"],
-                "notes": "EMA trend asagi, fiyat Fibonacci 0.5-0.618 bolgesinde",
+                "macd_hist": 0.0 if math.isnan(macd_hist_val) else macd_hist_val,
+                "notes": " | ".join(note_parts),
             }
 
     return None
@@ -767,6 +852,7 @@ def format_signal_message(signal: dict, interval: str) -> str:
         f"TP: `{signal['take_profit']:.4f}`\n"
         f"Tahmini R/R: `{signal['rr']:.2f}`\n"
         f"RSI: `{signal['rsi']:.1f}`\n"
+        f"MACD Hist: `{signal.get('macd_hist', 0):.6f}`\n"
         f"Guven: *{signal['confidence']}%*\n"
         f"Not: {signal['notes']}\n"
         f"Kapanis: {dt_str}"
