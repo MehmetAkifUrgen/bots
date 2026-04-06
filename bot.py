@@ -443,7 +443,7 @@ def load_config() -> Config:
         lookback_bars=int(os.getenv("LOOKBACK_BARS", "250")),
         fib_lookback=int(os.getenv("FIB_LOOKBACK", "120")),
         risk_reward=float(os.getenv("RISK_REWARD", "2.0")),
-        min_confidence=int(os.getenv("MIN_CONFIDENCE", "60")),
+        min_confidence=int(os.getenv("MIN_CONFIDENCE", "70")),
         max_price_usd=float(os.getenv("MAX_PRICE_USD", "100")),
         use_dynamic_symbols=parse_bool(os.getenv("USE_DYNAMIC_SYMBOLS", "true"), default=True),
         min_listing_year=int(os.getenv("MIN_LISTING_YEAR", "2021")),
@@ -781,6 +781,92 @@ def compute_bollinger(
     return upper, mid, lower
 
 
+def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average Directional Index (ADX). 25+ = guclu trend, <20 = yatay piyasa."""
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    tr = pd.concat(
+        [high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    pos_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=df.index,
+    )
+    neg_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=df.index,
+    )
+
+    alpha = 1.0 / period
+    atr_w = tr.ewm(alpha=alpha, adjust=False).mean()
+    pos_di = 100 * pos_dm.ewm(alpha=alpha, adjust=False).mean() / atr_w.replace(0, np.nan)
+    neg_di = 100 * neg_dm.ewm(alpha=alpha, adjust=False).mean() / atr_w.replace(0, np.nan)
+
+    di_sum = (pos_di + neg_di).replace(0, np.nan)
+    dx = (100 * (pos_di - neg_di).abs() / di_sum).fillna(0)
+    adx = dx.ewm(alpha=alpha, adjust=False).mean()
+    return adx
+
+
+def compute_supertrend(
+    df: pd.DataFrame,
+    period: int = 10,
+    multiplier: float = 3.0,
+) -> tuple[pd.Series, pd.Series]:
+    """SuperTrend indikatoru. (st_line, st_bull) dondurur.
+    st_bull = True: fiyat ST'nin uzerinde (yukari yonelim).
+    """
+    atr = compute_atr(df, period)
+    hl2 = (df["high"] + df["low"]) / 2.0
+    basic_upper = (hl2 + multiplier * atr).values
+    basic_lower = (hl2 - multiplier * atr).values
+    close_arr = df["close"].values
+    n = len(df)
+
+    final_upper = basic_upper.copy()
+    final_lower = basic_lower.copy()
+    st = np.full(n, np.nan)
+    bull = np.zeros(n, dtype=bool)
+
+    for i in range(1, n):
+        if basic_upper[i] < final_upper[i - 1] or close_arr[i - 1] > final_upper[i - 1]:
+            final_upper[i] = basic_upper[i]
+        else:
+            final_upper[i] = final_upper[i - 1]
+
+        if basic_lower[i] > final_lower[i - 1] or close_arr[i - 1] < final_lower[i - 1]:
+            final_lower[i] = basic_lower[i]
+        else:
+            final_lower[i] = final_lower[i - 1]
+
+        if np.isnan(st[i - 1]):
+            st[i] = final_upper[i]
+            bull[i] = close_arr[i] > st[i]
+        elif st[i - 1] == final_upper[i - 1]:
+            if close_arr[i] > final_upper[i]:
+                st[i] = final_lower[i]
+                bull[i] = True
+            else:
+                st[i] = final_upper[i]
+                bull[i] = False
+        else:
+            if close_arr[i] < final_lower[i]:
+                st[i] = final_upper[i]
+                bull[i] = False
+            else:
+                st[i] = final_lower[i]
+                bull[i] = True
+
+    return pd.Series(st, index=df.index), pd.Series(bull, index=df.index)
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["ema20"] = out["close"].ewm(span=20, adjust=False).mean()
@@ -799,6 +885,14 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["bb_lower"] = bb_lower
     out["obv"] = compute_obv(out)
     out["obv_ma20"] = out["obv"].rolling(20).mean()
+    out["adx14"] = compute_adx(out, period=14)
+    # BB band genisligi (squeeze/breakout tespiti icin)
+    out["bb_bw"] = (out["bb_upper"] - out["bb_lower"]) / out["bb_mid"].replace(0, np.nan)
+    out["bb_bw_ma20"] = out["bb_bw"].rolling(20).mean()
+    out["bb_bw_min10"] = out["bb_bw"].rolling(10).min()
+    st_line, st_bull = compute_supertrend(out, period=10, multiplier=3.0)
+    out["st_line"] = st_line
+    out["st_bull"] = st_bull
     return out
 
 
@@ -1036,6 +1130,13 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
     bb_mid_val = float(row["bb_mid"])
     obv_val = float(row["obv"])
     obv_ma_val = float(row["obv_ma20"]) if not math.isnan(float(row["obv_ma20"])) else obv_val
+    adx_val = float(row["adx14"]) if not math.isnan(float(row["adx14"])) else 0.0
+    bb_bw_val = float(row["bb_bw"]) if not math.isnan(float(row["bb_bw"])) else 0.0
+    bb_bw_ma_val = float(row["bb_bw_ma20"]) if not math.isnan(float(row["bb_bw_ma20"])) else 0.0
+    bb_bw_min_val = float(row["bb_bw_min10"]) if not math.isnan(float(row["bb_bw_min10"])) else 0.0
+    st_bull_val = bool(row["st_bull"])
+    st_bear_val = not st_bull_val
+    st_line_val = float(row["st_line"]) if not math.isnan(float(row["st_line"])) else 0.0
 
     swing_high = float(recent["high"].max())
     swing_low = float(recent["low"].min())
@@ -1043,22 +1144,27 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
     if range_size <= 0:
         return None
 
-    uptrend = ema20 > ema50 and close > ema20
-    downtrend = ema20 < ema50 and close < ema20
-    volume_ok = vol_ma20 > 0 and volume > vol_ma20
+    # ADX hard gate: <18 ise piyasa yatay — sinyal uretme
+    if adx_val < 18:
+        return None
+
+    # Tam EMA stack gerekli (yatay veya karisik EMA'larda sinyal yok)
+    uptrend = close > ema20 > ema50 > ema200
+    downtrend = close < ema20 < ema50 < ema200
+    # Volume: 1.3x ortalama (gercek hareket olan coinleri sec)
+    volume_ok = vol_ma20 > 0 and volume > 1.3 * vol_ma20
     candle_patterns = detect_candle_patterns(row, prev_row)
     ms = detect_market_structure(df)
     rsi_div = detect_rsi_divergence(df)
     funding_rate = fetch_funding_rate(symbol, cfg.binance_api_futures_base)
 
-    if uptrend:
+    if uptrend and st_bull_val:
         fib = fib_levels_from_swing(swing_low, swing_high)
         fib_ok = in_zone(close, fib["0.5"], fib["0.618"])
         rsi_ok = 42 <= rsi <= 70
         atr_ok = atr > 0
 
         macd_bull = not math.isnan(macd_hist_val) and macd_hist_val > 0
-        above_ema200 = not math.isnan(ema200) and close > ema200
         bb_pullback = not math.isnan(bb_mid_val) and close <= bb_mid_val
         whale_alert = vol_ma20 > 0 and volume > cfg.whale_vol_multiplier * vol_ma20
         obv_rising = obv_val > obv_ma_val
@@ -1066,25 +1172,38 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
         bull_structure = ms["structure"] == "BULLISH"
         bos_signal = ms["bos_bull"]
         bull_div = rsi_div == "BULL"
-        # Funding pozitif ve cok yuksekse longlar asiri dolu → long icin zayif sinyal
+        adx_strong = adx_val >= 25
+        bb_squeeze_break = (
+            bb_bw_ma_val > 0
+            and bb_bw_min_val < bb_bw_ma_val * 0.75
+            and bb_bw_val > bb_bw_min_val * 1.15
+        )
         funding_ok_long = funding_rate is None or funding_rate <= 0.0005
 
         score = score_signal(
-            base_conditions=[uptrend, fib_ok, rsi_ok],
-            bonus_conditions=[volume_ok, atr_ok, close > fib["0.382"], macd_bull, above_ema200, bb_pullback, whale_alert, obv_rising, bullish_candle, bull_structure, bos_signal, bull_div, funding_ok_long],
+            base_conditions=[uptrend, st_bull_val, rsi_ok],
+            bonus_conditions=[fib_ok, close > fib["0.382"], volume_ok, atr_ok, macd_bull, bb_pullback, whale_alert, obv_rising, bullish_candle, bull_structure, bos_signal, bull_div, adx_strong, bb_squeeze_break, funding_ok_long],
         )
 
-        if score >= cfg.min_confidence and fib_ok and rsi_ok and atr_ok:
+        if score >= cfg.min_confidence and rsi_ok and atr_ok and volume_ok:
             entry = close
-            stop_loss = min(fib["0.786"], entry - 1.2 * atr)
-            take_profit = max(entry + (entry - stop_loss) * cfg.risk_reward, fib["1.272_ext"])
+            # SL: SuperTrend cizgisi zemin gorevini goruyor; ATR bandi ile en yakin olan
+            raw_sl = entry - 1.5 * atr
+            stop_loss = max(st_line_val, raw_sl) if st_line_val > 0 and st_line_val < entry else raw_sl
+            if stop_loss >= entry:
+                stop_loss = entry - 1.5 * atr
+            take_profit = entry + (entry - stop_loss) * cfg.risk_reward
             rr = (take_profit - entry) / (entry - stop_loss) if entry > stop_loss else 0.0
 
-            note_parts = ["EMA yukari", "Fib 0.5-0.618"]
+            note_parts = ["EMA Stack", "SuperTrend Bull"]
+            if adx_strong:
+                note_parts.append("ADX Guclu")
+            if bb_squeeze_break:
+                note_parts.append("BB Squeeze/Breakout")
+            if fib_ok:
+                note_parts.append("Fib 0.5-0.618")
             if macd_bull:
                 note_parts.append("MACD+")
-            if above_ema200:
-                note_parts.append("EMA200 ustu")
             if bb_pullback:
                 note_parts.append("BB alt yari")
             if whale_alert:
@@ -1115,17 +1234,17 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
                 "market_structure": ms["structure"],
                 "bos": ms["bos_bull"],
                 "funding_rate": funding_str,
+                "supertrend": "Bull",
                 "notes": " | ".join(note_parts),
             }
 
-    if downtrend:
+    if downtrend and st_bear_val:
         fib = short_fib_levels_from_swing(swing_low, swing_high)
         fib_ok = in_zone(close, fib["0.5"], fib["0.618"])
         rsi_ok = 30 <= rsi <= 58
         atr_ok = atr > 0
 
         macd_bear = not math.isnan(macd_hist_val) and macd_hist_val < 0
-        below_ema200 = not math.isnan(ema200) and close < ema200
         bb_rejection = not math.isnan(bb_mid_val) and close >= bb_mid_val
         whale_alert = vol_ma20 > 0 and volume > cfg.whale_vol_multiplier * vol_ma20
         obv_falling = obv_val < obv_ma_val
@@ -1133,25 +1252,37 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
         bear_structure = ms["structure"] == "BEARISH"
         bos_signal = ms["bos_bear"]
         bear_div = rsi_div == "BEAR"
-        # Funding negatif ve cok dusukse shortlar asiri dolu → short icin zayif sinyal
+        adx_strong = adx_val >= 25
+        bb_squeeze_break = (
+            bb_bw_ma_val > 0
+            and bb_bw_min_val < bb_bw_ma_val * 0.75
+            and bb_bw_val > bb_bw_min_val * 1.15
+        )
         funding_ok_short = funding_rate is None or funding_rate >= -0.0005
 
         score = score_signal(
-            base_conditions=[downtrend, fib_ok, rsi_ok],
-            bonus_conditions=[volume_ok, atr_ok, close < fib["0.382"], macd_bear, below_ema200, bb_rejection, whale_alert, obv_falling, bearish_candle, bear_structure, bos_signal, bear_div, funding_ok_short],
+            base_conditions=[downtrend, st_bear_val, rsi_ok],
+            bonus_conditions=[fib_ok, close < fib["0.382"], volume_ok, atr_ok, macd_bear, bb_rejection, whale_alert, obv_falling, bearish_candle, bear_structure, bos_signal, bear_div, adx_strong, bb_squeeze_break, funding_ok_short],
         )
 
-        if score >= cfg.min_confidence and fib_ok and rsi_ok and atr_ok:
+        if score >= cfg.min_confidence and rsi_ok and atr_ok and volume_ok:
             entry = close
-            stop_loss = max(fib["0.786"], entry + 1.2 * atr)
-            take_profit = min(entry - (stop_loss - entry) * cfg.risk_reward, fib["1.272_ext"])
+            raw_sl = entry + 1.5 * atr
+            stop_loss = min(st_line_val, raw_sl) if st_line_val > entry else raw_sl
+            if stop_loss <= entry:
+                stop_loss = entry + 1.5 * atr
+            take_profit = entry - (stop_loss - entry) * cfg.risk_reward
             rr = (entry - take_profit) / (stop_loss - entry) if stop_loss > entry else 0.0
 
-            note_parts = ["EMA asagi", "Fib 0.5-0.618"]
+            note_parts = ["EMA Stack", "SuperTrend Bear"]
+            if adx_strong:
+                note_parts.append("ADX Guclu")
+            if bb_squeeze_break:
+                note_parts.append("BB Squeeze/Breakout")
+            if fib_ok:
+                note_parts.append("Fib 0.5-0.618")
             if macd_bear:
                 note_parts.append("MACD-")
-            if below_ema200:
-                note_parts.append("EMA200 alti")
             if bb_rejection:
                 note_parts.append("BB ust yari")
             if whale_alert:
@@ -1182,6 +1313,7 @@ def build_signal(symbol: str, df: pd.DataFrame, cfg: Config) -> dict | None:
                 "market_structure": ms["structure"],
                 "bos": ms["bos_bear"],
                 "funding_rate": funding_str,
+                "supertrend": "Bear",
                 "notes": " | ".join(note_parts),
             }
 
@@ -1272,6 +1404,7 @@ def format_signal_message(signal: dict, interval: str) -> str:
         f"Tahmini R/R: `{signal['rr']:.2f}`\n"
         f"RSI: `{signal['rsi']:.1f}`\n"
         f"MACD Hist: `{signal.get('macd_hist', 0):.6f}`\n"
+        f"SuperTrend: `{signal.get('supertrend', '?')}`\n"
         f"Yapi: `{signal.get('market_structure', '?')}`{'  *[BOS]*' if signal.get('bos') else ''}\n"
         f"Funding: `{signal.get('funding_rate', '?')}`\n"
         f"Guven: *{signal['confidence']}%*\n"
