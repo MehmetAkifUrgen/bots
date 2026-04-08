@@ -1,137 +1,127 @@
-# Binance Signal Notifier Bot (Telegram)
+# Binance Futures Top Gainers Analyzer
 
-Bu bot Binance spot verilerini teknik analiz ile tarar ve sinyal bulursa Telegram'a mesaj atar.
+Bu proje Binance USDT-M perpetual futures tarafinda 24 saatlik en cok yukselen 10 coini tarar ve her coin icin su sorulara cevap verir:
 
-Ek olarak paper trade (sanal al-sat) modulu ile gercek para kullanmadan stratejinin performansini takip eder.
+- Trend devam ediyor mu?
+- Long mu, short mu, yoksa bekle mi?
+- Giris bolgesi neresi?
+- Stop ve iki kademe hedef nerede?
 
-Kullanılan ana filtreler:
+Bot emir acmaz. Ilk surumun amaci temiz bir analiz akisi kurmak ve Telegram'a kullanilabilir trade setup'lari dusurmektir.
 
-- EMA 20 / EMA 50 trend yönü
-- RSI(14)
-- ATR(14) tabanlı stop-loss
-- Fibonacci retracement (0.5 - 0.618 bölgesi)
-- Basit hacim filtresi (volume > 20 ortalama)
-- Maksimum fiyat filtresi (`MAX_PRICE_USD`) ile pahali coinleri eleme
-- Dinamik sembol secimi: 2021+ listelenme ve dusuk hacim araligi
+## Nasil Calisir
 
-Paper trade ozellikleri:
+Her dongude bot:
 
-- Sinyal geldiginde sanal pozisyon acma
-- Mum yuksek/dusuk verisine gore TP/SL tetikleme
-- Net PnL, win rate, max drawdown takibi
-- Kapanan islemleri `paper_trades.csv` dosyasina loglama
+1. Binance Futures'tan aktif USDT perpetual sembolleri alir.
+2. 24 saatlik en cok yukselen coinleri hacim filtresiyle siralar.
+3. Her coin icin `15m`, `1h` ve `4h` mumlarini ceker.
+4. EMA, RSI, ATR, MACD histogram ve ADX hesaplar.
+5. Her coin icin su kararlardan birini uretir:
+   - `LONG`: trend devam setup'i
+   - `SHORT`: trend short veya asiri sisme sonrasi exhaustion short
+   - `WAIT`: coin hareketli ama giris kalitesi zayif
+6. Rapor degistiyse Telegram'a tek mesaj halinde gonderir.
 
-## Kurulum
+## Neden Gemini Ilk Asamada Sart Degil
 
-1. Python 3.11+ önerilir.
-2. Bağımlılıkları kur:
+Gemini istersen sonra eklenebilir, ama sinyal motorunun kendisi kuralli kalmali. LLM katmani daha cok su isler icin mantikli:
+
+- Mesajlari daha insan gibi yorumlamak
+- Ek aciklama veya ozet yazmak
+- Teknik sinyalin yanina risk notu dusmek
+
+Karar mekanizmasini LLM'e birakmak tutarsizlik yaratir. O yuzden v1 kuralli, deterministik ve test edilebilir.
+
+## Gereksinimler
+
+- Python 3.11+
+- Telegram mesaji istiyorsan bot token + chat id
+
+Kurulum:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Ortam değişkenlerini hazırla:
+## Ortam Degiskenleri
 
-```bash
-cp .env.example .env
-```
-
-4. `.env` içini doldur:
+Zorunlu:
 
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
-- `BINANCE_API_KEY`
-- `BINANCE_API_SECRET`
-- `BINANCE_API_FUTURES_BASE` (varsayilan: `https://fapi.binance.com`)
-- `USE_FUTURES` (`true`/`false`)
-- `FUTURES_ORDER_ENABLED` (`true`/`false`, varsayılan `false`). Sadece Telegram sinyal istiyorsan `false` olsun.
-- `FUTURES_LEVERAGE` (örn: `10`)
-- `FUTURES_MARGIN_TYPE` (`ISOLATED` veya `CROSSED`)
-- `FUTURES_RISK_PER_TRADE_PCT` (islem basi risk yuzdesi)
-- `MAX_NOTIONAL_PER_TRADE` (futures pozisyon notional siniri)
-- `SYMBOLS` (virgülle)
-- `INTERVAL` (örn: `15m`, `1h`)
-- `MAX_PRICE_USD` (sadece bu fiyat ve altindaki coinleri tara)
-- `USE_DYNAMIC_SYMBOLS` (`true` ise Binance'den otomatik sembol secer)
-- `MIN_LISTING_YEAR` (ornek: `2021`)
-- `MIN_QUOTE_VOLUME_USD` (24s minimum quote hacim)
-- `MAX_QUOTE_VOLUME_USD` (24s maksimum quote hacim)
-- `DYNAMIC_SYMBOL_LIMIT` (taranacak sembol limiti)
-- `PAPER_TRADE_ENABLED` (`true`/`false`)
-- `PAPER_INITIAL_BALANCE` (baslangic sanal bakiye)
-- `PAPER_RISK_PER_TRADE_PCT` (islem basi risk yuzdesi)
-- `PAPER_FEE_RATE` (komisyon orani, varsayilan `0.0004`)
-- `PAPER_LOG_FILE` (islem log dosyasi)
 
-Not: Dinamik secim acikken bot sadece su kosullari saglayan USDT paritelerini alir:
+Opsiyonel:
 
-- Binance spotta `TRADING` durumda olmasi
-- `MIN_LISTING_YEAR` ve sonrasi listelenmis olmasi
-- Son fiyatin `MAX_PRICE_USD` ve altinda olmasi
-- 24s quote hacminin `MIN_QUOTE_VOLUME_USD` ile `MAX_QUOTE_VOLUME_USD` araliginda olmasi
+- `BINANCE_API_FUTURES_BASE` varsayilan `https://fapi.binance.com`
+- `SCAN_EVERY_SECONDS` varsayilan `120`
+- `TOP_GAINERS_LIMIT` varsayilan `10`
+- `MIN_QUOTE_VOLUME_USD` varsayilan `15000000`
+- `MAX_QUOTE_VOLUME_USD` varsayilan `5000000000`
+- `LOOKBACK_BARS` varsayilan `260`
+- `MIN_READY_CONFIDENCE` varsayilan `78`
+- `SEND_WAIT_SETUPS` varsayilan `true`
+- `MAX_WAIT_SETUPS` varsayilan `3`
+- `ANALYSIS_STATE_FILE` varsayilan `analysis_state.json`
 
-## Çalıştırma
+Telegram ayari yoksa bot yine calisir ama raporu konsola yazar.
+
+## Calistirma
 
 ```bash
 python bot.py
 ```
 
+## Telegram Mesaji Nasil Okunur
+
+Her coin icin raporda su alanlar gelir:
+
+- `READY LONG`, `READY SHORT` veya `WAIT`
+- Guven skoru
+- 24s fiyat degisimi
+- Entry zone
+- Stop
+- TP1 ve TP2
+- Kararin nedenleri
+
+`WAIT` demek coin kotu degil, sadece su an kovalanacak kadar temiz setup vermiyor demek.
+
+Bot artik raporu ikiye ayirir:
+
+- `Isleme Uygunlar`: `MIN_READY_CONFIDENCE` esigini gecen setup'lar
+- `Izleme Listesi`: opsiyonel olarak gonderilen, henuz temiz olmayan coinler
+
 ## Railway Deploy
 
-1. Projeyi GitHub'a push et.
-2. Railway'de `New Project` -> `Deploy from GitHub Repo` ile bu repoyu sec.
-3. Servis ayarlarinda Start Command gerekirse `python -u bot.py` yaz.
-4. Railway `Variables` bolumune asagidaki degiskenleri tek tek ekle:
-   - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_CHAT_ID`
-   - `BINANCE_API_KEY`
-   - `BINANCE_API_SECRET`
-   - `BINANCE_API_FUTURES_BASE`
-   - `USE_FUTURES`
-   - `FUTURES_ORDER_ENABLED`
-   - `FUTURES_LEVERAGE`
-   - `FUTURES_MARGIN_TYPE`
-   - `FUTURES_RISK_PER_TRADE_PCT`
-   - `MAX_NOTIONAL_PER_TRADE`
-   - `SYMBOLS`
-   - `USE_DYNAMIC_SYMBOLS`
-   - `MIN_LISTING_YEAR`
-   - `MIN_QUOTE_VOLUME_USD`
-   - `MAX_QUOTE_VOLUME_USD`
-   - `DYNAMIC_SYMBOL_LIMIT`
-   - `MAX_PRICE_USD`
-   - `INTERVAL`
-   - `SCAN_EVERY_SECONDS`
-   - `LOOKBACK_BARS`
-   - `FIB_LOOKBACK`
-   - `RISK_REWARD`
-   - `MIN_CONFIDENCE`
-   - `PAPER_TRADE_ENABLED`
-   - `PAPER_INITIAL_BALANCE`
-   - `PAPER_RISK_PER_TRADE_PCT`
-   - `PAPER_FEE_RATE`
-   - `PAPER_LOG_FILE`
-5. Deploy sonrasi loglarda `Tarama basliyor...` satirini goruyorsan bot calisiyor demektir.
+Railway start command zaten hazir:
 
-Oneri:
+```bash
+python -u bot.py
+```
 
-- Railway tarafinda localdeki `.env` dosyasini yukleme; degerleri `Variables` icine tek tek ekle.
-- Local testte `USE_DYNAMIC_SYMBOLS=true` ile basla; cok az sembol gelirse hacim limitlerini genislet.
+`Variables` kismina en az su degerleri gir:
 
-Not: Bu proje su an icin sadece teknik analiz temelli sinyal uretir. Haber, siyasi, savas gibi olaylar dogrudan entegre edilmedi; gelecekte ekleyebiliriz.
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `SCAN_EVERY_SECONDS`
+- `TOP_GAINERS_LIMIT`
+- `MIN_QUOTE_VOLUME_USD`
+- `MAX_QUOTE_VOLUME_USD`
+- `MIN_READY_CONFIDENCE`
+- `SEND_WAIT_SETUPS`
+- `MAX_WAIT_SETUPS`
 
-Paper trade aciksa bot sinyal mesajina ek olarak:
+Deploy sonrasi loglarda `Top gainers` ve `Telegram'a rapor gonderildi` satirlarini goruyorsan akis calisiyor demektir.
 
-- "Paper Trade Acildi" mesaji yollar
-- TP/SL oldugunda "Paper Trade Kapandi" mesaji yollar
-- Islem sonucunu `paper_trades.csv` dosyasina yazar
+## Sonraki Asama
 
-Eger `FUTURES_ORDER_ENABLED=true` yaparsan bu bot Binance futures hesabina market order gonderebilir. Bunun icin:
+Istersen bir sonraki iterasyonda bunlardan birini ekleyebiliriz:
 
-- Binance futures API anahtarini kullan
-- API anahtari `Enable Futures` ve `Enable Trading` izinlerine sahip olmalidir
-- `FUTURES_ORDER_ENABLED` ilk once `false` olsun, local test sonrasi `true` yap
+1. Gemini ile teknik rapora dogal dil yorumu.
+2. Open interest ve liquidation verisi.
+3. Backtest modu.
+4. Sadece `READY` setup'lari atan sessiz mod.
 
-## Önemli Not
+## Uyari
 
-Bu bot yatırım tavsiyesi vermez. Sinyaller örnek/otomasyon amaçlıdır; canlı işlem öncesi mutlaka ileri test ve risk kontrolü yap.
+Bu proje yatirim tavsiyesi degildir. Canli emir baglamadan once forward test ve risk kontrolu yap.
