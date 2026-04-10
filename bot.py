@@ -4,7 +4,7 @@ import math
 import os
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -26,6 +26,7 @@ class Config:
     telegram_chat_id: str
     futures_base_url: str
     scan_every_seconds: int
+    min_scan_interval_seconds: int
     top_gainers_limit: int
     min_quote_volume_usd: float
     max_quote_volume_usd: float
@@ -34,6 +35,11 @@ class Config:
     send_wait_setups: bool
     max_wait_setups: int
     analysis_state_file: str
+    analysis_log_file: str
+    paper_trades_file: str
+    max_position_hold_hours: int
+    position_size_usd: float
+    starting_balance_usd: float
 
 
 @dataclass
@@ -49,6 +55,7 @@ class Setup:
     symbol: str
     decision: str
     setup_type: str
+    strategy_key: str
     confidence: int
     price_change_pct: float
     funding_rate_pct: float | None
@@ -62,6 +69,31 @@ class Setup:
     summary: str
 
 
+@dataclass
+class StrategyStats:
+    strategy_key: str
+    closed_trades: int
+    win_rate: float
+    avg_pnl_net: float
+    score_bonus: float
+
+
+@dataclass
+class ActivePosition:
+    symbol: str
+    side: str
+    setup_type: str
+    strategy_key: str
+    confidence: int
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    quantity: float
+    opened_at: str
+    max_hold_until: str | None
+    price_change_pct: float
+
+
 def parse_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
@@ -70,12 +102,15 @@ def parse_bool(value: str | None, default: bool = False) -> bool:
 
 def load_config() -> Config:
     load_dotenv()
+    requested_scan_seconds = int(os.getenv("SCAN_EVERY_SECONDS", "900"))
+    min_scan_interval_seconds = int(os.getenv("MIN_SCAN_INTERVAL_SECONDS", "900"))
     return Config(
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
         futures_base_url=os.getenv("BINANCE_API_FUTURES_BASE", "https://fapi.binance.com").strip(),
-        scan_every_seconds=int(os.getenv("SCAN_EVERY_SECONDS", "120")),
-        top_gainers_limit=int(os.getenv("TOP_GAINERS_LIMIT", "10")),
+        scan_every_seconds=max(requested_scan_seconds, min_scan_interval_seconds),
+        min_scan_interval_seconds=min_scan_interval_seconds,
+        top_gainers_limit=int(os.getenv("TOP_GAINERS_LIMIT", "0")),
         min_quote_volume_usd=float(os.getenv("MIN_QUOTE_VOLUME_USD", "15000000")),
         max_quote_volume_usd=float(os.getenv("MAX_QUOTE_VOLUME_USD", "5000000000")),
         lookback_bars=int(os.getenv("LOOKBACK_BARS", "260")),
@@ -83,6 +118,11 @@ def load_config() -> Config:
         send_wait_setups=parse_bool(os.getenv("SEND_WAIT_SETUPS", "true"), default=True),
         max_wait_setups=int(os.getenv("MAX_WAIT_SETUPS", "3")),
         analysis_state_file=os.getenv("ANALYSIS_STATE_FILE", "analysis_state.json").strip(),
+        analysis_log_file=os.getenv("ANALYSIS_LOG_FILE", "analysis_log.csv").strip(),
+        paper_trades_file=os.getenv("PAPER_TRADES_FILE", "paper_trades.csv").strip(),
+        max_position_hold_hours=int(os.getenv("MAX_POSITION_HOLD_HOURS", "0")),
+        position_size_usd=float(os.getenv("POSITION_SIZE_USD", "100")),
+        starting_balance_usd=float(os.getenv("STARTING_BALANCE_USD", "1000")),
     )
 
 
@@ -105,6 +145,22 @@ def write_state(path: str, state: dict) -> None:
         json.dump(state, handle, ensure_ascii=True, indent=2)
 
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def fetch_json(url: str, *, params: dict | None = None, timeout: int = 20) -> dict | list:
     response = requests.get(url, params=params, timeout=timeout)
     response.raise_for_status()
@@ -125,6 +181,10 @@ def send_telegram(cfg: Config, text: str) -> None:
     }
     response = requests.post(url, json=payload, timeout=20)
     response.raise_for_status()
+
+
+def build_strategy_key(decision: str, setup_type: str) -> str:
+    return f"{decision.lower()}::{setup_type.lower()}"
 
 
 def symbol_base(symbol: str) -> str:
@@ -160,7 +220,7 @@ def fetch_active_futures_symbols(cfg: Config) -> set[str]:
     return symbols
 
 
-def fetch_top_gainers(cfg: Config) -> list[MarketTicker]:
+def fetch_market_candidates(cfg: Config) -> list[MarketTicker]:
     active_symbols = fetch_active_futures_symbols(cfg)
     tickers = fetch_json(f"{cfg.futures_base_url}/fapi/v1/ticker/24hr", timeout=30)
     candidates: list[MarketTicker] = []
@@ -177,8 +237,6 @@ def fetch_top_gainers(cfg: Config) -> list[MarketTicker]:
         except (TypeError, ValueError):
             continue
 
-        if price_change_pct <= 0:
-            continue
         if quote_volume < cfg.min_quote_volume_usd or quote_volume > cfg.max_quote_volume_usd:
             continue
         if last_price <= 0:
@@ -193,8 +251,10 @@ def fetch_top_gainers(cfg: Config) -> list[MarketTicker]:
             )
         )
 
-    candidates.sort(key=lambda item: (item.price_change_pct, item.quote_volume), reverse=True)
-    return candidates[: cfg.top_gainers_limit]
+    candidates.sort(key=lambda item: (abs(item.price_change_pct), item.quote_volume), reverse=True)
+    if cfg.top_gainers_limit > 0:
+        return candidates[: cfg.top_gainers_limit]
+    return candidates
 
 
 def fetch_funding_rates(cfg: Config) -> dict[str, float]:
@@ -323,7 +383,11 @@ def trend_down(row: pd.Series) -> bool:
     return close < ema20 < ema50 < ema200
 
 
-def build_setup(market: MarketTicker, frames: dict[str, pd.DataFrame], funding_rate: float | None) -> Setup:
+def build_candidate_setups(
+    market: MarketTicker,
+    frames: dict[str, pd.DataFrame],
+    funding_rate: float | None,
+) -> list[Setup]:
     tf_15 = frames["15m"]
     tf_1h = frames["1h"]
     tf_4h = frames["4h"]
@@ -353,6 +417,7 @@ def build_setup(market: MarketTicker, frames: dict[str, pd.DataFrame], funding_r
     swing_high_15 = safe_float(recent_15["high"].max())
     dist_from_ema20 = (close_15 - ema20_15) / atr_15 if atr_15 > 0 else 0.0
     funding_pct = funding_rate * 100 if funding_rate is not None else None
+    candidates: list[Setup] = []
 
     long_conditions = [
         trend_up(row_4h),
@@ -390,6 +455,28 @@ def build_setup(market: MarketTicker, frames: dict[str, pd.DataFrame], funding_r
     ]
     exhaustion_short_score = int(round(100 * sum(exhaustion_short_conditions) / len(exhaustion_short_conditions)))
 
+    scalp_long_conditions = [
+        trend_up(row_1h),
+        close_15 >= ema20_15 >= ema50_15,
+        48 <= rsi_15 <= 66,
+        adx_15 >= 20,
+        macd_15 > macd_15_prev,
+        volume_15 >= vol_ma_15 * 1.05,
+        0.0 <= dist_from_ema20 <= 0.55,
+    ]
+    scalp_long_score = int(round(100 * sum(scalp_long_conditions) / len(scalp_long_conditions)))
+
+    scalp_short_conditions = [
+        trend_down(row_1h),
+        close_15 <= ema20_15 <= ema50_15,
+        34 <= rsi_15 <= 52,
+        adx_15 >= 20,
+        macd_15 < macd_15_prev,
+        volume_15 >= vol_ma_15 * 1.05,
+        -0.55 <= dist_from_ema20 <= 0.0,
+    ]
+    scalp_short_score = int(round(100 * sum(scalp_short_conditions) / len(scalp_short_conditions)))
+
     if long_score >= 78:
         entry_low = min(close_15, ema20_15)
         entry_high = max(close_15, ema20_15 + 0.25 * atr_15)
@@ -400,21 +487,24 @@ def build_setup(market: MarketTicker, frames: dict[str, pd.DataFrame], funding_r
         risk = max(entry_mid - stop_loss, atr_15 * 0.8)
         target_1 = entry_mid + 1.5 * risk
         target_2 = entry_mid + 2.5 * risk
-        return Setup(
-            symbol=market.symbol,
-            decision="LONG",
-            setup_type="trend continuation",
-            confidence=long_score,
-            price_change_pct=market.price_change_pct,
-            funding_rate_pct=funding_pct,
-            entry_low=entry_low,
-            entry_high=entry_high,
-            stop_loss=stop_loss,
-            target_1=target_1,
-            target_2=target_2,
-            ready=True,
-            invalidation="15m kapanis EMA20 altina inerse setup zayiflar.",
-            summary="4h ve 1h trend yukari, 15m tarafinda geri cekilme sonrasi devam setup'i var.",
+        candidates.append(
+            Setup(
+                symbol=market.symbol,
+                decision="LONG",
+                setup_type="trend continuation",
+                strategy_key=build_strategy_key("LONG", "trend continuation"),
+                confidence=long_score,
+                price_change_pct=market.price_change_pct,
+                funding_rate_pct=funding_pct,
+                entry_low=entry_low,
+                entry_high=entry_high,
+                stop_loss=stop_loss,
+                target_1=target_1,
+                target_2=target_2,
+                ready=True,
+                invalidation="15m kapanis EMA20 altina inerse setup zayiflar.",
+                summary="4h ve 1h trend yukari, 15m tarafinda geri cekilme sonrasi devam setup'i var.",
+            )
         )
 
     if trend_short_score >= 78:
@@ -427,21 +517,24 @@ def build_setup(market: MarketTicker, frames: dict[str, pd.DataFrame], funding_r
         risk = max(stop_loss - entry_mid, atr_15 * 0.8)
         target_1 = entry_mid - 1.5 * risk
         target_2 = entry_mid - 2.5 * risk
-        return Setup(
-            symbol=market.symbol,
-            decision="SHORT",
-            setup_type="trend continuation",
-            confidence=trend_short_score,
-            price_change_pct=market.price_change_pct,
-            funding_rate_pct=funding_pct,
-            entry_low=entry_low,
-            entry_high=entry_high,
-            stop_loss=stop_loss,
-            target_1=target_1,
-            target_2=target_2,
-            ready=True,
-            invalidation="15m kapanis EMA20 ustune geri cikarsa setup bozulur.",
-            summary="Yukselenler icinde olsa da ust zaman dilimlerinde zayiflik var ve trend short setup'i olusmus.",
+        candidates.append(
+            Setup(
+                symbol=market.symbol,
+                decision="SHORT",
+                setup_type="trend continuation",
+                strategy_key=build_strategy_key("SHORT", "trend continuation"),
+                confidence=trend_short_score,
+                price_change_pct=market.price_change_pct,
+                funding_rate_pct=funding_pct,
+                entry_low=entry_low,
+                entry_high=entry_high,
+                stop_loss=stop_loss,
+                target_1=target_1,
+                target_2=target_2,
+                ready=True,
+                invalidation="15m kapanis EMA20 ustune geri cikarsa setup bozulur.",
+                summary="Yukselenler icinde olsa da ust zaman dilimlerinde zayiflik var ve trend short setup'i olusmus.",
+            )
         )
 
     if exhaustion_short_score >= 72:
@@ -452,22 +545,84 @@ def build_setup(market: MarketTicker, frames: dict[str, pd.DataFrame], funding_r
         risk = max(stop_loss - entry_mid, atr_15 * 0.8)
         target_1 = entry_mid - 1.2 * risk
         target_2 = entry_mid - 2.0 * risk
-        return Setup(
-            symbol=market.symbol,
-            decision="SHORT",
-            setup_type="exhaustion fade",
-            confidence=exhaustion_short_score,
-            price_change_pct=market.price_change_pct,
-            funding_rate_pct=funding_pct,
-            entry_low=entry_low,
-            entry_high=entry_high,
-            stop_loss=stop_loss,
-            target_1=target_1,
-            target_2=target_2,
-            ready=True,
-            invalidation="Yeni 15m zirve gelirse counter-trend short iptal edilir.",
-            summary="Coin cok sisli, RSI yuksek ve momentum zayifliyor; sadece hizli short denemesi olarak dusun.",
+        candidates.append(
+            Setup(
+                symbol=market.symbol,
+                decision="SHORT",
+                setup_type="exhaustion fade",
+                strategy_key=build_strategy_key("SHORT", "exhaustion fade"),
+                confidence=exhaustion_short_score,
+                price_change_pct=market.price_change_pct,
+                funding_rate_pct=funding_pct,
+                entry_low=entry_low,
+                entry_high=entry_high,
+                stop_loss=stop_loss,
+                target_1=target_1,
+                target_2=target_2,
+                ready=True,
+                invalidation="Yeni 15m zirve gelirse counter-trend short iptal edilir.",
+                summary="Coin cok sisli, RSI yuksek ve momentum zayifliyor; sadece hizli short denemesi olarak dusun.",
+            )
         )
+
+    if scalp_long_score >= 72:
+        entry_low = min(close_15, ema20_15)
+        entry_high = max(close_15, ema20_15 + 0.15 * atr_15)
+        stop_loss = min(entry_low - 0.75 * atr_15, swing_low_15)
+        entry_mid = (entry_low + entry_high) / 2
+        risk = max(entry_mid - stop_loss, atr_15 * 0.55)
+        target_1 = entry_mid + 1.1 * risk
+        target_2 = entry_mid + 1.6 * risk
+        candidates.append(
+            Setup(
+                symbol=market.symbol,
+                decision="LONG",
+                setup_type="scalp continuation",
+                strategy_key=build_strategy_key("LONG", "scalp continuation"),
+                confidence=scalp_long_score,
+                price_change_pct=market.price_change_pct,
+                funding_rate_pct=funding_pct,
+                entry_low=entry_low,
+                entry_high=entry_high,
+                stop_loss=stop_loss,
+                target_1=target_1,
+                target_2=target_2,
+                ready=True,
+                invalidation="15m EMA20 ve son dip birlikte kirilirse scalp long iptal olur.",
+                summary="1h yon yukari, 15m momentum ve hacim hizlaniyor; kisa vadeli scalp devam setup'i var.",
+            )
+        )
+
+    if scalp_short_score >= 72:
+        entry_low = min(close_15 - 0.15 * atr_15, ema20_15)
+        entry_high = max(close_15, ema20_15)
+        stop_loss = max(entry_high + 0.75 * atr_15, swing_high_15)
+        entry_mid = (entry_low + entry_high) / 2
+        risk = max(stop_loss - entry_mid, atr_15 * 0.55)
+        target_1 = entry_mid - 1.1 * risk
+        target_2 = entry_mid - 1.6 * risk
+        candidates.append(
+            Setup(
+                symbol=market.symbol,
+                decision="SHORT",
+                setup_type="scalp continuation",
+                strategy_key=build_strategy_key("SHORT", "scalp continuation"),
+                confidence=scalp_short_score,
+                price_change_pct=market.price_change_pct,
+                funding_rate_pct=funding_pct,
+                entry_low=entry_low,
+                entry_high=entry_high,
+                stop_loss=stop_loss,
+                target_1=target_1,
+                target_2=target_2,
+                ready=True,
+                invalidation="15m EMA20 ustune sert geri alim gelirse scalp short iptal olur.",
+                summary="1h yon asagi, 15m momentum ivmeleniyor; kisa vadeli scalp short setup'i var.",
+            )
+        )
+
+    if candidates:
+        return candidates
 
     wait_reasons: list[str] = []
     if not trend_up(row_4h):
@@ -481,22 +636,315 @@ def build_setup(market: MarketTicker, frames: dict[str, pd.DataFrame], funding_r
     if not wait_reasons:
         wait_reasons.append("setup kosullari eksik")
 
-    return Setup(
-        symbol=market.symbol,
-        decision="WAIT",
-        setup_type="no clean setup",
-        confidence=max(long_score, trend_short_score, exhaustion_short_score),
-        price_change_pct=market.price_change_pct,
-        funding_rate_pct=funding_pct,
-        entry_low=None,
-        entry_high=None,
-        stop_loss=None,
-        target_1=None,
-        target_2=None,
-        ready=False,
-        invalidation="Temiz retest veya yon teyidi gelmeden islem yok.",
-        summary="; ".join(wait_reasons),
+    return [
+        Setup(
+            symbol=market.symbol,
+            decision="WAIT",
+            setup_type="no clean setup",
+            strategy_key=build_strategy_key("WAIT", "no clean setup"),
+            confidence=max(long_score, trend_short_score, exhaustion_short_score, scalp_long_score, scalp_short_score),
+            price_change_pct=market.price_change_pct,
+            funding_rate_pct=funding_pct,
+            entry_low=None,
+            entry_high=None,
+            stop_loss=None,
+            target_1=None,
+            target_2=None,
+            ready=False,
+            invalidation="Temiz retest veya yon teyidi gelmeden islem yok.",
+            summary="; ".join(wait_reasons),
+        )
+    ]
+
+
+def load_trade_history(path: str) -> pd.DataFrame:
+    columns = [
+        "symbol",
+        "side",
+        "setup_type",
+        "strategy_key",
+        "entry",
+        "exit",
+        "stop_loss",
+        "take_profit",
+        "quantity",
+        "opened_at",
+        "closed_at",
+        "exit_reason",
+        "pnl_net",
+        "balance_after",
+        "confidence",
+    ]
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return pd.DataFrame(columns=columns)
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame(columns=columns)
+    for column in columns:
+        if column not in df.columns:
+            df[column] = np.nan
+    return df[columns]
+
+
+def compute_strategy_stats(path: str) -> dict[str, StrategyStats]:
+    trade_history = load_trade_history(path)
+    if trade_history.empty:
+        return {}
+
+    trade_history["pnl_net"] = pd.to_numeric(trade_history["pnl_net"], errors="coerce")
+    if trade_history["strategy_key"].isna().all():
+        trade_history["strategy_key"] = trade_history.apply(
+            lambda row: build_strategy_key(str(row.get("side", "WAIT")), str(row.get("setup_type", "unknown"))),
+            axis=1,
+        )
+
+    closed_trades = trade_history.dropna(subset=["closed_at", "pnl_net", "strategy_key"])
+    if closed_trades.empty:
+        return {}
+
+    stats: dict[str, StrategyStats] = {}
+    for strategy_key, group in closed_trades.groupby("strategy_key"):
+        closed_count = len(group)
+        win_rate = float((group["pnl_net"] > 0).mean())
+        avg_pnl_net = float(group["pnl_net"].mean())
+        sample_factor = min(closed_count, 10) / 10
+        bounded_pnl = max(min(avg_pnl_net, 15.0), -15.0)
+        score_bonus = sample_factor * (((win_rate - 0.5) * 24) + bounded_pnl)
+        stats[str(strategy_key)] = StrategyStats(
+            strategy_key=str(strategy_key),
+            closed_trades=closed_count,
+            win_rate=win_rate,
+            avg_pnl_net=avg_pnl_net,
+            score_bonus=score_bonus,
+        )
+    return stats
+
+
+def compute_trade_summary(path: str) -> dict[str, float]:
+    trade_history = load_trade_history(path)
+    if trade_history.empty:
+        return {"closed_trades": 0.0, "win_rate": 0.0, "avg_pnl_net": 0.0}
+
+    trade_history["pnl_net"] = pd.to_numeric(trade_history["pnl_net"], errors="coerce")
+    closed_trades = trade_history.dropna(subset=["closed_at", "pnl_net"])
+    if closed_trades.empty:
+        return {"closed_trades": 0.0, "win_rate": 0.0, "avg_pnl_net": 0.0}
+
+    return {
+        "closed_trades": float(len(closed_trades)),
+        "win_rate": float((closed_trades["pnl_net"] > 0).mean()),
+        "avg_pnl_net": float(closed_trades["pnl_net"].mean()),
+    }
+
+
+def score_setup(setup: Setup, strategy_stats: dict[str, StrategyStats]) -> float:
+    stats = strategy_stats.get(setup.strategy_key)
+    bonus = stats.score_bonus if stats else 0.0
+    return float(setup.confidence) + bonus
+
+
+def select_best_ready_setup(
+    setups: list[Setup],
+    min_ready_confidence: int,
+    strategy_stats: dict[str, StrategyStats],
+) -> Setup | None:
+    ready_setups = [setup for setup in setups if setup.ready and setup.confidence >= min_ready_confidence]
+    if not ready_setups:
+        return None
+    return max(
+        ready_setups,
+        key=lambda setup: (
+            score_setup(setup, strategy_stats),
+            setup.confidence,
+            setup.price_change_pct,
+        ),
     )
+
+
+def setup_entry_price(setup: Setup) -> float:
+    if setup.entry_low is not None and setup.entry_high is not None:
+        return (setup.entry_low + setup.entry_high) / 2
+    if setup.entry_high is not None:
+        return setup.entry_high
+    if setup.entry_low is not None:
+        return setup.entry_low
+    raise ValueError(f"{setup.symbol} icin entry price hesaplanamadi.")
+
+
+def load_active_position(state: dict) -> ActivePosition | None:
+    raw = state.get("active_position")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return ActivePosition(
+            symbol=str(raw["symbol"]),
+            side=str(raw["side"]),
+            setup_type=str(raw["setup_type"]),
+            strategy_key=str(raw["strategy_key"]),
+            confidence=int(raw["confidence"]),
+            entry_price=float(raw["entry_price"]),
+            stop_loss=float(raw["stop_loss"]),
+            take_profit=float(raw["take_profit"]),
+            quantity=float(raw["quantity"]),
+            opened_at=str(raw["opened_at"]),
+            max_hold_until=str(raw["max_hold_until"]) if raw.get("max_hold_until") is not None else None,
+            price_change_pct=float(raw["price_change_pct"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def open_position_from_setup(setup: Setup, cfg: Config, now: datetime) -> ActivePosition:
+    entry_price = setup_entry_price(setup)
+    quantity = cfg.position_size_usd / entry_price
+    stop_loss = setup.stop_loss if setup.stop_loss is not None else entry_price
+    take_profit = setup.target_1 or setup.target_2 or entry_price
+    max_hold_until = None
+    if cfg.max_position_hold_hours > 0:
+        max_hold_until = (now + timedelta(hours=cfg.max_position_hold_hours)).isoformat()
+    return ActivePosition(
+        symbol=setup.symbol,
+        side=setup.decision,
+        setup_type=setup.setup_type,
+        strategy_key=setup.strategy_key,
+        confidence=setup.confidence,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        quantity=quantity,
+        opened_at=now.isoformat(),
+        max_hold_until=max_hold_until,
+        price_change_pct=setup.price_change_pct,
+    )
+
+
+def fetch_last_price(cfg: Config, symbol: str) -> float:
+    raw = fetch_json(
+        f"{cfg.futures_base_url}/fapi/v1/ticker/price",
+        params={"symbol": symbol},
+        timeout=20,
+    )
+    return float(raw.get("price", 0.0))
+
+
+def evaluate_position_exit(
+    position: ActivePosition,
+    current_price: float,
+    now: datetime,
+) -> tuple[str, float] | None:
+    if position.side == "LONG":
+        if current_price <= position.stop_loss:
+            return ("stop_loss", current_price)
+        if current_price >= position.take_profit:
+            return ("take_profit", current_price)
+    else:
+        if current_price >= position.stop_loss:
+            return ("stop_loss", current_price)
+        if current_price <= position.take_profit:
+            return ("take_profit", current_price)
+
+    max_hold_until = parse_datetime(position.max_hold_until)
+    if max_hold_until is not None and now >= max_hold_until:
+        return ("max_hold_1d", current_price)
+    return None
+
+
+def compute_position_pnl(position: ActivePosition, exit_price: float) -> float:
+    direction = 1 if position.side == "LONG" else -1
+    return (exit_price - position.entry_price) * position.quantity * direction
+
+
+def append_paper_trade(
+    path: str,
+    position: ActivePosition,
+    exit_price: float,
+    exit_reason: str,
+    closed_at: datetime,
+    pnl_net: float,
+    balance_after: float,
+) -> None:
+    trade_history = load_trade_history(path)
+    new_row = pd.DataFrame(
+        [
+            {
+                "symbol": position.symbol,
+                "side": position.side,
+                "setup_type": position.setup_type,
+                "strategy_key": position.strategy_key,
+                "entry": position.entry_price,
+                "exit": exit_price,
+                "stop_loss": position.stop_loss,
+                "take_profit": position.take_profit,
+                "quantity": position.quantity,
+                "opened_at": position.opened_at,
+                "closed_at": closed_at.isoformat(),
+                "exit_reason": exit_reason,
+                "pnl_net": pnl_net,
+                "balance_after": balance_after,
+                "confidence": position.confidence,
+            }
+        ]
+    )
+    trade_history = pd.concat([trade_history, new_row], ignore_index=True)
+    trade_history.to_csv(path, index=False)
+
+
+def format_strategy_edge(setup: Setup, strategy_stats: dict[str, StrategyStats]) -> str:
+    stats = strategy_stats.get(setup.strategy_key)
+    if stats is None:
+        return "gecmis veri yok"
+    return (
+        f"{stats.closed_trades} kapanmis islem | "
+        f"win rate %{stats.win_rate * 100:.0f} | "
+        f"ort pnl {stats.avg_pnl_net:+.2f} USD"
+    )
+
+
+def format_entry_message(setup: Setup, position: ActivePosition, strategy_stats: dict[str, StrategyStats]) -> str:
+    funding_text = "?" if setup.funding_rate_pct is None else f"{setup.funding_rate_pct:+.4f}%"
+    hold_text = "sinirsiz" if position.max_hold_until is None else (
+        parse_datetime(position.max_hold_until) or utc_now()
+    ).strftime('%Y-%m-%d %H:%M UTC')
+    return (
+        f"*PAPER ENTRY* | *{position.symbol}* | *{position.side}* `{position.confidence}`\n"
+        f"Tip: `{position.setup_type}` | 24s degisim: `{setup.price_change_pct:+.2f}%`\n"
+        f"Entry: `{format_price(position.entry_price)}` | SL: `{format_price(position.stop_loss)}` | TP: `{format_price(position.take_profit)}`\n"
+        f"Boyut: `{position.quantity:.4f}` | Notional: `{position.quantity * position.entry_price:.2f} USD`\n"
+        f"Funding: `{funding_text}` | Strateji edge: {format_strategy_edge(setup, strategy_stats)}\n"
+        f"Maks elde tutma: `{hold_text}`\n"
+        f"Not: {setup.summary}"
+    )
+
+
+def format_exit_message(
+    position: ActivePosition,
+    exit_price: float,
+    exit_reason: str,
+    pnl_net: float,
+    balance_after: float,
+    closed_at: datetime,
+    summary: dict[str, float],
+) -> str:
+    reason_map = {
+        "take_profit": "hedefe ulasti",
+        "stop_loss": "stop oldu",
+        "max_hold_1d": "1 gunluk sure doldu",
+    }
+    opened_at = parse_datetime(position.opened_at) or closed_at
+    held_minutes = int((closed_at - opened_at).total_seconds() // 60)
+    return (
+        f"*PAPER EXIT* | *{position.symbol}* | *{position.side}*\n"
+        f"Cikis: `{format_price(exit_price)}` | Sebep: `{reason_map.get(exit_reason, exit_reason)}`\n"
+        f"PnL: `{pnl_net:+.2f} USD` | Bakiye: `{balance_after:.2f} USD`\n"
+        f"Sure: `{held_minutes} dk` | Acilis: `{format_price(position.entry_price)}`\n"
+        f"Basari orani: `%{summary['win_rate'] * 100:.0f}` | Kapanan islem: `{int(summary['closed_trades'])}` | Ortalama pnl: `{summary['avg_pnl_net']:+.2f} USD`"
+    )
+
+
+def write_cycle_state(cfg: Config, state: dict) -> None:
+    state["updated_at"] = utc_now().isoformat()
+    write_state(cfg.analysis_state_file, state)
 
 
 def format_price(value: float | None) -> str:
@@ -558,18 +1006,18 @@ def build_report_hash(report_text: str) -> str:
 
 
 def analyze_market(cfg: Config) -> list[Setup]:
-    top_gainers = fetch_top_gainers(cfg)
-    if not top_gainers:
+    market_candidates = fetch_market_candidates(cfg)
+    if not market_candidates:
         raise RuntimeError("Filtrelere uyan futures sembolu bulunamadi.")
 
     funding_map = fetch_funding_rates(cfg)
     print(
-        "Top gainers: "
-        + ", ".join(f"{item.symbol}({item.price_change_pct:+.2f}%)" for item in top_gainers)
+        "Tarama evreni: "
+        + ", ".join(f"{item.symbol}({item.price_change_pct:+.2f}%)" for item in market_candidates[:20])
     )
 
     setups: list[Setup] = []
-    for market in top_gainers:
+    for market in market_candidates:
         frames: dict[str, pd.DataFrame] = {}
         for interval in TIMEFRAMES:
             df = fetch_klines(cfg, market.symbol, interval)
@@ -577,7 +1025,7 @@ def analyze_market(cfg: Config) -> list[Setup]:
                 raise RuntimeError(f"{market.symbol} {interval} icin yetersiz mum verisi geldi.")
             frames[interval] = add_indicators(df)
 
-        setups.append(build_setup(market, frames, funding_map.get(market.symbol)))
+        setups.extend(build_candidate_setups(market, frames, funding_map.get(market.symbol)))
 
     setups.sort(key=lambda item: (not item.ready, -item.confidence, -item.price_change_pct))
     return setups
@@ -586,35 +1034,89 @@ def analyze_market(cfg: Config) -> list[Setup]:
 def main() -> None:
     cfg = load_config()
     state = read_state(cfg.analysis_state_file)
-    last_hash = str(state.get("last_report_hash", ""))
+    paper_balance = float(state.get("paper_balance_usd", cfg.starting_balance_usd))
 
     print(
-        f"Basladi | Scan every: {cfg.scan_every_seconds}s | Top limit: {cfg.top_gainers_limit} | "
+        f"Basladi | Scan every: {cfg.scan_every_seconds}s | Symbol limit: {cfg.top_gainers_limit or 'all'} | "
         f"Volume filter: {cfg.min_quote_volume_usd:.0f}-{cfg.max_quote_volume_usd:.0f} | "
-        f"Ready threshold: {cfg.min_ready_confidence}"
+        f"Ready threshold: {cfg.min_ready_confidence} | Max hold: {cfg.max_position_hold_hours or 0}h(disabled if 0)"
     )
 
     while True:
         try:
-            setups = analyze_market(cfg)
-            report_text = build_report(setups, cfg)
-            report_hash = build_report_hash(report_text)
+            active_position = load_active_position(state)
+            now = utc_now()
 
-            if report_hash != last_hash:
-                send_telegram(cfg, report_text)
-                last_hash = report_hash
-                write_state(
-                    cfg.analysis_state_file,
-                    {
-                        "last_report_hash": last_hash,
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
-                print("Telegram'a rapor gonderildi.")
+            if active_position is not None:
+                current_price = fetch_last_price(cfg, active_position.symbol)
+                exit_signal = evaluate_position_exit(active_position, current_price, now)
+                if exit_signal is not None:
+                    exit_reason, exit_price = exit_signal
+                    pnl_net = compute_position_pnl(active_position, exit_price)
+                    paper_balance += pnl_net
+                    append_paper_trade(
+                        cfg.paper_trades_file,
+                        active_position,
+                        exit_price,
+                        exit_reason,
+                        now,
+                        pnl_net,
+                        paper_balance,
+                    )
+                    trade_summary = compute_trade_summary(cfg.paper_trades_file)
+                    send_telegram(
+                        cfg,
+                        format_exit_message(
+                            active_position,
+                            exit_price,
+                            exit_reason,
+                            pnl_net,
+                            paper_balance,
+                            now,
+                            trade_summary,
+                        ),
+                    )
+                    state.pop("active_position", None)
+                    state["last_action"] = "exit"
+                    state["last_exit_reason"] = exit_reason
+                    state["paper_balance_usd"] = paper_balance
+                    state["win_rate"] = trade_summary["win_rate"]
+                    state["closed_trades"] = int(trade_summary["closed_trades"])
+                    print(
+                        f"Pozisyon kapandi: {active_position.symbol} | {exit_reason} | "
+                        f"PnL {pnl_net:+.2f} USD"
+                    )
+                else:
+                    print(
+                        f"Aktif pozisyon korunuyor: {active_position.symbol} {active_position.side} | "
+                        f"anlik fiyat {current_price:.6f}"
+                    )
             else:
-                print("Rapor degismedi, mesaj gonderilmedi.")
+                strategy_stats = compute_strategy_stats(cfg.paper_trades_file)
+                setups = analyze_market(cfg)
+                best_setup = select_best_ready_setup(setups, cfg.min_ready_confidence, strategy_stats)
+                if best_setup is not None:
+                    new_position = open_position_from_setup(best_setup, cfg, now)
+                    state["active_position"] = asdict(new_position)
+                    state["last_action"] = "entry"
+                    state["last_selected_strategy"] = best_setup.strategy_key
+                    send_telegram(cfg, format_entry_message(best_setup, new_position, strategy_stats))
+                    print(
+                        f"Pozisyon acildi: {new_position.symbol} {new_position.side} | "
+                        f"{new_position.setup_type} | skor {score_setup(best_setup, strategy_stats):.2f}"
+                    )
+                else:
+                    print("Temiz ve esik ustu setup bulunamadi, yeni pozisyon acilmadi.")
+
+            state["paper_balance_usd"] = paper_balance
+            state["last_cycle_status"] = "ok"
+            state["last_success_at"] = now.isoformat()
+            write_cycle_state(cfg, state)
         except Exception as exc:
-            print(f"[HATA] {datetime.now(timezone.utc).isoformat()} | {exc}")
+            state["last_cycle_status"] = "error"
+            state["last_error"] = str(exc)
+            write_cycle_state(cfg, state)
+            print(f"[HATA] {utc_now().isoformat()} | {exc}")
 
         time.sleep(cfg.scan_every_seconds)
 

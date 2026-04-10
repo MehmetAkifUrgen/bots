@@ -1,0 +1,10 @@
+{
+  "status": "ok",
+  "updated_at": "2026-04-08T17:58:58.874234+00:00",
+  "last_success_at": "2026-04-08T17:58:58.874234+00:00",
+  "consecutive_failures": 0,
+  "ready_count": 1,
+  "market_regime": "bullish",
+  "app_env": "development",
+  "run_once": true
+}

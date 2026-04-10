@@ -1,27 +1,30 @@
-# Binance Futures Top Gainers Analyzer
+# Binance Futures Futures Scanner
 
-Bu proje Binance USDT-M perpetual futures tarafinda 24 saatlik en cok yukselen 10 coini tarar ve her coin icin su sorulara cevap verir:
+Bu proje Binance USDT-M perpetual futures tarafinda stablecoin tabanli pariteleri disarida birakip tum uygun sembolleri tarar ve her coin icin su sorulara cevap verir:
 
 - Trend devam ediyor mu?
 - Long mu, short mu, yoksa bekle mi?
 - Giris bolgesi neresi?
 - Stop ve iki kademe hedef nerede?
 
-Bot emir acmaz. Ilk surumun amaci temiz bir analiz akisi kurmak ve Telegram'a kullanilabilir trade setup'lari dusurmektir.
+Bot gercek emir acmaz. Paper trade mantigiyla en iyi setup'i secer, pozisyonu takip eder ve sadece giris/cikis oldugunda Telegram mesaji yollar.
 
 ## Nasil Calisir
 
 Her dongude bot:
 
 1. Binance Futures'tan aktif USDT perpetual sembolleri alir.
-2. 24 saatlik en cok yukselen coinleri hacim filtresiyle siralar.
+2. Stablecoin bazli sembolleri eleyip hacim filtresinden gecen tum uygun coinleri tarar.
 3. Her coin icin `15m`, `1h` ve `4h` mumlarini ceker.
 4. EMA, RSI, ATR, MACD histogram ve ADX hesaplar.
-5. Her coin icin su kararlardan birini uretir:
+5. Her coin icin tum uygun strateji adaylarini cikarir:
    - `LONG`: trend devam setup'i
    - `SHORT`: trend short veya asiri sisme sonrasi exhaustion short
+   - `SCALP`: kisa vadeli momentum devam setup'i
    - `WAIT`: coin hareketli ama giris kalitesi zayif
-6. Rapor degistiyse Telegram'a tek mesaj halinde gonderir.
+6. Gecmis paper trade performansina bakip en basarili strateji tipine hafif agirlik verir.
+7. Tek aktif pozisyon acar ve yalnizca stop veya hedefe gelince kapatir. Istersen sure bazli kapama tekrar acilabilir.
+8. Telegram'a sadece pozisyon giris ve cikis mesajlarini gonderir.
 
 ## Neden Gemini Ilk Asamada Sart Degil
 
@@ -54,8 +57,9 @@ Zorunlu:
 Opsiyonel:
 
 - `BINANCE_API_FUTURES_BASE` varsayilan `https://fapi.binance.com`
-- `SCAN_EVERY_SECONDS` varsayilan `120`
-- `TOP_GAINERS_LIMIT` varsayilan `10`
+- `SCAN_EVERY_SECONDS` varsayilan `900`
+- `MIN_SCAN_INTERVAL_SECONDS` varsayilan `900`
+- `TOP_GAINERS_LIMIT` varsayilan `0` ve `0` tum uygun coinleri tarar
 - `MIN_QUOTE_VOLUME_USD` varsayilan `15000000`
 - `MAX_QUOTE_VOLUME_USD` varsayilan `5000000000`
 - `LOOKBACK_BARS` varsayilan `260`
@@ -63,8 +67,12 @@ Opsiyonel:
 - `SEND_WAIT_SETUPS` varsayilan `true`
 - `MAX_WAIT_SETUPS` varsayilan `3`
 - `ANALYSIS_STATE_FILE` varsayilan `analysis_state.json`
+- `PAPER_TRADES_FILE` varsayilan `paper_trades.csv`
+- `POSITION_SIZE_USD` varsayilan `100`
+- `MAX_POSITION_HOLD_HOURS` varsayilan `0` ve `0` sure bazli zorunlu cikisi kapatir
+- `STARTING_BALANCE_USD` varsayilan `1000`
 
-Telegram ayari yoksa bot yine calisir ama raporu konsola yazar.
+Telegram ayari yoksa bot yine calisir ama giris/cikis mesajlarini konsola yazar.
 
 ## Calistirma
 
@@ -86,10 +94,10 @@ Her coin icin raporda su alanlar gelir:
 
 `WAIT` demek coin kotu degil, sadece su an kovalanacak kadar temiz setup vermiyor demek.
 
-Bot artik raporu ikiye ayirir:
+Bot artik surekli watchlist spam'i atmaz. Mesajlar sunlarla sinirlidir:
 
-- `Isleme Uygunlar`: `MIN_READY_CONFIDENCE` esigini gecen setup'lar
-- `Izleme Listesi`: opsiyonel olarak gonderilen, henuz temiz olmayan coinler
+- `PAPER ENTRY`: secilen en iyi setup ile acilan pozisyon
+- `PAPER EXIT`: stop veya hedef ile kapanan pozisyon. Mesaj icinde toplu basari orani da vardir.
 
 ## Railway Deploy
 
@@ -111,7 +119,7 @@ python -u bot.py
 - `SEND_WAIT_SETUPS`
 - `MAX_WAIT_SETUPS`
 
-Deploy sonrasi loglarda `Top gainers` ve `Telegram'a rapor gonderildi` satirlarini goruyorsan akis calisiyor demektir.
+Deploy sonrasi loglarda `Tarama evreni` ve `Pozisyon acildi` satirlarini goruyorsan akis calisiyor demektir.
 
 ## Sonraki Asama
 
@@ -120,7 +128,7 @@ Istersen bir sonraki iterasyonda bunlardan birini ekleyebiliriz:
 1. Gemini ile teknik rapora dogal dil yorumu.
 2. Open interest ve liquidation verisi.
 3. Backtest modu.
-4. Sadece `READY` setup'lari atan sessiz mod.
+4. Ayni anda birden fazla pozisyon acabilen portfoy modu.
 
 ## Uyari
 
