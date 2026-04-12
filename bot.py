@@ -1018,14 +1018,20 @@ def analyze_market(cfg: Config) -> list[Setup]:
 
     setups: list[Setup] = []
     for market in market_candidates:
-        frames: dict[str, pd.DataFrame] = {}
-        for interval in TIMEFRAMES:
-            df = fetch_klines(cfg, market.symbol, interval)
-            if len(df) < 220:
-                raise RuntimeError(f"{market.symbol} {interval} icin yetersiz mum verisi geldi.")
-            frames[interval] = add_indicators(df)
-
-        setups.extend(build_candidate_setups(market, frames, funding_map.get(market.symbol)))
+        try:
+            frames: dict[str, pd.DataFrame] = {}
+            for interval in TIMEFRAMES:
+                df = fetch_klines(cfg, market.symbol, interval)
+                if len(df) < 220:
+                    print(f"[UYARI] {market.symbol} {interval} icin yetersiz mum verisi, atlandi.")
+                    break
+                frames[interval] = add_indicators(df)
+            
+            if len(frames) == len(TIMEFRAMES):
+                setups.extend(build_candidate_setups(market, frames, funding_map.get(market.symbol)))
+        except Exception as exc:
+            print(f"[UYARI] {market.symbol} taranamadi: {exc}")
+            continue
 
     setups.sort(key=lambda item: (not item.ready, -item.confidence, -item.price_change_pct))
     return setups

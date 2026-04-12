@@ -1,9 +1,23 @@
 {
-  "last_report_hash": "5f168ae08fb85ce87fbd7dc921f92e59559f2b5d58cd1e365edbfcee1f1f768a",
-  "updated_at": "2026-04-08T17:58:58.874234+00:00",
-  "last_success_at": "2026-04-08T17:58:58.874234+00:00",
+  "paper_balance_usd": 10000.0,
   "last_cycle_status": "ok",
-  "last_ready_count": 1,
-  "last_market_regime": "bullish",
-  "consecutive_failures": 0
+  "last_error": "BSBUSDT 4h icin yetersiz mum verisi geldi.",
+  "updated_at": "2026-04-12T07:46:33.111708+00:00",
+  "active_position": {
+    "symbol": "BLURUSDT",
+    "side": "LONG",
+    "setup_type": "trend continuation",
+    "strategy_key": "long::trend continuation",
+    "confidence": 100,
+    "entry_price": 0.02284505606123212,
+    "stop_loss": 0.022110175636501198,
+    "take_profit": 0.0239473766983285,
+    "quantity": 4377.31471229345,
+    "opened_at": "2026-04-12T07:41:30.276542+00:00",
+    "max_hold_until": null,
+    "price_change_pct": 4.909
+  },
+  "last_action": "entry",
+  "last_selected_strategy": "long::trend continuation",
+  "last_success_at": "2026-04-12T07:46:32.560559+00:00"
 }
