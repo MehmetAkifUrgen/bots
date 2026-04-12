@@ -477,6 +477,51 @@ def build_candidate_setups(
     ]
     scalp_short_score = int(round(100 * sum(scalp_short_conditions) / len(scalp_short_conditions)))
 
+    # === HIZLI SCALP (PUMP/DUMP YAKALAMA) ===
+    recent_3_bars = tf_15.iloc[-5:-2]
+    price_changes = []
+    for i in range(1, len(recent_3_bars)):
+        prev_close = safe_float(recent_3_bars.iloc[i - 1]["close"])
+        curr_close = safe_float(recent_3_bars.iloc[i]["close"])
+        if prev_close > 0:
+            pct_change = (curr_close - prev_close) / prev_close * 100
+            price_changes.append(pct_change)
+
+    max_bar_change = max(price_changes) if price_changes else 0.0
+    avg_recent_volume = safe_float(recent_3_bars["volume"].mean())
+    volume_spike = avg_recent_volume / vol_ma_15 if vol_ma_15 > 0 else 1.0
+
+    rsi_recent = []
+    for i in range(-4, -2):
+        rsi_recent.append(safe_float(tf_15.iloc[i]["rsi14"]))
+    rsi_trend = rsi_recent[-1] - rsi_recent[0] if len(rsi_recent) >= 2 else 0.0
+
+    # Hızlı LONG (Pump yakalama)
+    fast_long_conditions = [
+        trend_up(row_1h),
+        max_bar_change >= 1.5,
+        volume_spike >= 1.8,
+        55 <= rsi_15 <= 75,
+        rsi_trend > 5,
+        macd_15 > macd_15_prev,
+        close_15 >= ema20_15,
+        adx_15 >= 18,
+    ]
+    fast_long_score = int(round(100 * sum(fast_long_conditions) / len(fast_long_conditions)))
+
+    # Hızlı SHORT (Dump yakalama)
+    fast_short_conditions = [
+        trend_down(row_1h),
+        max_bar_change <= -1.5,
+        volume_spike >= 1.8,
+        25 <= rsi_15 <= 45,
+        rsi_trend < -5,
+        macd_15 < macd_15_prev,
+        close_15 <= ema20_15,
+        adx_15 >= 18,
+    ]
+    fast_short_score = int(round(100 * sum(fast_short_conditions) / len(fast_short_conditions)))
+
     if long_score >= 78:
         entry_low = min(close_15, ema20_15)
         entry_high = max(close_15, ema20_15 + 0.25 * atr_15)
@@ -621,6 +666,64 @@ def build_candidate_setups(
             )
         )
 
+    # === FAST SCALP LONG (Pump yakalama) ===
+    if fast_long_score >= 75:
+        entry_low = close_15
+        entry_high = close_15 + 0.2 * atr_15
+        stop_loss = close_15 - 0.8 * atr_15
+        entry_mid = (entry_low + entry_high) / 2
+        risk = max(entry_mid - stop_loss, atr_15 * 0.6)
+        target_1 = entry_mid + 1.2 * risk
+        target_2 = entry_mid + 1.8 * risk
+        candidates.append(
+            Setup(
+                symbol=market.symbol,
+                decision="LONG",
+                setup_type="fast scalp pump",
+                strategy_key=build_strategy_key("LONG", "fast scalp pump"),
+                confidence=fast_long_score,
+                price_change_pct=market.price_change_pct,
+                funding_rate_pct=funding_pct,
+                entry_low=entry_low,
+                entry_high=entry_high,
+                stop_loss=stop_loss,
+                target_1=target_1,
+                target_2=target_2,
+                ready=True,
+                invalidation="15m kapanis EMA20 altinda olursa veya hacim dusurse iptal.",
+                summary=f"HIZLI PUMP! Son bar %{max_bar_change:.1f} artis, hacim {volume_spike:.1f}x normalin ustunde. Momentum guclu.",
+            )
+        )
+
+    # === FAST SCALP SHORT (Dump yakalama) ===
+    if fast_short_score >= 75:
+        entry_low = close_15 - 0.2 * atr_15
+        entry_high = close_15
+        stop_loss = close_15 + 0.8 * atr_15
+        entry_mid = (entry_low + entry_high) / 2
+        risk = max(stop_loss - entry_mid, atr_15 * 0.6)
+        target_1 = entry_mid - 1.2 * risk
+        target_2 = entry_mid - 1.8 * risk
+        candidates.append(
+            Setup(
+                symbol=market.symbol,
+                decision="SHORT",
+                setup_type="fast scalp dump",
+                strategy_key=build_strategy_key("SHORT", "fast scalp dump"),
+                confidence=fast_short_score,
+                price_change_pct=market.price_change_pct,
+                funding_rate_pct=funding_pct,
+                entry_low=entry_low,
+                entry_high=entry_high,
+                stop_loss=stop_loss,
+                target_1=target_1,
+                target_2=target_2,
+                ready=True,
+                invalidation="15m kapanis EMA20 ustunde olursa veya hacim dusurse iptal.",
+                summary=f"HIZLI DUMP! Son bar %{max_bar_change:.1f} dusus, hacim {volume_spike:.1f}x normalin ustunde. Momentum zayif.",
+            )
+        )
+
     if candidates:
         return candidates
 
@@ -642,7 +745,7 @@ def build_candidate_setups(
             decision="WAIT",
             setup_type="no clean setup",
             strategy_key=build_strategy_key("WAIT", "no clean setup"),
-            confidence=max(long_score, trend_short_score, exhaustion_short_score, scalp_long_score, scalp_short_score),
+            confidence=max(long_score, trend_short_score, exhaustion_short_score, scalp_long_score, scalp_short_score, fast_long_score, fast_short_score),
             price_change_pct=market.price_change_pct,
             funding_rate_pct=funding_pct,
             entry_low=None,

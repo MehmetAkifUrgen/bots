@@ -1,8 +1,8 @@
 {
   "paper_balance_usd": 10000.0,
-  "last_cycle_status": "ok",
-  "last_error": "BSBUSDT 4h icin yetersiz mum verisi geldi.",
-  "updated_at": "2026-04-12T07:46:33.111708+00:00",
+  "last_cycle_status": "error",
+  "last_error": "[Errno 32] Broken pipe",
+  "updated_at": "2026-04-12T07:54:59.126152+00:00",
   "active_position": {
     "symbol": "BLURUSDT",
     "side": "LONG",
@@ -19,5 +19,5 @@
   },
   "last_action": "entry",
   "last_selected_strategy": "long::trend continuation",
-  "last_success_at": "2026-04-12T07:46:32.560559+00:00"
+  "last_success_at": "2026-04-12T07:52:56.962612+00:00"
 }
