@@ -1,15 +1,60 @@
-# Binance Futures Futures Scanner
+# Binance Futures Scanner & Paper Trading Bot
 
-Bu proje Binance USDT-M perpetual futures tarafinda stablecoin tabanli pariteleri disarida birakip tum uygun sembolleri tarar ve her coin icin su sorulara cevap verir:
+Gelişmiş Binance USDT-M perpetual futures tarayıcı ve paper trading botu. Stablecoin tabanlı pariteleri dışarıda bırakıp tüm uygun sembolleri tarar ve her coin için şu sorulara cevap verir:
 
 - Trend devam ediyor mu?
 - Long mu, short mu, yoksa bekle mi?
-- Giris bolgesi neresi?
+- Giriş bölgesi neresi?
 - Stop ve iki kademe hedef nerede?
 
-Bot gercek emir acmaz. Paper trade mantigiyla en iyi setup'i secer, pozisyonu takip eder ve sadece giris/cikis oldugunda Telegram mesaji yollar.
+Bot gerçek emir açmaz. Paper trade mantığıyla en iyi setup'i seçer, pozisyonu takip eder ve sadece giriş/çıkış olduğunda Telegram mesajı gönderir.
 
-## Nasil Calisir
+## 🆕 Yeni Özellikler (v2.0)
+
+### ✨ Eklenen Özellikler:
+
+1. **Backtest Modülü** (`backtest.py`)
+   - Geçmiş verilerle strateji testi
+   - Detaylı performans metrikleri
+   - Strategy breakdown analizi
+
+2. **Dinamik Pozisyon Boyutlandırma**
+   - Yüzde bazlı risk yönetimi
+   - Risk/getiri oranlı sizing
+   - Maksimum risk limiti koruması
+
+3. **Trailing Stop Loss**
+   - ATR bazlı dinamik stop
+   - Kar koruma mekanizması
+   - Pozisyon lehine otomatik güncelleme
+
+4. **Piyasa Rejimi Tespiti**
+   - TRENDING_UP / TRENDING_DOWN / RANGING tespiti
+   - Rejim gücü skoru
+   - Strateji optimizasyonu için rejim bilgisi
+
+5. **Open Interest Entegrasyonu**
+   - OI trend takibi
+   - Funding rate analizi
+   - Fiyat-OI divergence tespiti
+
+6. **Gemini AI Yorumları** (Opsiyonel)
+   - Teknik sinyallere doğal dil yorumu
+   - Risk değerlendirmesi
+   - Alternatif senaryo analizi
+
+7. **Kapsamlı Analitik**
+   - Sharpe, Sortino, Calmar ratio
+   - Maksimum drawdown takibi
+   - Saat/gün bazlı performans
+   - Strateji ve sembol kırılımı
+
+8. **Geliştirilmiş Hata Yönetimi**
+   - Otomatik retry mekanizması
+   - Exponential backoff
+   - Detaylı hata logları
+
+## Nasıl Çalışılır
 
 Her dongude bot:
 
@@ -69,15 +114,57 @@ Opsiyonel:
 - `ANALYSIS_STATE_FILE` varsayilan `analysis_state.json`
 - `PAPER_TRADES_FILE` varsayilan `paper_trades.csv`
 - `POSITION_SIZE_USD` varsayilan `100`
+- `POSITION_SIZE_PCT` varsayilan `2` (bakiyenin %2'si risk)
+- `MAX_RISK_PCT` varsayilan `5` (maksimum pozisyon büyüklüğü)
+- `TRAILING_STOP_ATR_MULT` varsayilan `1.5` (trailing stop ATR çarpanı)
+- `MAX_DRAWDOWN_PCT` varsayilan `20` (maksimum drawdown limiti)
 - `MAX_POSITION_HOLD_HOURS` varsayilan `0` ve `0` sure bazli zorunlu cikisi kapatir
 - `STARTING_BALANCE_USD` varsayilan `1000`
+- `GEMINI_API_KEY` Gemini AI yorumları için (opsiyonel)
 
 Telegram ayari yoksa bot yine calisir ama giris/cikis mesajlarini konsola yazar.
 
 ## Calistirma
 
+### Ana Bot
+
 ```bash
 python bot.py
+```
+
+### Backtest
+
+```bash
+# Tek sembol backtest
+python backtest.py --symbol BTCUSDT --days 90 --interval 1h
+
+# Tüm top gainers backtest
+python backtest.py --all-symbols --days 60 --interval 1h --top 20
+
+# Sonuçları kaydet
+python backtest.py --symbol ETHUSDT --days 90 --interval 1h --output backtest_results.json
+```
+
+### Analitik Raporu
+
+```bash
+# Kapsamlı analiz
+python analytics.py --file paper_trades.csv --balance 1000
+
+# JSON çıktısı
+python analytics.py --file paper_trades.csv --balance 1000 --output analytics_report.json
+```
+
+### Gemini AI Test
+
+```bash
+python gemini_analyzer.py --test
+```
+
+### Alarm Botu
+
+```bash
+python alarm.py
 ```
 
 ## Telegram Mesaji Nasil Okunur
@@ -118,18 +205,41 @@ python -u bot.py
 - `MIN_READY_CONFIDENCE`
 - `SEND_WAIT_SETUPS`
 - `MAX_WAIT_SETUPS`
+- `POSITION_SIZE_PCT`
+- `TRAILING_STOP_ATR_MULT`
+- `GEMINI_API_KEY` (opsiyonel)
 
 Deploy sonrasi loglarda `Tarama evreni` ve `Pozisyon acildi` satirlarini goruyorsan akis calisiyor demektir.
 
-## Sonraki Asama
+## Gelecek Gelistirmeler
 
 Istersen bir sonraki iterasyonda bunlardan birini ekleyebiliriz:
 
-1. Gemini ile teknik rapora dogal dil yorumu.
-2. Open interest ve liquidation verisi.
-3. Backtest modu.
-4. Ayni anda birden fazla pozisyon acabilen portfoy modu.
+1. Multi-position portfolio yönetimi (aynı anda birden fazla pozisyon)
+2. Liquidation data entegrasyonu
+3. Order book depth analizi
+4. Machine learning model training (geçmiş verilere dayalı)
+5. Web dashboard (gerçek zamanlı pozisyon takibi)
+6. Discord webhook desteği
 
 ## Uyari
 
 Bu proje yatirim tavsiyesi degildir. Canli emir baglamadan once forward test ve risk kontrolu yap.
+
+## Backtest Önemli Notlar
+
+Botu canlıya almadan önce mutlaka backtest yapın:
+
+```bash
+# 1. Önce backtest yap
+python backtest.py --all-symbols --days 90 --interval 1h --top 30 --output results.json
+
+# 2. Sonuçları incele (win rate > 50%, profit factor > 1.2 olmalı)
+
+# 3. Paper trading ile en az 1-2 hafta test et
+
+# 4. Analitik raporu oluştur
+python analytics.py --file paper_trades.csv --balance 1000 --output final_report.json
+```
+
+**Asla backtest yapmadan canlıya başlama!**

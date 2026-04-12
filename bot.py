@@ -5,6 +5,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 
 import numpy as np
 import pandas as pd
@@ -18,6 +19,31 @@ STABLECOIN_BASES = {
     "SUSD", "FRAX", "GUSD", "LUSD", "MIM", "USDN", "USDJ",
     "HUSD", "USDK", "VAI", "USTC", "UST", "CUSD", "EURC",
 }
+
+
+def retry_on_failure(max_retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
+    """
+    Decorator: HTTP isteklerinde basarisizlikta tekrar dene.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            current_delay = delay
+            last_exception = None
+            
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (requests.exceptions.RequestException, Exception) as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        print(f"  [Retry {attempt+1}/{max_retries}] {func.__name__}: {e}")
+                        time.sleep(current_delay)
+                        current_delay *= backoff
+                    else:
+                        raise last_exception
+        return wrapper
+    return decorator
 
 
 @dataclass
@@ -39,7 +65,11 @@ class Config:
     paper_trades_file: str
     max_position_hold_hours: int
     position_size_usd: float
+    position_size_pct: float
     starting_balance_usd: float
+    max_risk_pct: float
+    trailing_stop_atr_mult: float
+    max_drawdown_pct: float
 
 
 @dataclass
@@ -59,6 +89,9 @@ class Setup:
     confidence: int
     price_change_pct: float
     funding_rate_pct: float | None
+    open_interest: float | None
+    oi_trend: str | None
+    oi_strength: int | None
     entry_low: float | None
     entry_high: float | None
     stop_loss: float | None
@@ -92,6 +125,9 @@ class ActivePosition:
     opened_at: str
     max_hold_until: str | None
     price_change_pct: float
+    highest_price: float
+    lowest_price: float
+    trailing_stop: float | None
 
 
 def parse_bool(value: str | None, default: bool = False) -> bool:
@@ -122,7 +158,11 @@ def load_config() -> Config:
         paper_trades_file=os.getenv("PAPER_TRADES_FILE", "paper_trades.csv").strip(),
         max_position_hold_hours=int(os.getenv("MAX_POSITION_HOLD_HOURS", "0")),
         position_size_usd=float(os.getenv("POSITION_SIZE_USD", "100")),
+        position_size_pct=float(os.getenv("POSITION_SIZE_PCT", "2")),
         starting_balance_usd=float(os.getenv("STARTING_BALANCE_USD", "1000")),
+        max_risk_pct=float(os.getenv("MAX_RISK_PCT", "5")),
+        trailing_stop_atr_mult=float(os.getenv("TRAILING_STOP_ATR_MULT", "1.5")),
+        max_drawdown_pct=float(os.getenv("MAX_DRAWDOWN_PCT", "20")),
     )
 
 
@@ -161,6 +201,7 @@ def parse_datetime(value: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+@retry_on_failure(max_retries=3, delay=1.0, backoff=2.0)
 def fetch_json(url: str, *, params: dict | None = None, timeout: int = 20) -> dict | list:
     response = requests.get(url, params=params, timeout=timeout)
     response.raise_for_status()
@@ -272,6 +313,95 @@ def fetch_funding_rates(cfg: Config) -> dict[str, float]:
     return mapping
 
 
+def fetch_open_interest(cfg: Config, symbol: str) -> dict | None:
+    """
+    Open Interest verisini cek.
+    Returns: {"openInterest": float, "symbol": str, "time": int}
+    """
+    try:
+        raw = fetch_json(
+            f"{cfg.futures_base_url}/fapi/v1/openInterest",
+            params={"symbol": symbol},
+            timeout=20,
+        )
+        return {
+            "symbol": str(raw.get("symbol", symbol)),
+            "openInterest": float(raw.get("openInterest", 0)),
+            "time": int(raw.get("time", 0)),
+        }
+    except Exception as e:
+        print(f"  [OI Warning] {symbol}: {e}")
+        return None
+
+
+def fetch_open_interest_history(
+    cfg: Config,
+    symbol: str,
+    period: str = "5m",
+    limit: int = 100,
+) -> pd.DataFrame:
+    """
+    Open Interest gecmis verilerini cek (Binance'de sinirli desteklenir).
+    Alternatif olarak funding rate ve OI change oranlarini kullanabiliriz.
+    """
+    try:
+        # Binance'de OI history endpoint'i yok, ama global configs OI değişimini takip edebiliriz
+        # Şimdilik mevcut OI'yi dönelim
+        current_oi = fetch_open_interest(cfg, symbol)
+        if current_oi:
+            return pd.DataFrame([current_oi])
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"  [OI History Warning] {symbol}: {e}")
+        return pd.DataFrame()
+
+
+def analyze_open_interest_trend(
+    current_oi: float,
+    historical_oi: pd.DataFrame,
+    price_change_pct: float,
+) -> tuple[str, float]:
+    """
+    Open Interest trendini analiz et.
+    Returns: (trend_direction, strength)
+    - "INCREASING": Yeni para girisi, trend guclu
+    - "DECREASING": Para cikisi, trend zayifliyor
+    - "STABLE": Degisim yok
+    """
+    if current_oi <= 0 or historical_oi.empty:
+        return ("UNKNOWN", 0.0)
+
+    # OI change hesaplama
+    if len(historical_oi) >= 2:
+        prev_oi = float(historical_oi.iloc[-2].get("openInterest", current_oi))
+        oi_change_pct = ((current_oi - prev_oi) / prev_oi * 100) if prev_oi > 0 else 0
+    else:
+        oi_change_pct = 0.0
+
+    # Yorumla
+    if oi_change_pct > 2:
+        trend = "INCREASING"
+        strength = min(abs(oi_change_pct) / 10, 1.0)  # Normalize to 0-1
+    elif oi_change_pct < -2:
+        trend = "DECREASING"
+        strength = min(abs(oi_change_pct) / 10, 1.0)
+    else:
+        trend = "STABLE"
+        strength = 0.5
+
+    # Price-OI divergence kontrolu
+    divergence = False
+    if price_change_pct > 2 and trend == "DECREASING":
+        divergence = True  # Fiyat yukseliyor ama OI dusuyor - zayif trend
+    elif price_change_pct < -2 and trend == "INCREASING":
+        divergence = True  # Fiyat dusuyor ama OI artiyor - short build-up
+
+    if divergence:
+        strength *= 0.5  # Divergence durumunda gucu azalt
+
+    return (trend, round(strength * 100))
+
+
 def fetch_klines(cfg: Config, symbol: str, interval: str) -> pd.DataFrame:
     raw = fetch_json(
         f"{cfg.futures_base_url}/fapi/v1/klines",
@@ -360,6 +490,124 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def detect_market_regime(df: pd.DataFrame) -> tuple[str, float]:
+    """
+    Piyasa kosullarini tespit et: TRENDING_UP, TRENDING_DOWN, veya RANGING
+    Returns: (regime, strength) where strength is 0-100
+    """
+    if len(df) < 50:
+        return ("RANGING", 0.0)
+
+    last_row = df.iloc[-1]
+    close = safe_float(last_row["close"])
+    ema20 = safe_float(last_row["ema20"])
+    ema50 = safe_float(last_row["ema50"])
+    ema200 = safe_float(last_row["ema200"])
+    adx = safe_float(last_row["adx14"])
+    atr = safe_float(last_row["atr14"])
+
+    # EMA alignment scoring
+    ema_score = 0
+    if close > ema20 > ema50 > ema200:
+        ema_score = 100  # Strong uptrend
+    elif close < ema20 < ema50 < ema200:
+        ema_score = -100  # Strong downtrend
+    elif close > ema20 and ema20 > ema50:
+        ema_score = 50  # Weak uptrend
+    elif close < ema20 and ema20 < ema50:
+        ema_score = -50  # Weak downtrend
+    else:
+        ema_score = 0  # Mixed/ranging
+
+    # ADX tells trend strength
+    adx_strength = min(adx / 50, 1.0)  # Normalize to 0-1
+
+    # ATR relative to price (volatility)
+    atr_pct = (atr / close * 100) if close > 0 else 0
+    volatility_score = min(atr_pct / 2, 1.0)  # Normalize, cap at 2%
+
+    # Final regime determination
+    if abs(ema_score) >= 50 and adx >= 20:
+        if ema_score > 0:
+            regime = "TRENDING_UP"
+            strength = min((abs(ema_score) * 0.5 + adx * 30 + volatility_score * 20) / 100, 1.0)
+        else:
+            regime = "TRENDING_DOWN"
+            strength = min((abs(ema_score) * 0.5 + adx * 30 + volatility_score * 20) / 100, 1.0)
+    else:
+        regime = "RANGING"
+        strength = 1.0 - adx_strength  # High ADX means NOT ranging
+
+    return (regime, round(strength * 100))
+
+
+def update_trailing_stop(
+    position: ActivePosition,
+    current_price: float,
+    atr: float,
+    trailing_mult: float,
+) -> ActivePosition:
+    """Trailing stop'u guncelle - kararti pozisyon lehine ilerlet."""
+    if position.side == "LONG":
+        # Update highest price seen
+        new_highest = max(position.highest_price, current_price)
+        
+        # Calculate new trailing stop
+        if position.trailing_stop is not None:
+            new_trailing = new_highest - (trailing_mult * atr)
+            # Only move stop up, never down
+            updated_trailing_stop = max(position.trailing_stop, new_trailing)
+        else:
+            updated_trailing_stop = new_highest - (trailing_mult * atr)
+
+        return ActivePosition(
+            symbol=position.symbol,
+            side=position.side,
+            setup_type=position.setup_type,
+            strategy_key=position.strategy_key,
+            confidence=position.confidence,
+            entry_price=position.entry_price,
+            stop_loss=max(position.stop_loss, updated_trailing_stop),  # Use the higher stop
+            take_profit=position.take_profit,
+            quantity=position.quantity,
+            opened_at=position.opened_at,
+            max_hold_until=position.max_hold_until,
+            price_change_pct=position.price_change_pct,
+            highest_price=new_highest,
+            lowest_price=position.lowest_price,
+            trailing_stop=updated_trailing_stop,
+        )
+    else:  # SHORT
+        # Update lowest price seen
+        new_lowest = min(position.lowest_price, current_price)
+        
+        # Calculate new trailing stop
+        if position.trailing_stop is not None:
+            new_trailing = new_lowest + (trailing_mult * atr)
+            # Only move stop down, never up
+            updated_trailing_stop = min(position.trailing_stop, new_trailing)
+        else:
+            updated_trailing_stop = new_lowest + (trailing_mult * atr)
+
+        return ActivePosition(
+            symbol=position.symbol,
+            side=position.side,
+            setup_type=position.setup_type,
+            strategy_key=position.strategy_key,
+            confidence=position.confidence,
+            entry_price=position.entry_price,
+            stop_loss=min(position.stop_loss, updated_trailing_stop),  # Use the lower stop
+            take_profit=position.take_profit,
+            quantity=position.quantity,
+            opened_at=position.opened_at,
+            max_hold_until=position.max_hold_until,
+            price_change_pct=position.price_change_pct,
+            highest_price=position.highest_price,
+            lowest_price=new_lowest,
+            trailing_stop=updated_trailing_stop,
+        )
+
+
 def safe_float(value: float | int | np.floating) -> float:
     result = float(value)
     if math.isnan(result) or math.isinf(result):
@@ -387,6 +635,9 @@ def build_candidate_setups(
     market: MarketTicker,
     frames: dict[str, pd.DataFrame],
     funding_rate: float | None,
+    open_interest: float | None = None,
+    oi_trend: str | None = None,
+    oi_strength: int | None = None,
 ) -> list[Setup]:
     tf_15 = frames["15m"]
     tf_1h = frames["1h"]
@@ -541,6 +792,9 @@ def build_candidate_setups(
                 confidence=long_score,
                 price_change_pct=market.price_change_pct,
                 funding_rate_pct=funding_pct,
+                open_interest=open_interest,
+                oi_trend=oi_trend,
+                oi_strength=oi_strength,
                 entry_low=entry_low,
                 entry_high=entry_high,
                 stop_loss=stop_loss,
@@ -571,6 +825,9 @@ def build_candidate_setups(
                 confidence=trend_short_score,
                 price_change_pct=market.price_change_pct,
                 funding_rate_pct=funding_pct,
+                open_interest=open_interest,
+                oi_trend=oi_trend,
+                oi_strength=oi_strength,
                 entry_low=entry_low,
                 entry_high=entry_high,
                 stop_loss=stop_loss,
@@ -599,6 +856,9 @@ def build_candidate_setups(
                 confidence=exhaustion_short_score,
                 price_change_pct=market.price_change_pct,
                 funding_rate_pct=funding_pct,
+                open_interest=open_interest,
+                oi_trend=oi_trend,
+                oi_strength=oi_strength,
                 entry_low=entry_low,
                 entry_high=entry_high,
                 stop_loss=stop_loss,
@@ -627,6 +887,9 @@ def build_candidate_setups(
                 confidence=scalp_long_score,
                 price_change_pct=market.price_change_pct,
                 funding_rate_pct=funding_pct,
+                open_interest=open_interest,
+                oi_trend=oi_trend,
+                oi_strength=oi_strength,
                 entry_low=entry_low,
                 entry_high=entry_high,
                 stop_loss=stop_loss,
@@ -655,6 +918,9 @@ def build_candidate_setups(
                 confidence=scalp_short_score,
                 price_change_pct=market.price_change_pct,
                 funding_rate_pct=funding_pct,
+                open_interest=open_interest,
+                oi_trend=oi_trend,
+                oi_strength=oi_strength,
                 entry_low=entry_low,
                 entry_high=entry_high,
                 stop_loss=stop_loss,
@@ -684,6 +950,9 @@ def build_candidate_setups(
                 confidence=fast_long_score,
                 price_change_pct=market.price_change_pct,
                 funding_rate_pct=funding_pct,
+                open_interest=open_interest,
+                oi_trend=oi_trend,
+                oi_strength=oi_strength,
                 entry_low=entry_low,
                 entry_high=entry_high,
                 stop_loss=stop_loss,
@@ -713,6 +982,9 @@ def build_candidate_setups(
                 confidence=fast_short_score,
                 price_change_pct=market.price_change_pct,
                 funding_rate_pct=funding_pct,
+                open_interest=open_interest,
+                oi_trend=oi_trend,
+                oi_strength=oi_strength,
                 entry_low=entry_low,
                 entry_high=entry_high,
                 stop_loss=stop_loss,
@@ -748,6 +1020,9 @@ def build_candidate_setups(
             confidence=max(long_score, trend_short_score, exhaustion_short_score, scalp_long_score, scalp_short_score, fast_long_score, fast_short_score),
             price_change_pct=market.price_change_pct,
             funding_rate_pct=funding_pct,
+            open_interest=open_interest,
+            oi_trend=oi_trend,
+            oi_strength=oi_strength,
             entry_low=None,
             entry_high=None,
             stop_loss=None,
@@ -893,19 +1168,41 @@ def load_active_position(state: dict) -> ActivePosition | None:
             opened_at=str(raw["opened_at"]),
             max_hold_until=str(raw["max_hold_until"]) if raw.get("max_hold_until") is not None else None,
             price_change_pct=float(raw["price_change_pct"]),
+            highest_price=float(raw.get("highest_price", raw["entry_price"])),
+            lowest_price=float(raw.get("lowest_price", raw["entry_price"])),
+            trailing_stop=float(raw["trailing_stop"]) if raw.get("trailing_stop") is not None else None,
         )
     except (KeyError, TypeError, ValueError):
         return None
 
 
-def open_position_from_setup(setup: Setup, cfg: Config, now: datetime) -> ActivePosition:
+def open_position_from_setup(setup: Setup, cfg: Config, now: datetime, balance: float) -> ActivePosition:
     entry_price = setup_entry_price(setup)
-    quantity = cfg.position_size_usd / entry_price
-    stop_loss = setup.stop_loss if setup.stop_loss is not None else entry_price
-    take_profit = setup.target_1 or setup.target_2 or entry_price
+    
+    # Percentage-based position sizing
+    risk_amount = balance * (cfg.position_size_pct / 100)
+    
+    # Calculate position size based on risk
+    if setup.stop_loss is not None and setup.stop_loss != entry_price:
+        # Risk-based sizing: position_size = risk_amount / (entry - stop)
+        risk_per_unit = abs(entry_price - setup.stop_loss)
+        if risk_per_unit > 0:
+            quantity = risk_amount / risk_per_unit
+            # Cap at max risk percentage
+            max_position_value = balance * (cfg.max_risk_pct / 100) * 10  # 10x max leverage equivalent
+            quantity = min(quantity, max_position_value / entry_price)
+        else:
+            quantity = cfg.position_size_usd / entry_price
+    else:
+        quantity = cfg.position_size_usd / entry_price
+    
+    stop_loss = setup.stop_loss if setup.stop_loss is not None else entry_price * 0.98
+    take_profit = setup.target_1 or setup.target_2 or entry_price * 1.02
+    
     max_hold_until = None
     if cfg.max_position_hold_hours > 0:
         max_hold_until = (now + timedelta(hours=cfg.max_position_hold_hours)).isoformat()
+    
     return ActivePosition(
         symbol=setup.symbol,
         side=setup.decision,
@@ -919,6 +1216,9 @@ def open_position_from_setup(setup: Setup, cfg: Config, now: datetime) -> Active
         opened_at=now.isoformat(),
         max_hold_until=max_hold_until,
         price_change_pct=setup.price_change_pct,
+        highest_price=entry_price,
+        lowest_price=entry_price,
+        trailing_stop=None,
     )
 
 
@@ -1129,9 +1429,28 @@ def analyze_market(cfg: Config) -> list[Setup]:
                     print(f"[UYARI] {market.symbol} {interval} icin yetersiz mum verisi, atlandi.")
                     break
                 frames[interval] = add_indicators(df)
-            
+
             if len(frames) == len(TIMEFRAMES):
-                setups.extend(build_candidate_setups(market, frames, funding_map.get(market.symbol)))
+                # Fetch Open Interest data
+                oi_data = fetch_open_interest(cfg, market.symbol)
+                oi_value = oi_data.get("openInterest") if oi_data else None
+                oi_history = pd.DataFrame([oi_data]) if oi_data else pd.DataFrame()
+                oi_trend, oi_strength = analyze_open_interest_trend(
+                    oi_value or 0,
+                    oi_history,
+                    market.price_change_pct,
+                )
+                
+                setups.extend(
+                    build_candidate_setups(
+                        market,
+                        frames,
+                        funding_map.get(market.symbol),
+                        open_interest=oi_value,
+                        oi_trend=oi_trend,
+                        oi_strength=oi_strength,
+                    )
+                )
         except Exception as exc:
             print(f"[UYARI] {market.symbol} taranamadi: {exc}")
             continue
@@ -1148,7 +1467,8 @@ def main() -> None:
     print(
         f"Basladi | Scan every: {cfg.scan_every_seconds}s | Symbol limit: {cfg.top_gainers_limit or 'all'} | "
         f"Volume filter: {cfg.min_quote_volume_usd:.0f}-{cfg.max_quote_volume_usd:.0f} | "
-        f"Ready threshold: {cfg.min_ready_confidence} | Max hold: {cfg.max_position_hold_hours or 0}h(disabled if 0)"
+        f"Ready threshold: {cfg.min_ready_confidence} | Max hold: {cfg.max_position_hold_hours or 0}h(disabled if 0) | "
+        f"Position sizing: {cfg.position_size_pct}% risk | Trailing stop: {cfg.trailing_stop_atr_mult}x ATR"
     )
 
     while True:
@@ -1158,10 +1478,40 @@ def main() -> None:
 
             if active_position is not None:
                 current_price = fetch_last_price(cfg, active_position.symbol)
+                
+                # Fetch current ATR for trailing stop calculation
+                try:
+                    df_15m = fetch_klines(cfg, active_position.symbol, "15m")
+                    if len(df_15m) >= 50:
+                        df_15m = add_indicators(df_15m)
+                        current_atr = safe_float(df_15m.iloc[-1]["atr14"])
+                        
+                        # Update trailing stop
+                        active_position = update_trailing_stop(
+                            active_position,
+                            current_price,
+                            current_atr,
+                            cfg.trailing_stop_atr_mult,
+                        )
+                        state["active_position"] = asdict(active_position)
+                        
+                        print(
+                            f"Trailing stop guncellendi: {active_position.symbol} | "
+                            f"Yeni SL: {active_position.stop_loss:.6f}"
+                        )
+                except Exception as e:
+                    print(f"Trailing stop guncelleme hatasi: {e}")
+
                 exit_signal = evaluate_position_exit(active_position, current_price, now)
                 if exit_signal is not None:
                     exit_reason, exit_price = exit_signal
                     pnl_net = compute_position_pnl(active_position, exit_price)
+                    
+                    # Check max drawdown limit
+                    pnl_pct = (pnl_net / (active_position.entry_price * active_position.quantity)) * 100
+                    if abs(pnl_pct) > cfg.max_drawdown_pct and exit_reason != "stop_loss":
+                        exit_reason = "max_drawdown_limit"
+                    
                     paper_balance += pnl_net
                     append_paper_trade(
                         cfg.paper_trades_file,
@@ -1198,21 +1548,23 @@ def main() -> None:
                 else:
                     print(
                         f"Aktif pozisyon korunuyor: {active_position.symbol} {active_position.side} | "
-                        f"anlik fiyat {current_price:.6f}"
+                        f"anlik fiyat {current_price:.6f} | "
+                        f"Trailing SL: {active_position.stop_loss:.6f}"
                     )
             else:
                 strategy_stats = compute_strategy_stats(cfg.paper_trades_file)
                 setups = analyze_market(cfg)
                 best_setup = select_best_ready_setup(setups, cfg.min_ready_confidence, strategy_stats)
                 if best_setup is not None:
-                    new_position = open_position_from_setup(best_setup, cfg, now)
+                    new_position = open_position_from_setup(best_setup, cfg, now, paper_balance)
                     state["active_position"] = asdict(new_position)
                     state["last_action"] = "entry"
                     state["last_selected_strategy"] = best_setup.strategy_key
                     send_telegram(cfg, format_entry_message(best_setup, new_position, strategy_stats))
                     print(
                         f"Pozisyon acildi: {new_position.symbol} {new_position.side} | "
-                        f"{new_position.setup_type} | skor {score_setup(best_setup, strategy_stats):.2f}"
+                        f"{new_position.setup_type} | skor {score_setup(best_setup, strategy_stats):.2f} | "
+                        f"Boyut: {new_position.quantity:.4f} ({paper_balance * cfg.position_size_pct / 100:.2f} USD risk)"
                     )
                 else:
                     print("Temiz ve esik ustu setup bulunamadi, yeni pozisyon acilmadi.")
