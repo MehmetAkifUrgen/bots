@@ -70,6 +70,7 @@ class Config:
     max_risk_pct: float
     trailing_stop_atr_mult: float
     max_drawdown_pct: float
+    max_open_positions: int
 
 
 @dataclass
@@ -163,6 +164,7 @@ def load_config() -> Config:
         max_risk_pct=float(os.getenv("MAX_RISK_PCT", "5")),
         trailing_stop_atr_mult=float(os.getenv("TRAILING_STOP_ATR_MULT", "1.5")),
         max_drawdown_pct=float(os.getenv("MAX_DRAWDOWN_PCT", "20")),
+        max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "3")),
     )
 
 
@@ -1150,30 +1152,65 @@ def setup_entry_price(setup: Setup) -> float:
     raise ValueError(f"{setup.symbol} icin entry price hesaplanamadi.")
 
 
+def load_active_positions(state: dict) -> list[ActivePosition]:
+    raw_list = state.get("active_positions")
+    if not isinstance(raw_list, list):
+        # Backward compatibility: migrate old single position format
+        old_position = state.get("active_position")
+        if isinstance(old_position, dict):
+            try:
+                return [ActivePosition(
+                    symbol=str(old_position["symbol"]),
+                    side=str(old_position["side"]),
+                    setup_type=str(old_position["setup_type"]),
+                    strategy_key=str(old_position["strategy_key"]),
+                    confidence=int(old_position["confidence"]),
+                    entry_price=float(old_position["entry_price"]),
+                    stop_loss=float(old_position["stop_loss"]),
+                    take_profit=float(old_position["take_profit"]),
+                    quantity=float(old_position["quantity"]),
+                    opened_at=str(old_position["opened_at"]),
+                    max_hold_until=str(old_position["max_hold_until"]) if old_position.get("max_hold_until") is not None else None,
+                    price_change_pct=float(old_position["price_change_pct"]),
+                    highest_price=float(old_position.get("highest_price", old_position["entry_price"])),
+                    lowest_price=float(old_position.get("lowest_price", old_position["entry_price"])),
+                    trailing_stop=float(old_position["trailing_stop"]) if old_position.get("trailing_stop") is not None else None,
+                )]
+            except (KeyError, TypeError, ValueError):
+                pass
+        return []
+
+    result: list[ActivePosition] = []
+    for raw in raw_list:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            result.append(ActivePosition(
+                symbol=str(raw["symbol"]),
+                side=str(raw["side"]),
+                setup_type=str(raw["setup_type"]),
+                strategy_key=str(raw["strategy_key"]),
+                confidence=int(raw["confidence"]),
+                entry_price=float(raw["entry_price"]),
+                stop_loss=float(raw["stop_loss"]),
+                take_profit=float(raw["take_profit"]),
+                quantity=float(raw["quantity"]),
+                opened_at=str(raw["opened_at"]),
+                max_hold_until=str(raw["max_hold_until"]) if raw.get("max_hold_until") is not None else None,
+                price_change_pct=float(raw["price_change_pct"]),
+                highest_price=float(raw.get("highest_price", raw["entry_price"])),
+                lowest_price=float(raw.get("lowest_price", raw["entry_price"])),
+                trailing_stop=float(raw["trailing_stop"]) if raw.get("trailing_stop") is not None else None,
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return result
+
+
 def load_active_position(state: dict) -> ActivePosition | None:
-    raw = state.get("active_position")
-    if not isinstance(raw, dict):
-        return None
-    try:
-        return ActivePosition(
-            symbol=str(raw["symbol"]),
-            side=str(raw["side"]),
-            setup_type=str(raw["setup_type"]),
-            strategy_key=str(raw["strategy_key"]),
-            confidence=int(raw["confidence"]),
-            entry_price=float(raw["entry_price"]),
-            stop_loss=float(raw["stop_loss"]),
-            take_profit=float(raw["take_profit"]),
-            quantity=float(raw["quantity"]),
-            opened_at=str(raw["opened_at"]),
-            max_hold_until=str(raw["max_hold_until"]) if raw.get("max_hold_until") is not None else None,
-            price_change_pct=float(raw["price_change_pct"]),
-            highest_price=float(raw.get("highest_price", raw["entry_price"])),
-            lowest_price=float(raw.get("lowest_price", raw["entry_price"])),
-            trailing_stop=float(raw["trailing_stop"]) if raw.get("trailing_stop") is not None else None,
-        )
-    except (KeyError, TypeError, ValueError):
-        return None
+    """Backward compatibility: return first active position."""
+    positions = load_active_positions(state)
+    return positions[0] if positions else None
 
 
 def open_position_from_setup(setup: Setup, cfg: Config, now: datetime, balance: float) -> ActivePosition:
@@ -1468,108 +1505,151 @@ def main() -> None:
         f"Basladi | Scan every: {cfg.scan_every_seconds}s | Symbol limit: {cfg.top_gainers_limit or 'all'} | "
         f"Volume filter: {cfg.min_quote_volume_usd:.0f}-{cfg.max_quote_volume_usd:.0f} | "
         f"Ready threshold: {cfg.min_ready_confidence} | Max hold: {cfg.max_position_hold_hours or 0}h(disabled if 0) | "
-        f"Position sizing: {cfg.position_size_pct}% risk | Trailing stop: {cfg.trailing_stop_atr_mult}x ATR"
+        f"Max open positions: {cfg.max_open_positions} | Position sizing: {cfg.position_size_pct}% risk | "
+        f"Trailing stop: {cfg.trailing_stop_atr_mult}x ATR"
     )
 
     while True:
         try:
-            active_position = load_active_position(state)
+            active_positions = load_active_positions(state)
             now = utc_now()
 
-            if active_position is not None:
-                current_price = fetch_last_price(cfg, active_position.symbol)
-                
+            # === PHASE 1: Check exits & update trailing stops for ALL positions ===
+            closed_positions: list[tuple[ActivePosition, str, float, float]] = []  # (pos, reason, exit_price, pnl)
+            updated_positions: list[ActivePosition] = []
+
+            for position in active_positions:
+                current_price = fetch_last_price(cfg, position.symbol)
+
                 # Fetch current ATR for trailing stop calculation
                 try:
-                    df_15m = fetch_klines(cfg, active_position.symbol, "15m")
+                    df_15m = fetch_klines(cfg, position.symbol, "15m")
                     if len(df_15m) >= 50:
                         df_15m = add_indicators(df_15m)
                         current_atr = safe_float(df_15m.iloc[-1]["atr14"])
-                        
+
                         # Update trailing stop
-                        active_position = update_trailing_stop(
-                            active_position,
+                        updated_position = update_trailing_stop(
+                            position,
                             current_price,
                             current_atr,
                             cfg.trailing_stop_atr_mult,
                         )
-                        state["active_position"] = asdict(active_position)
-                        
+                        updated_positions.append(updated_position)
+                        position = updated_position  # Use updated position for exit check
+
                         print(
-                            f"Trailing stop guncellendi: {active_position.symbol} | "
-                            f"Yeni SL: {active_position.stop_loss:.6f}"
+                            f"Trailing stop guncellendi: {position.symbol} | "
+                            f"Yeni SL: {position.stop_loss:.6f}"
                         )
                 except Exception as e:
-                    print(f"Trailing stop guncelleme hatasi: {e}")
+                    print(f"Trailing stop guncelleme hatasi ({position.symbol}): {e}")
 
-                exit_signal = evaluate_position_exit(active_position, current_price, now)
+                # Check exit conditions
+                exit_signal = evaluate_position_exit(position, current_price, now)
                 if exit_signal is not None:
                     exit_reason, exit_price = exit_signal
-                    pnl_net = compute_position_pnl(active_position, exit_price)
-                    
+                    pnl_net = compute_position_pnl(position, exit_price)
+
                     # Check max drawdown limit
-                    pnl_pct = (pnl_net / (active_position.entry_price * active_position.quantity)) * 100
+                    pnl_pct = (pnl_net / (position.entry_price * position.quantity)) * 100
                     if abs(pnl_pct) > cfg.max_drawdown_pct and exit_reason != "stop_loss":
                         exit_reason = "max_drawdown_limit"
-                    
-                    paper_balance += pnl_net
-                    append_paper_trade(
-                        cfg.paper_trades_file,
-                        active_position,
+
+                    closed_positions.append((position, exit_reason, exit_price, pnl_net))
+                else:
+                    pos_index = len(updated_positions) + 1
+                    print(
+                        f"Aktif pozisyon [{pos_index}/{len(active_positions)}]: "
+                        f"{position.symbol} {position.side} | "
+                        f"anlik fiyat {current_price:.6f} | "
+                        f"Trailing SL: {position.stop_loss:.6f}"
+                    )
+
+            # === PHASE 2: Process closed positions ===
+            for position, exit_reason, exit_price, pnl_net in closed_positions:
+                paper_balance += pnl_net
+                append_paper_trade(
+                    cfg.paper_trades_file,
+                    position,
+                    exit_price,
+                    exit_reason,
+                    now,
+                    pnl_net,
+                    paper_balance,
+                )
+                trade_summary = compute_trade_summary(cfg.paper_trades_file)
+                send_telegram(
+                    cfg,
+                    format_exit_message(
+                        position,
                         exit_price,
                         exit_reason,
-                        now,
                         pnl_net,
                         paper_balance,
-                    )
-                    trade_summary = compute_trade_summary(cfg.paper_trades_file)
-                    send_telegram(
-                        cfg,
-                        format_exit_message(
-                            active_position,
-                            exit_price,
-                            exit_reason,
-                            pnl_net,
-                            paper_balance,
-                            now,
-                            trade_summary,
-                        ),
-                    )
-                    state.pop("active_position", None)
-                    state["last_action"] = "exit"
-                    state["last_exit_reason"] = exit_reason
-                    state["paper_balance_usd"] = paper_balance
-                    state["win_rate"] = trade_summary["win_rate"]
-                    state["closed_trades"] = int(trade_summary["closed_trades"])
-                    print(
-                        f"Pozisyon kapandi: {active_position.symbol} | {exit_reason} | "
-                        f"PnL {pnl_net:+.2f} USD"
-                    )
-                else:
-                    print(
-                        f"Aktif pozisyon korunuyor: {active_position.symbol} {active_position.side} | "
-                        f"anlik fiyat {current_price:.6f} | "
-                        f"Trailing SL: {active_position.stop_loss:.6f}"
-                    )
+                        now,
+                        trade_summary,
+                    ),
+                )
+                print(
+                    f"Pozisyon kapandi: {position.symbol} | {exit_reason} | "
+                    f"PnL {pnl_net:+.2f} USD"
+                )
+
+            # === PHASE 3: Update state with remaining active positions ===
+            # Remove closed positions, keep updated ones
+            closed_symbols = {pos.symbol for pos, _, _, _ in closed_positions}
+            remaining_positions = [p for p in updated_positions if p.symbol not in closed_symbols]
+
+            if remaining_positions:
+                state["active_positions"] = [asdict(p) for p in remaining_positions]
             else:
-                strategy_stats = compute_strategy_stats(cfg.paper_trades_file)
-                setups = analyze_market(cfg)
-                best_setup = select_best_ready_setup(setups, cfg.min_ready_confidence, strategy_stats)
-                if best_setup is not None:
-                    new_position = open_position_from_setup(best_setup, cfg, now, paper_balance)
-                    state["active_position"] = asdict(new_position)
-                    state["last_action"] = "entry"
-                    state["last_selected_strategy"] = best_setup.strategy_key
-                    send_telegram(cfg, format_entry_message(best_setup, new_position, strategy_stats))
-                    print(
-                        f"Pozisyon acildi: {new_position.symbol} {new_position.side} | "
-                        f"{new_position.setup_type} | skor {score_setup(best_setup, strategy_stats):.2f} | "
-                        f"Boyut: {new_position.quantity:.4f} ({paper_balance * cfg.position_size_pct / 100:.2f} USD risk)"
-                    )
-                else:
-                    print("Temiz ve esik ustu setup bulunamadi, yeni pozisyon acilmadi.")
+                state.pop("active_positions", None)
 
             state["paper_balance_usd"] = paper_balance
+            trade_summary = compute_trade_summary(cfg.paper_trades_file)
+            state["win_rate"] = trade_summary["win_rate"]
+            state["closed_trades"] = int(trade_summary["closed_trades"])
+
+            # === PHASE 4: Open new positions if slots available ===
+            open_slots = cfg.max_open_positions - len(remaining_positions)
+            if open_slots > 0:
+                strategy_stats = compute_strategy_stats(cfg.paper_trades_file)
+                setups = analyze_market(cfg)
+
+                # Filter out symbols already in active positions
+                active_symbols = {p.symbol for p in remaining_positions}
+                available_setups = [s for s in setups if s.symbol not in active_symbols and s.ready and s.confidence >= cfg.min_ready_confidence]
+
+                opened_count = 0
+                skipped_symbols: list[str] = []
+                for setup in sorted(available_setups, key=lambda s: score_setup(s, strategy_stats), reverse=True):
+                    if opened_count >= open_slots:
+                        break
+
+                    new_position = open_position_from_setup(setup, cfg, now, paper_balance)
+                    state["active_positions"] = [asdict(p) for p in remaining_positions] + [asdict(new_position)]
+                    remaining_positions.append(new_position)
+                    state["last_action"] = "entry"
+                    state["last_selected_strategy"] = setup.strategy_key
+                    send_telegram(cfg, format_entry_message(setup, new_position, strategy_stats))
+                    print(
+                        f"Pozisyon acildi: {new_position.symbol} {new_position.side} | "
+                        f"{new_position.setup_type} | skor {score_setup(setup, strategy_stats):.2f} | "
+                        f"Boyut: {new_position.quantity:.4f} ({paper_balance * cfg.position_size_pct / 100:.2f} USD risk)"
+                    )
+                    opened_count += 1
+
+                if opened_count == 0:
+                    if available_setups:
+                        print(f"{len(available_setups)} uygun setup var ama slot dolu veya esik altinda.")
+                    else:
+                        print("Temiz ve esik ustu setup bulunamadi, yeni pozisyon acilmadi.")
+
+                state["paper_balance_usd"] = paper_balance
+            else:
+                print(f"Tum slotlar dolu ({len(remaining_positions)}/{cfg.max_open_positions}), yeni pozisyon acilmadi.")
+
             state["last_cycle_status"] = "ok"
             state["last_success_at"] = now.isoformat()
             write_cycle_state(cfg, state)
