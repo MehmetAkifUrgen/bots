@@ -71,6 +71,9 @@ class Config:
     trailing_stop_atr_mult: float
     max_drawdown_pct: float
     max_open_positions: int
+    commission_pct: float
+    slippage_pct: float
+    max_position_age_hours: int
 
 
 @dataclass
@@ -165,6 +168,9 @@ def load_config() -> Config:
         trailing_stop_atr_mult=float(os.getenv("TRAILING_STOP_ATR_MULT", "1.5")),
         max_drawdown_pct=float(os.getenv("MAX_DRAWDOWN_PCT", "20")),
         max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "3")),
+        commission_pct=float(os.getenv("COMMISSION_PCT", "0.08")),
+        slippage_pct=float(os.getenv("SLIPPAGE_PCT", "0.05")),
+        max_position_age_hours=int(os.getenv("MAX_POSITION_AGE_HOURS", "4")),
     )
 
 
@@ -1213,6 +1219,64 @@ def load_active_position(state: dict) -> ActivePosition | None:
     return positions[0] if positions else None
 
 
+def cleanup_stale_positions(
+    positions: list[ActivePosition],
+    cfg: Config,
+    now: datetime,
+    paper_balance: float,
+    cfg_path: str,
+) -> tuple[list[ActivePosition], float, list[dict]]:
+    """
+    Bot restart'inde veya cycle'da eski pozisyonlari tespit et ve kapat.
+    Returns: (remaining_positions, updated_balance, closed_trade_records)
+    """
+    remaining: list[ActivePosition] = []
+    closed_records: list[dict] = []
+    updated_balance = paper_balance
+
+    for position in positions:
+        opened_at = parse_datetime(position.opened_at)
+        if opened_at is None:
+            # Invalid date, force close
+            exit_reason = "stale_position_invalid_date"
+        else:
+            age_hours = (now - opened_at).total_seconds() / 3600
+            if age_hours > cfg.max_position_age_hours:
+                exit_reason = f"stale_position_age_{int(age_hours)}h"
+            else:
+                remaining.append(position)
+                continue  # Position is still valid
+
+        # Force close stale position at entry price (unknown real exit price)
+        current_price = position.entry_price  # Fallback
+        try:
+            current_price = fetch_last_price(cfg, position.symbol)
+        except Exception as e:
+            print(f"  [Force Close Warning] {position.symbol}: fiyat cekilemedi, entry price ile kapatildi. {e}")
+
+        pnl_net = compute_position_pnl(position, current_price, cfg)
+        updated_balance += pnl_net
+
+        append_paper_trade(
+            cfg_path,
+            position,
+            current_price,
+            exit_reason,
+            now,
+            pnl_net,
+            updated_balance,
+        )
+        closed_records.append({
+            "position": position,
+            "exit_price": current_price,
+            "exit_reason": exit_reason,
+            "pnl": pnl_net,
+        })
+        print(f"  [Force Close] {position.symbol} | {exit_reason} | PnL: {pnl_net:+.2f} USD")
+
+    return remaining, updated_balance, closed_records
+
+
 def open_position_from_setup(setup: Setup, cfg: Config, now: datetime, balance: float) -> ActivePosition:
     entry_price = setup_entry_price(setup)
     
@@ -1290,9 +1354,23 @@ def evaluate_position_exit(
     return None
 
 
-def compute_position_pnl(position: ActivePosition, exit_price: float) -> float:
+def compute_position_pnl(
+    position: ActivePosition,
+    exit_price: float,
+    cfg: Config,
+) -> float:
     direction = 1 if position.side == "LONG" else -1
-    return (exit_price - position.entry_price) * position.quantity * direction
+    gross_pnl = (exit_price - position.entry_price) * position.quantity * direction
+
+    # Commission: entry + exit
+    notional_entry = position.entry_price * position.quantity
+    notional_exit = exit_price * position.quantity
+    commission = (notional_entry + notional_exit) * (cfg.commission_pct / 100)
+
+    # Slippage on exit
+    slippage = notional_exit * (cfg.slippage_pct / 100)
+
+    return gross_pnl - commission - slippage
 
 
 def append_paper_trade(
@@ -1445,10 +1523,51 @@ def build_report_hash(report_text: str) -> str:
     return hashlib.sha256(report_text.encode("utf-8")).hexdigest()
 
 
+def detect_btc_trend(cfg: Config) -> str | None:
+    """
+    BTC trend'ini tespit et.
+    Returns: 'TRENDING_UP', 'TRENDING_DOWN', 'RANGING', or None (error)
+    """
+    btc_symbol = "BTCUSDT"
+    try:
+        df_1h = fetch_klines(cfg, btc_symbol, "1h")
+        if len(df_1h) < 50:
+            return None
+        df_1h = add_indicators(df_1h)
+        regime, _ = detect_market_regime(df_1h)
+        return regime
+    except Exception as e:
+        print(f"[BTC Trend Warning] {e}")
+        return None
+
+
+def should_filter_setup(setup: Setup, btc_trend: str | None) -> bool:
+    """
+    BTC trend'ine gore setup'i filtrele.
+    Returns True = BU SETUP'I ATLA.
+    """
+    if btc_trend is None:
+        return False  # BTC trend bilinmiyorsa filtreleme
+
+    # BTC düşerken altcoin LONG açma
+    if btc_trend == "TRENDING_DOWN" and setup.decision == "LONG":
+        return True
+
+    # BTC yükselirken SHORT riskli (ama tamamen engelleme, sadece confidence arttır)
+    # Burada filtreleme yapmıyoruz, kullanıcıya bırakıyoruz
+
+    return False
+
+
 def analyze_market(cfg: Config) -> list[Setup]:
     market_candidates = fetch_market_candidates(cfg)
     if not market_candidates:
         raise RuntimeError("Filtrelere uyan futures sembolu bulunamadi.")
+
+    # BTC trend'ini tespit et
+    btc_trend = detect_btc_trend(cfg)
+    if btc_trend:
+        print(f"BTC Trend: {btc_trend}")
 
     funding_map = fetch_funding_rates(cfg)
     print(
@@ -1477,17 +1596,48 @@ def analyze_market(cfg: Config) -> list[Setup]:
                     oi_history,
                     market.price_change_pct,
                 )
-                
-                setups.extend(
-                    build_candidate_setups(
-                        market,
-                        frames,
-                        funding_map.get(market.symbol),
-                        open_interest=oi_value,
-                        oi_trend=oi_trend,
-                        oi_strength=oi_strength,
-                    )
+
+                candidates = build_candidate_setups(
+                    market,
+                    frames,
+                    funding_map.get(market.symbol),
+                    open_interest=oi_value,
+                    oi_trend=oi_trend,
+                    oi_strength=oi_strength,
                 )
+
+                # BTC trend filtresini uygula
+                if btc_trend:
+                    filtered = []
+                    for setup in candidates:
+                        if should_filter_setup(setup, btc_trend):
+                            print(f"  [BTC Filter] {setup.symbol} {setup.decision} atlandi (BTC: {btc_trend})")
+                            # READY'yi WAIT'e çevir, direkt atma
+                            filtered.append(Setup(
+                                symbol=setup.symbol,
+                                decision="WAIT",
+                                setup_type="btc trend filter",
+                                strategy_key=build_strategy_key("WAIT", "btc trend filter"),
+                                confidence=setup.confidence,
+                                price_change_pct=setup.price_change_pct,
+                                funding_rate_pct=setup.funding_rate_pct,
+                                open_interest=setup.open_interest,
+                                oi_trend=setup.oi_trend,
+                                oi_strength=setup.oi_strength,
+                                entry_low=None,
+                                entry_high=None,
+                                stop_loss=None,
+                                target_1=None,
+                                target_2=None,
+                                ready=False,
+                                invalidation=f"BTC trend {btc_trend}, {setup.decision} setup'i riskli.",
+                                summary=f"BTC trend {btc_trend} oldugu icin {setup.decision} setup'i filtrelendi.",
+                            ))
+                        else:
+                            filtered.append(setup)
+                    setups.extend(filtered)
+                else:
+                    setups.extend(candidates)
         except Exception as exc:
             print(f"[UYARI] {market.symbol} taranamadi: {exc}")
             continue
@@ -1506,7 +1656,8 @@ def main() -> None:
         f"Volume filter: {cfg.min_quote_volume_usd:.0f}-{cfg.max_quote_volume_usd:.0f} | "
         f"Ready threshold: {cfg.min_ready_confidence} | Max hold: {cfg.max_position_hold_hours or 0}h(disabled if 0) | "
         f"Max open positions: {cfg.max_open_positions} | Position sizing: {cfg.position_size_pct}% risk | "
-        f"Trailing stop: {cfg.trailing_stop_atr_mult}x ATR"
+        f"Trailing stop: {cfg.trailing_stop_atr_mult}x ATR | "
+        f"Commission: {cfg.commission_pct}% | Slippage: {cfg.slippage_pct}%"
     )
 
     while True:
@@ -1514,11 +1665,63 @@ def main() -> None:
             active_positions = load_active_positions(state)
             now = utc_now()
 
+            # === PHASE 0: Detect bot restart & cleanup stale positions ===
+            last_cycle_status = state.get("last_cycle_status")
+            last_success_at = parse_datetime(state.get("last_success_at"))
+            is_restart = (
+                last_cycle_status in ("error", "exit", None)
+                or (last_success_at is not None and (now - last_success_at).total_seconds() > 3600)
+            )
+
+            if is_restart and active_positions:
+                print(f"Bot restart detected veya uzun sure gecmis. Pozisyonlar kontrol ediliyor...")
+                fresh_positions, paper_balance, closed_records = cleanup_stale_positions(
+                    active_positions,
+                    cfg,
+                    now,
+                    paper_balance,
+                    cfg.paper_trades_file,
+                )
+
+                # Send Telegram notifications for force-closed positions
+                for record in closed_records:
+                    trade_summary = compute_trade_summary(cfg.paper_trades_file)
+                    send_telegram(
+                        cfg,
+                        format_exit_message(
+                            record["position"],
+                            record["exit_price"],
+                            record["exit_reason"],
+                            record["pnl"],
+                            paper_balance,
+                            now,
+                            trade_summary,
+                        ),
+                    )
+
+                # Update state with cleaned positions
+                if fresh_positions:
+                    state["active_positions"] = [asdict(p) for p in fresh_positions]
+                    remaining_positions = fresh_positions
+                else:
+                    state.pop("active_positions", None)
+                    remaining_positions = []
+
+                state["paper_balance_usd"] = paper_balance
+                state["last_cycle_status"] = "ok"
+                state["last_success_at"] = now.isoformat()
+                write_cycle_state(cfg, state)
+
+                if closed_records:
+                    print(f"{len(closed_records)} eski pozisyon temizlendi. Bakiye: {paper_balance:.2f} USD")
+            else:
+                remaining_positions = active_positions
+
             # === PHASE 1: Check exits & update trailing stops for ALL positions ===
             closed_positions: list[tuple[ActivePosition, str, float, float]] = []  # (pos, reason, exit_price, pnl)
             updated_positions: list[ActivePosition] = []
 
-            for position in active_positions:
+            for position in remaining_positions:
                 current_price = fetch_last_price(cfg, position.symbol)
 
                 # Fetch current ATR for trailing stop calculation
@@ -1549,7 +1752,7 @@ def main() -> None:
                 exit_signal = evaluate_position_exit(position, current_price, now)
                 if exit_signal is not None:
                     exit_reason, exit_price = exit_signal
-                    pnl_net = compute_position_pnl(position, exit_price)
+                    pnl_net = compute_position_pnl(position, exit_price, cfg)
 
                     # Check max drawdown limit
                     pnl_pct = (pnl_net / (position.entry_price * position.quantity)) * 100
