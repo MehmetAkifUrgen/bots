@@ -165,8 +165,8 @@ def load_config() -> Config:
         min_quote_volume_usd=float(os.getenv("MIN_QUOTE_VOLUME_USD", "15000000")),
         max_quote_volume_usd=float(os.getenv("MAX_QUOTE_VOLUME_USD", "5000000000")),
         lookback_bars=int(os.getenv("LOOKBACK_BARS", "260")),
-        min_ready_confidence=int(os.getenv("MIN_READY_CONFIDENCE", "78")),
-        send_wait_setups=parse_bool(os.getenv("SEND_WAIT_SETUPS", "true"), default=True),
+        min_ready_confidence=int(os.getenv("MIN_READY_CONFIDENCE", "82")),
+        send_wait_setups=parse_bool(os.getenv("SEND_WAIT_SETUPS", "false"), default=False),
         max_wait_setups=int(os.getenv("MAX_WAIT_SETUPS", "3")),
         analysis_state_file=os.getenv("ANALYSIS_STATE_FILE", "analysis_state.json").strip(),
         analysis_log_file=os.getenv("ANALYSIS_LOG_FILE", "analysis_log.csv").strip(),
@@ -655,6 +655,44 @@ def trend_down(row: pd.Series) -> bool:
     return close < ema20 < ema50 < ema200
 
 
+def create_trade_setup(
+    market: MarketTicker,
+    decision: str,
+    setup_type: str,
+    confidence: int,
+    entry_price: float,
+    stop_loss: float,
+    target_1: float,
+    target_2: float,
+    summary: str,
+    invalidation: str,
+    funding_pct: float | None = None,
+    open_interest: float | None = None,
+    oi_trend: str | None = None,
+    oi_strength: int | None = None,
+) -> Setup:
+    return Setup(
+        symbol=market.symbol,
+        decision=decision,
+        setup_type=setup_type,
+        strategy_key=build_strategy_key(decision, setup_type),
+        confidence=confidence,
+        price_change_pct=market.price_change_pct,
+        funding_rate_pct=funding_pct,
+        open_interest=open_interest,
+        oi_trend=oi_trend,
+        oi_strength=oi_strength,
+        entry_low=entry_price,  # Simplified to single point for cleaner logic
+        entry_high=entry_price * 1.0005,
+        stop_loss=stop_loss,
+        target_1=target_1,
+        target_2=target_2,
+        ready=True,
+        invalidation=invalidation,
+        summary=summary,
+    )
+
+
 def build_candidate_setups(
     market: MarketTicker,
     frames: dict[str, pd.DataFrame],
@@ -668,7 +706,6 @@ def build_candidate_setups(
     tf_4h = frames["4h"]
 
     row_15 = tf_15.iloc[-2]
-    row_15_prev = tf_15.iloc[-3]
     row_1h = tf_1h.iloc[-2]
     row_4h = tf_4h.iloc[-2]
     recent_15 = tf_15.iloc[-22:-2]
@@ -679,346 +716,93 @@ def build_candidate_setups(
     atr_15 = max(safe_float(row_15["atr14"]), close_15 * 0.003)
     rsi_15 = safe_float(row_15["rsi14"])
     adx_15 = safe_float(row_15["adx14"])
-    macd_15 = safe_float(row_15["macd_hist"])
-    macd_15_prev = safe_float(row_15_prev["macd_hist"])
-    volume_15 = safe_float(row_15["volume"])
     vol_ma_15 = safe_float(row_15["vol_ma20"])
-
-    rsi_1h = safe_float(row_1h["rsi14"])
-    adx_1h = safe_float(row_1h["adx14"])
-    macd_1h = safe_float(row_1h["macd_hist"])
+    volume_15 = safe_float(row_15["volume"])
 
     swing_low_15 = safe_float(recent_15["low"].min())
     swing_high_15 = safe_float(recent_15["high"].max())
-    dist_from_ema20 = (close_15 - ema20_15) / atr_15 if atr_15 > 0 else 0.0
     funding_pct = funding_rate * 100 if funding_rate is not None else None
+    
     candidates: list[Setup] = []
 
-    long_conditions = [
-        trend_up(row_4h),
-        trend_up(row_1h),
-        close_15 >= ema20_15,
-        50 <= rsi_1h <= 68,
-        adx_1h >= 18,
-        macd_1h > 0,
-        volume_15 >= vol_ma_15,
-        0.0 <= dist_from_ema20 <= 0.9,
-        funding_rate is None or funding_rate <= 0.0008,
-    ]
-    long_score = int(round(100 * sum(long_conditions) / len(long_conditions)))
+    # 1. A+ TREND PULLBACK (Güvenli İşlem)
+    # BTC trend kontrolü analyze_market içinde yapılıyor, burada teknik uyum bakıyoruz
+    is_bullish = trend_up(row_4h) and trend_up(row_1h)
+    is_bearish = trend_down(row_4h) and trend_down(row_1h)
 
-    trend_short_conditions = [
-        trend_down(row_4h),
-        trend_down(row_1h),
-        close_15 <= ema20_15,
-        32 <= rsi_1h <= 50,
-        adx_1h >= 18,
-        macd_1h < 0,
-        volume_15 >= vol_ma_15,
-        -0.9 <= dist_from_ema20 <= 0.1,
-    ]
-    trend_short_score = int(round(100 * sum(trend_short_conditions) / len(trend_short_conditions)))
+    # Pullback kontrolü: 15m EMA20 retest
+    dist_ema20 = (close_15 - ema20_15) / atr_15 if atr_15 > 0 else 0.0
+    
+    if is_bullish and 0.0 <= dist_ema20 <= 0.6:
+        # Long Setup
+        stop_loss = min(swing_low_15, ema50_15) - 0.5 * atr_15
+        risk = close_15 - stop_loss
+        if risk > 0:
+            target_1 = close_15 + 1.5 * risk
+            target_2 = close_15 + 2.5 * risk
+            candidates.append(create_trade_setup(
+                market, "LONG", "A+ Trend Pullback", 85, close_15, stop_loss, target_1, target_2,
+                "4h/1h trend yukari, 15m EMA20 retest basarili.", "15m kapanis EMA50 altina inerse.",
+                funding_pct, open_interest, oi_trend, oi_strength
+            ))
 
-    exhaustion_short_conditions = [
-        market.price_change_pct >= 10,
-        rsi_1h >= 72,
-        rsi_15 >= 68,
-        dist_from_ema20 >= 1.25,
-        macd_15 < macd_15_prev,
-        close_15 < safe_float(row_15_prev["close"]),
-        funding_rate is None or funding_rate >= 0.0005,
-    ]
-    exhaustion_short_score = int(round(100 * sum(exhaustion_short_conditions) / len(exhaustion_short_conditions)))
+    if is_bearish and -0.6 <= dist_ema20 <= 0.0:
+        # Short Setup
+        stop_loss = max(swing_high_15, ema50_15) + 0.5 * atr_15
+        risk = stop_loss - close_15
+        if risk > 0:
+            target_1 = close_15 - 1.5 * risk
+            target_2 = close_15 - 2.5 * risk
+            candidates.append(create_trade_setup(
+                market, "SHORT", "A+ Trend Pullback", 85, close_15, stop_loss, target_1, target_2,
+                "4h/1h trend asagi, 15m EMA20 retest basarili.", "15m kapanis EMA50 ustune cikarsa.",
+                funding_pct, open_interest, oi_trend, oi_strength
+            ))
 
-    scalp_long_conditions = [
-        trend_up(row_1h),
-        close_15 >= ema20_15 >= ema50_15,
-        48 <= rsi_15 <= 66,
-        adx_15 >= 20,
-        macd_15 > macd_15_prev,
-        volume_15 >= vol_ma_15 * 1.05,
-        0.0 <= dist_from_ema20 <= 0.55,
-    ]
-    scalp_long_score = int(round(100 * sum(scalp_long_conditions) / len(scalp_long_conditions)))
-
-    scalp_short_conditions = [
-        trend_down(row_1h),
-        close_15 <= ema20_15 <= ema50_15,
-        34 <= rsi_15 <= 52,
-        adx_15 >= 20,
-        macd_15 < macd_15_prev,
-        volume_15 >= vol_ma_15 * 1.05,
-        -0.55 <= dist_from_ema20 <= 0.0,
-    ]
-    scalp_short_score = int(round(100 * sum(scalp_short_conditions) / len(scalp_short_conditions)))
-
-    # === HIZLI SCALP (PUMP/DUMP YAKALAMA) ===
-    recent_3_bars = tf_15.iloc[-5:-2]
-    price_changes = []
-    for i in range(1, len(recent_3_bars)):
-        prev_close = safe_float(recent_3_bars.iloc[i - 1]["close"])
-        curr_close = safe_float(recent_3_bars.iloc[i]["close"])
-        if prev_close > 0:
-            pct_change = (curr_close - prev_close) / prev_close * 100
-            price_changes.append(pct_change)
-
-    max_bar_change = max(price_changes) if price_changes else 0.0
-    avg_recent_volume = safe_float(recent_3_bars["volume"].mean())
-    volume_spike = avg_recent_volume / vol_ma_15 if vol_ma_15 > 0 else 1.0
-
-    rsi_recent = []
-    for i in range(-4, -2):
-        rsi_recent.append(safe_float(tf_15.iloc[i]["rsi14"]))
-    rsi_trend = rsi_recent[-1] - rsi_recent[0] if len(rsi_recent) >= 2 else 0.0
-
-    # Hızlı LONG (Pump yakalama)
-    fast_long_conditions = [
-        trend_up(row_1h),
-        max_bar_change >= 1.5,
-        volume_spike >= 1.8,
-        55 <= rsi_15 <= 75,
-        rsi_trend > 5,
-        macd_15 > macd_15_prev,
-        close_15 >= ema20_15,
-        adx_15 >= 18,
-    ]
-    fast_long_score = int(round(100 * sum(fast_long_conditions) / len(fast_long_conditions)))
-
-    # Hızlı SHORT (Dump yakalama)
-    fast_short_conditions = [
-        trend_down(row_1h),
-        max_bar_change <= -1.5,
-        volume_spike >= 1.8,
-        25 <= rsi_15 <= 45,
-        rsi_trend < -5,
-        macd_15 < macd_15_prev,
-        close_15 <= ema20_15,
-        adx_15 >= 18,
-    ]
-    fast_short_score = int(round(100 * sum(fast_short_conditions) / len(fast_short_conditions)))
-
-    if long_score >= 78:
-        entry_low = min(close_15, ema20_15)
-        entry_high = max(close_15, ema20_15 + 0.25 * atr_15)
-        stop_loss = min(swing_low_15, ema50_15) - 0.6 * atr_15
-        if stop_loss >= entry_low:
-            stop_loss = entry_low - atr_15
-        entry_mid = (entry_low + entry_high) / 2
-        risk = max(entry_mid - stop_loss, atr_15 * 0.8)
-        target_1 = entry_mid + 1.5 * risk
-        target_2 = entry_mid + 2.5 * risk
-        candidates.append(
-            Setup(
-                symbol=market.symbol,
-                decision="LONG",
-                setup_type="trend continuation",
-                strategy_key=build_strategy_key("LONG", "trend continuation"),
-                confidence=long_score,
-                price_change_pct=market.price_change_pct,
-                funding_rate_pct=funding_pct,
-                open_interest=open_interest,
-                oi_trend=oi_trend,
-                oi_strength=oi_strength,
-                entry_low=entry_low,
-                entry_high=entry_high,
-                stop_loss=stop_loss,
-                target_1=target_1,
-                target_2=target_2,
-                ready=True,
-                invalidation="15m kapanis EMA20 altina inerse setup zayiflar.",
-                summary="4h ve 1h trend yukari, 15m tarafinda geri cekilme sonrasi devam setup'i var.",
-            )
-        )
-
-    if trend_short_score >= 78:
-        entry_low = min(close_15, ema20_15)
-        entry_high = max(close_15, ema20_15 + 0.25 * atr_15)
-        stop_loss = max(swing_high_15, ema50_15) + 0.6 * atr_15
-        if stop_loss <= entry_high:
-            stop_loss = entry_high + atr_15
-        entry_mid = (entry_low + entry_high) / 2
-        risk = max(stop_loss - entry_mid, atr_15 * 0.8)
-        target_1 = entry_mid - 1.5 * risk
-        target_2 = entry_mid - 2.5 * risk
-        candidates.append(
-            Setup(
-                symbol=market.symbol,
-                decision="SHORT",
-                setup_type="trend continuation",
-                strategy_key=build_strategy_key("SHORT", "trend continuation"),
-                confidence=trend_short_score,
-                price_change_pct=market.price_change_pct,
-                funding_rate_pct=funding_pct,
-                open_interest=open_interest,
-                oi_trend=oi_trend,
-                oi_strength=oi_strength,
-                entry_low=entry_low,
-                entry_high=entry_high,
-                stop_loss=stop_loss,
-                target_1=target_1,
-                target_2=target_2,
-                ready=True,
-                invalidation="15m kapanis EMA20 ustune geri cikarsa setup bozulur.",
-                summary="Yukselenler icinde olsa da ust zaman dilimlerinde zayiflik var ve trend short setup'i olusmus.",
-            )
-        )
-
-    if exhaustion_short_score >= 72:
-        entry_low = close_15
-        entry_high = close_15 + 0.45 * atr_15
-        stop_loss = max(swing_high_15, entry_high + 0.8 * atr_15)
-        entry_mid = (entry_low + entry_high) / 2
-        risk = max(stop_loss - entry_mid, atr_15 * 0.8)
-        target_1 = entry_mid - 1.2 * risk
-        target_2 = entry_mid - 2.0 * risk
-        candidates.append(
-            Setup(
-                symbol=market.symbol,
-                decision="SHORT",
-                setup_type="exhaustion fade",
-                strategy_key=build_strategy_key("SHORT", "exhaustion fade"),
-                confidence=exhaustion_short_score,
-                price_change_pct=market.price_change_pct,
-                funding_rate_pct=funding_pct,
-                open_interest=open_interest,
-                oi_trend=oi_trend,
-                oi_strength=oi_strength,
-                entry_low=entry_low,
-                entry_high=entry_high,
-                stop_loss=stop_loss,
-                target_1=target_1,
-                target_2=target_2,
-                ready=True,
-                invalidation="Yeni 15m zirve gelirse counter-trend short iptal edilir.",
-                summary="Coin cok sisli, RSI yuksek ve momentum zayifliyor; sadece hizli short denemesi olarak dusun.",
-            )
-        )
-
-    if scalp_long_score >= 72:
-        entry_low = min(close_15, ema20_15)
-        entry_high = max(close_15, ema20_15 + 0.15 * atr_15)
-        stop_loss = min(entry_low - 0.75 * atr_15, swing_low_15)
-        entry_mid = (entry_low + entry_high) / 2
-        risk = max(entry_mid - stop_loss, atr_15 * 0.55)
-        target_1 = entry_mid + 1.1 * risk
-        target_2 = entry_mid + 1.6 * risk
-        candidates.append(
-            Setup(
-                symbol=market.symbol,
-                decision="LONG",
-                setup_type="scalp continuation",
-                strategy_key=build_strategy_key("LONG", "scalp continuation"),
-                confidence=scalp_long_score,
-                price_change_pct=market.price_change_pct,
-                funding_rate_pct=funding_pct,
-                open_interest=open_interest,
-                oi_trend=oi_trend,
-                oi_strength=oi_strength,
-                entry_low=entry_low,
-                entry_high=entry_high,
-                stop_loss=stop_loss,
-                target_1=target_1,
-                target_2=target_2,
-                ready=True,
-                invalidation="15m EMA20 ve son dip birlikte kirilirse scalp long iptal olur.",
-                summary="1h yon yukari, 15m momentum ve hacim hizlaniyor; kisa vadeli scalp devam setup'i var.",
-            )
-        )
-
-    if scalp_short_score >= 72:
-        entry_low = min(close_15 - 0.15 * atr_15, ema20_15)
-        entry_high = max(close_15, ema20_15)
-        stop_loss = max(entry_high + 0.75 * atr_15, swing_high_15)
-        entry_mid = (entry_low + entry_high) / 2
-        risk = max(stop_loss - entry_mid, atr_15 * 0.55)
-        target_1 = entry_mid - 1.1 * risk
-        target_2 = entry_mid - 1.6 * risk
-        candidates.append(
-            Setup(
-                symbol=market.symbol,
-                decision="SHORT",
-                setup_type="scalp continuation",
-                strategy_key=build_strategy_key("SHORT", "scalp continuation"),
-                confidence=scalp_short_score,
-                price_change_pct=market.price_change_pct,
-                funding_rate_pct=funding_pct,
-                open_interest=open_interest,
-                oi_trend=oi_trend,
-                oi_strength=oi_strength,
-                entry_low=entry_low,
-                entry_high=entry_high,
-                stop_loss=stop_loss,
-                target_1=target_1,
-                target_2=target_2,
-                ready=True,
-                invalidation="15m EMA20 ustune sert geri alim gelirse scalp short iptal olur.",
-                summary="1h yon asagi, 15m momentum ivmeleniyor; kisa vadeli scalp short setup'i var.",
-            )
-        )
-
-    # === FAST SCALP LONG (Pump yakalama) ===
-    if fast_long_score >= 75:
-        entry_low = close_15
-        entry_high = close_15 + 0.2 * atr_15
+    # 2. S-TIER PUMP BREAKOUT (Hacimli Patlama)
+    pump_candidate = detect_pump_candidate(market.symbol, market.price_change_pct, tf_15, tf_1h, tf_4h, funding_rate, open_interest)
+    if pump_candidate and pump_candidate.score >= 78:
         stop_loss = close_15 - 0.8 * atr_15
-        entry_mid = (entry_low + entry_high) / 2
-        risk = max(entry_mid - stop_loss, atr_15 * 0.6)
-        target_1 = entry_mid + 1.2 * risk
-        target_2 = entry_mid + 1.8 * risk
-        candidates.append(
-            Setup(
-                symbol=market.symbol,
-                decision="LONG",
-                setup_type="fast scalp pump",
-                strategy_key=build_strategy_key("LONG", "fast scalp pump"),
-                confidence=fast_long_score,
-                price_change_pct=market.price_change_pct,
-                funding_rate_pct=funding_pct,
-                open_interest=open_interest,
-                oi_trend=oi_trend,
-                oi_strength=oi_strength,
-                entry_low=entry_low,
-                entry_high=entry_high,
-                stop_loss=stop_loss,
-                target_1=target_1,
-                target_2=target_2,
-                ready=True,
-                invalidation="15m kapanis EMA20 altinda olursa veya hacim dusurse iptal.",
-                summary=f"HIZLI PUMP! Son bar %{max_bar_change:.1f} artis, hacim {volume_spike:.1f}x normalin ustunde. Momentum guclu.",
-            )
-        )
+        risk = close_15 - stop_loss
+        if risk > 0:
+            target_1 = close_15 + 1.8 * risk
+            target_2 = close_15 + 3.0 * risk
+            signals_text = ", ".join(pump_candidate.signals[:2])
+            candidates.append(create_trade_setup(
+                market, "LONG", "S-Tier Pump Breakout", pump_candidate.score, close_15, stop_loss, target_1, target_2,
+                f"PUMP SINYALI (Skor {pump_candidate.score}): {signals_text}", "Hacim duserse veya ivme tersine donerse.",
+                funding_pct, open_interest, oi_trend, oi_strength
+            ))
 
-    # === FAST SCALP SHORT (Dump yakalama) ===
-    if fast_short_score >= 75:
-        entry_low = close_15 - 0.2 * atr_15
-        entry_high = close_15
-        stop_loss = close_15 + 0.8 * atr_15
-        entry_mid = (entry_low + entry_high) / 2
-        risk = max(stop_loss - entry_mid, atr_15 * 0.6)
-        target_1 = entry_mid - 1.2 * risk
-        target_2 = entry_mid - 1.8 * risk
-        candidates.append(
-            Setup(
-                symbol=market.symbol,
-                decision="SHORT",
-                setup_type="fast scalp dump",
-                strategy_key=build_strategy_key("SHORT", "fast scalp dump"),
-                confidence=fast_short_score,
-                price_change_pct=market.price_change_pct,
-                funding_rate_pct=funding_pct,
-                open_interest=open_interest,
-                oi_trend=oi_trend,
-                oi_strength=oi_strength,
-                entry_low=entry_low,
-                entry_high=entry_high,
-                stop_loss=stop_loss,
-                target_1=target_1,
-                target_2=target_2,
-                ready=True,
-                invalidation="15m kapanis EMA20 ustunde olursa veya hacim dusurse iptal.",
-                summary=f"HIZLI DUMP! Son bar %{max_bar_change:.1f} dusus, hacim {volume_spike:.1f}x normalin ustunde. Momentum zayif.",
-            )
+    # 3. FAST MOMENTUM (Hizli Yakalama)
+    # Son 3 bar hacim ve fiyat ivmesi
+    recent_bars = tf_15.iloc[-4:-2]
+    vol_spike = volume_15 / vol_ma_15 if vol_ma_15 > 0 else 1.0
+    price_momentum = (close_15 - safe_float(recent_bars.iloc[0]["close"])) / safe_float(recent_bars.iloc[0]["close"]) * 100 if safe_float(recent_bars.iloc[0]["close"]) > 0 else 0
+    
+    if vol_spike > 2.0 and abs(price_momentum) > 1.2:
+        side = "LONG" if price_momentum > 0 else "SHORT"
+        if (side == "LONG" and trend_up(row_1h)) or (side == "SHORT" and trend_down(row_1h)):
+            sl_dist = 0.9 * atr_15
+            stop_loss = close_15 - sl_dist if side == "LONG" else close_15 + sl_dist
+            target_1 = close_15 + 1.2 * sl_dist if side == "LONG" else close_15 - 1.2 * sl_dist
+            target_2 = close_15 + 2.0 * sl_dist if side == "LONG" else close_15 - 2.0 * sl_dist
+            candidates.append(create_trade_setup(
+                market, side, "Fast Momentum", 82, close_15, stop_loss, target_1, target_2,
+                f"HIZLI MOMENTUM: {vol_spike:.1f}x hacim artisi ve %{price_momentum:.1f} ivme.", "Ivme kaybolursa.",
+                funding_pct, open_interest, oi_trend, oi_strength
+            ))
+
+    if candidates:
+        return candidates
+
+    return [
+        create_trade_setup(
+            market, "WAIT", "no clean setup", 0, close_15, 0, 0, 0,
+            "Temiz setup yok, pusuya devam.", "Retest beklenebilir.",
+            funding_pct, open_interest, oi_trend, oi_strength
         )
+    ]
 
     if candidates:
         return candidates
@@ -1491,46 +1275,31 @@ def format_price(value: float | None) -> str:
     return f"{value:.6f}"
 
 
-def format_setup_line(setup: Setup) -> str:
-    funding_text = "?" if setup.funding_rate_pct is None else f"{setup.funding_rate_pct:+.4f}%"
-    if setup.decision == "WAIT":
-        return (
-            f"*{setup.symbol}* | {setup.price_change_pct:+.2f}% | *WAIT* | Guven `{setup.confidence}`\n"
-            f"Sebep: {setup.summary}\n"
-            f"Funding: `{funding_text}`"
-        )
-
-    return (
-        f"*{setup.symbol}* | {setup.price_change_pct:+.2f}% | *{setup.decision}* `{setup.confidence}` | `READY`\n"
-        f"Tip: `{setup.setup_type}` | Funding: `{funding_text}`\n"
-        f"Entry: `{format_price(setup.entry_low)}` - `{format_price(setup.entry_high)}`\n"
-        f"SL: `{format_price(setup.stop_loss)}` | TP1: `{format_price(setup.target_1)}` | TP2: `{format_price(setup.target_2)}`\n"
-        f"Not: {setup.summary}\n"
-        f"Iptal: {setup.invalidation}"
-    )
+# format_setup_line artik build_report icinde inline yapiliyor.
 
 
 def build_report(setups: list[Setup], cfg: Config) -> str:
     now_text = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    ready_setups = [setup for setup in setups if setup.ready and setup.confidence >= cfg.min_ready_confidence]
-    watchlist = [setup for setup in setups if not setup.ready or setup.confidence < cfg.min_ready_confidence]
+    ready_setups = [s for s in setups if s.ready and s.confidence >= cfg.min_ready_confidence]
+    
     sections = [
-        "*Binance Futures Top Gainers Analizi*",
+        "🎯 *UZMAN TRADER - SINYAL RAPORU*",
         f"Zaman: `{now_text}`",
-        f"Toplam coin: `{len(setups)}` | Hazir setup: `{len(ready_setups)}` | Esik: `{cfg.min_ready_confidence}`",
+        f"Tarama: `{len(setups)}` coin | Hazir: `{len(ready_setups)}`",
         "",
     ]
 
     if ready_setups:
-        sections.append("*Isleme Uygunlar*")
-        sections.extend(format_setup_line(setup) for setup in ready_setups)
+        sections.append("*🔥 YÜKSEK GÜVENLİ FIRSATLAR*")
+        for setup in ready_setups:
+            sections.append(
+                f"*{setup.symbol}* | `{setup.decision}` `{setup.confidence}/100`\n"
+                f"Tip: `{setup.setup_type}`\n"
+                f"Giris: `{format_price(setup.entry_low)}` | SL: `{format_price(setup.stop_loss)}` | TP: `{format_price(setup.target_1)}`\n"
+                f"Analiz: _{setup.summary}_"
+            )
     else:
-        sections.append("*Isleme Uygunlar*")
-        sections.append("Bu turda esigin ustunde temiz setup cikmadi.")
-
-    if cfg.send_wait_setups and watchlist:
-        sections.append("*Izleme Listesi*")
-        sections.extend(format_setup_line(setup) for setup in watchlist[: cfg.max_wait_setups])
+        sections.append("🔍 Su an pusuya devam, temiz firsat yok.")
 
     return "\n\n".join(sections)
 
@@ -1557,22 +1326,7 @@ def detect_btc_trend(cfg: Config) -> str | None:
         return None
 
 
-def should_filter_setup(setup: Setup, btc_trend: str | None) -> bool:
-    """
-    BTC trend'ine gore setup'i filtrele.
-    Returns True = BU SETUP'I ATLA.
-    """
-    if btc_trend is None:
-        return False  # BTC trend bilinmiyorsa filtreleme
-
-    # BTC düşerken altcoin LONG açma
-    if btc_trend == "TRENDING_DOWN" and setup.decision == "LONG":
-        return True
-
-    # BTC yükselirken SHORT riskli (ama tamamen engelleme, sadece confidence arttır)
-    # Burada filtreleme yapmıyoruz, kullanıcıya bırakıyoruz
-
-    return False
+# btc_trend filtreleme mantigi artik analyze_market icinde hard filter olarak yapiliyor.
 
 
 def analyze_market(cfg: Config) -> list[Setup]:
@@ -1622,34 +1376,17 @@ def analyze_market(cfg: Config) -> list[Setup]:
                     oi_strength=oi_strength,
                 )
 
-                # BTC trend filtresini uygula
+                # BTC trend filtresini uygula (HARD FILTER)
                 if btc_trend:
                     filtered = []
                     for setup in candidates:
-                        if should_filter_setup(setup, btc_trend):
-                            print(f"  [BTC Filter] {setup.symbol} {setup.decision} atlandi (BTC: {btc_trend})")
-                            # READY'yi WAIT'e çevir, direkt atma
-                            filtered.append(Setup(
-                                symbol=setup.symbol,
-                                decision="WAIT",
-                                setup_type="btc trend filter",
-                                strategy_key=build_strategy_key("WAIT", "btc trend filter"),
-                                confidence=setup.confidence,
-                                price_change_pct=setup.price_change_pct,
-                                funding_rate_pct=setup.funding_rate_pct,
-                                open_interest=setup.open_interest,
-                                oi_trend=setup.oi_trend,
-                                oi_strength=setup.oi_strength,
-                                entry_low=None,
-                                entry_high=None,
-                                stop_loss=None,
-                                target_1=None,
-                                target_2=None,
-                                ready=False,
-                                invalidation=f"BTC trend {btc_trend}, {setup.decision} setup'i riskli.",
-                                summary=f"BTC trend {btc_trend} oldugu icin {setup.decision} setup'i filtrelendi.",
-                            ))
-                        else:
+                        skip = False
+                        if btc_trend == "TRENDING_DOWN" and setup.decision == "LONG":
+                            skip = True
+                        if btc_trend == "TRENDING_UP" and setup.decision == "SHORT":
+                            skip = True
+                        
+                        if not skip:
                             filtered.append(setup)
                     setups.extend(filtered)
                 else:
