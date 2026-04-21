@@ -1399,85 +1399,8 @@ def analyze_market(cfg: Config) -> list[Setup]:
     return setups
 
 
-def run_pump_scan(cfg: Config, market_candidates: list[MarketTicker], funding_map: dict[str, float], state: dict) -> list:
-    """
-    Piyasadaki tüm coinleri pump sinyalleri için tara.
-    Eşiği geçen coinleri Telegram'a bildir, cooldown ile spam önle.
-    """
-    now = utc_now()
-    pump_cooldowns: dict = state.get("pump_cooldowns", {})
-    alerts_sent: list = []
-    candidates_found: list = []
-
-    print(f"[Pump Radar] {len(market_candidates)} coin taranıyor... (min skor: {cfg.pump_min_score})")
-
-    for market in market_candidates:
-        # Cooldown kontrolü
-        last_alert_str = pump_cooldowns.get(market.symbol)
-        if last_alert_str:
-            last_alert = parse_datetime(last_alert_str)
-            if last_alert and (now - last_alert).total_seconds() < cfg.pump_cooldown_minutes * 60:
-                continue  # Bu coin için henüz cooldown bitmedi
-
-        try:
-            frames: dict[str, pd.DataFrame] = {}
-            for interval in TIMEFRAMES:
-                df = fetch_klines(cfg, market.symbol, interval)
-                if len(df) < 50:
-                    break
-                frames[interval] = add_indicators(df)
-
-            if len(frames) != len(TIMEFRAMES):
-                continue
-
-            oi_data = fetch_open_interest(cfg, market.symbol)
-            oi_value = oi_data.get("openInterest") if oi_data else None
-
-            candidate = detect_pump_candidate(
-                symbol=market.symbol,
-                price_change_24h=market.price_change_pct,
-                df_15m=frames["15m"],
-                df_1h=frames["1h"],
-                df_4h=frames["4h"],
-                funding_rate=funding_map.get(market.symbol),
-                open_interest=float(oi_value) if oi_value else None,
-            )
-
-            if candidate and candidate.score >= cfg.pump_min_score and candidate.signals:
-                candidates_found.append(candidate)
-                pump_cooldowns[market.symbol] = now.isoformat()
-                msg = format_pump_alert(candidate)
-                send_telegram(cfg, msg)
-                alerts_sent.append(market.symbol)
-                print(
-                    f"  [Pump Radar] 🚀 {market.symbol} | Skor: {candidate.score}/100 | "
-                    f"{len(candidate.signals)} sinyal | {', '.join(s[:30] for s in candidate.signals[:3])}"
-                )
-
-        except Exception as exc:
-            print(f"  [Pump Radar Hata] {market.symbol}: {exc}")
-            continue
-
-    # Özet mesajı (opsiyonel)
-    if cfg.pump_send_summary and candidates_found:
-        summary_msg = format_pump_summary(sorted(candidates_found, key=lambda c: c.score, reverse=True))
-        send_telegram(cfg, summary_msg)
-
-    if not alerts_sent:
-        print(f"[Pump Radar] Bu turda eşiği geçen pump adayı bulunamadı.")
-    else:
-        print(f"[Pump Radar] {len(alerts_sent)} uyarı gönderildi: {', '.join(alerts_sent)}")
-
-    # Eski cooldown kayıtlarını temizle (24 saat geçmişse sil)
-    stale_symbols = [
-        sym for sym, ts in pump_cooldowns.items()
-        if (dt := parse_datetime(ts)) and (now - dt).total_seconds() > 86400
-    ]
-    for sym in stale_symbols:
-        del pump_cooldowns[sym]
-
-    state["pump_cooldowns"] = pump_cooldowns
-    return candidates_found
+# run_pump_scan fonksiyounu artik gereksiz oldugu icin kaldirildi. 
+# Pump mantigi artik sadece Trading dongusu icinde (build_candidate_setups) calisiyor.
 
 
 def main() -> None:
@@ -1504,15 +1427,7 @@ def main() -> None:
             active_positions = load_active_positions(state)
             now = utc_now()
 
-            # === PUMP RADAR PHASE: Her cycle'da pump sinyalleri tara ===
-            if cfg.pump_scan_enabled:
-                try:
-                    pump_candidates = fetch_market_candidates(cfg)
-                    pump_funding_map = fetch_funding_rates(cfg)
-                    run_pump_scan(cfg, pump_candidates, pump_funding_map, state)
-                    write_cycle_state(cfg, state)  # pump_cooldowns'ı kaydet
-                except Exception as pump_exc:
-                    print(f"[Pump Radar Genel Hata] {pump_exc}")
+            # === PUMP RADAR PHASE: Artik gereksiz oldugu icin Trading dongusune dahil edildi ===
 
             # === PHASE 0: Detect bot restart & cleanup stale positions ===
             last_cycle_status = state.get("last_cycle_status")
