@@ -1,480 +1,332 @@
-"""
-pennant_scanner.py — Yükselen Flama Botu
-5m + 15m grafiklerde rising pennant tespit eder, pozisyon açar, takip eder.
-"""
-
+"""pennant_scanner.py v2 - Yükselen Flama Botu (düzeltilmiş)"""
 import json, math, os, time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Optional
-
-import numpy as np
-import pandas as pd
-import requests
+import numpy as np, pandas as pd, requests
 from dotenv import load_dotenv
-
 load_dotenv()
 
-# ── Config ────────────────────────────────────────────────────────────────────
-BASE_URL       = os.getenv("BINANCE_API_FUTURES_BASE", "https://fapi.binance.com")
-TG_TOKEN       = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT        = os.getenv("TELEGRAM_CHAT_ID", "")
-MIN_SCORE      = int(os.getenv("PENNANT_MIN_SCORE", "55"))
-COOLDOWN_MIN   = int(os.getenv("PENNANT_COOLDOWN_MINUTES", "15"))
-MIN_VOL        = float(os.getenv("MIN_QUOTE_VOLUME_USD", "5000000"))
-MAX_VOL        = float(os.getenv("MAX_QUOTE_VOLUME_USD", "1000000000"))
-STATE_FILE     = os.getenv("PENNANT_STATE_FILE", "pennant_state.json")
-MAX_POSITIONS  = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
-TIMEFRAMES     = ("5m", "15m")
+BASE_URL      = os.getenv("BINANCE_API_FUTURES_BASE", "https://fapi.binance.com")
+TG_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT       = os.getenv("TELEGRAM_CHAT_ID", "")
+MIN_SCORE     = int(os.getenv("PENNANT_MIN_SCORE", "60"))
+COOLDOWN_MIN  = int(os.getenv("PENNANT_COOLDOWN_MINUTES", "15"))
+MIN_VOL       = float(os.getenv("MIN_QUOTE_VOLUME_USD", "5000000"))
+MAX_VOL       = float(os.getenv("MAX_QUOTE_VOLUME_USD", "1000000000"))
+STATE_FILE    = os.getenv("PENNANT_STATE_FILE", "pennant_state.json")
+MAX_POS       = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
+TFS           = ("5m", "15m")
+STABLE        = {"USDC","BUSD","DAI","TUSD","USDP","FDUSD","USDD","FRAX","GUSD","LUSD","USTC","UST","EURC"}
 
-STABLECOINS = {"USDC","BUSD","DAI","TUSD","USDP","FDUSD","USDD","FRAX","GUSD","LUSD","USTC","UST","EURC"}
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def _s(v) -> float:
+def _s(v):
     try:
         r = float(v)
         return 0.0 if (math.isnan(r) or math.isinf(r)) else r
     except: return 0.0
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-def fmt_price(v: float) -> str:
+def utcnow(): return datetime.now(timezone.utc)
+def fmt(v):
     if v >= 1000: return f"{v:.2f}"
-    if v >= 1:    return f"{v:.4f}"
+    if v >= 1: return f"{v:.4f}"
     return f"{v:.6f}"
 
-def send_tg(text: str) -> None:
-    if not TG_TOKEN or not TG_CHAT:
-        print(text); return
+def tg(text):
+    if not TG_TOKEN or not TG_CHAT: print(text); return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": text, "parse_mode": "Markdown",
-                  "disable_web_page_preview": True},
-            timeout=20,
-        ).raise_for_status()
-    except Exception as e:
-        print(f"[TG Error] {e}")
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id":TG_CHAT,"text":text,"parse_mode":"Markdown",
+                  "disable_web_page_preview":True}, timeout=20).raise_for_status()
+    except Exception as e: print(f"[TG] {e}")
 
-def fetch_json(url, params=None):
+def fetch(url, params=None):
     r = requests.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    return r.json()
+    r.raise_for_status(); return r.json()
 
-def fetch_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-    raw = fetch_json(f"{BASE_URL}/fapi/v1/klines",
-                     {"symbol": symbol, "interval": interval, "limit": limit})
-    cols = ["open_time","open","high","low","close","volume",
-            "close_time","qav","trades","tbbav","tbqav","ignore"]
+def klines(sym, tf, limit=250):
+    raw = fetch(f"{BASE_URL}/fapi/v1/klines", {"symbol":sym,"interval":tf,"limit":limit})
+    cols = ["ot","open","high","low","close","volume","ct","qav","trades","tbbav","tbqav","ign"]
     df = pd.DataFrame(raw, columns=cols)
-    for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in ["open","high","low","close","volume"]: df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
-def fetch_last_price(symbol: str) -> float:
-    raw = fetch_json(f"{BASE_URL}/fapi/v1/ticker/price", {"symbol": symbol})
-    return float(raw.get("price", 0))
+def last_price(sym):
+    return float(fetch(f"{BASE_URL}/fapi/v1/ticker/price", {"symbol":sym}).get("price",0))
 
-def linreg_slope(arr) -> float:
+def indicators(df):
+    c = df["close"]
+    df["ema20"] = c.ewm(span=20, adjust=False).mean()
+    df["ema50"] = c.ewm(span=50, adjust=False).mean()
+    d = c.diff()
+    g = d.clip(lower=0).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    l = (-d.clip(upper=0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    df["rsi"] = (100 - 100/(1 + g/l.replace(0, np.nan))).fillna(50)
+    df["vol_ma"] = df["volume"].rolling(20).mean()
+    return df
+
+def slope(arr):
     y = np.array(arr, dtype=float)
     if len(y) < 3: return 0.0
-    x = np.arange(len(y))
-    s = np.polyfit(x, y, 1)[0]
-    base = abs(y.mean()) or 1.0
-    return s / base * 100
+    s = np.polyfit(np.arange(len(y)), y, 1)[0]
+    return s / (abs(y.mean()) or 1.0) * 100
 
-# ── State ─────────────────────────────────────────────────────────────────────
-def load_state() -> dict:
+def load_st():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f: return json.load(f)
         except: pass
-    return {"positions": [], "last_scan_at": None, "closed_trades": []}
+    return {"positions":[], "last_scan_at":None, "closed_trades":[]}
 
-def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-
-# ── Dataclasses ───────────────────────────────────────────────────────────────
-@dataclass
-class PennantSignal:
-    symbol: str
-    timeframe: str
-    score: int
-    signals: list
-    current_price: float
-    flagpole_gain_pct: float
-    flagpole_height_abs: float   # Direk yüksekliği (fiyat farkı)
-    consolidation_bars: int
-    volume_decline_pct: float
-    upper_trendline: float       # Kırılım seviyesi
-    cons_low: float              # Konsolidasyonun en dibi (stop için)
-    dist_to_breakout_pct: float
-    dual_tf: bool = False
-    price_change_24h: float = 0.0
+def save_st(s):
+    with open(STATE_FILE,"w") as f: json.dump(s, f, indent=2, ensure_ascii=False)
 
 @dataclass
-class Position:
-    symbol: str
-    timeframe: str
-    entry_price: float
-    stop_loss: float
-    target1: float
-    target2: float
-    flagpole_gain_pct: float
-    score: int
-    opened_at: str
-    highest_price: float
-    status: str = "OPEN"         # OPEN | TP1 | TP2 | SL | TIMEOUT
+class Sig:
+    symbol:str; tf:str; score:int; why:list; price:float
+    fp_gain:float; fp_h:float; cb:int; vdec:float
+    upper:float; low:float; dist:float; rsi:float
+    vspike:bool; dual:bool=False; pct24:float=0.0
 
-# ── Pattern Detection ─────────────────────────────────────────────────────────
-def detect_pennant(df: pd.DataFrame, symbol: str, tf: str,
-                   pct24h: float = 0.0) -> Optional[PennantSignal]:
-    if len(df) < 40: return None
+@dataclass
+class Pos:
+    symbol:str; tf:str; entry:float; sl:float; tp1:float; tp2:float
+    fp_gain:float; score:int; opened_at:str; highest:float; status:str="OPEN"
 
-    closes = df["close"].values.astype(float)
-    highs  = df["high"].values.astype(float)
-    lows   = df["low"].values.astype(float)
-    vols   = df["volume"].values.astype(float)
-
-    cur = _s(closes[-2])
+def detect(df, sym, tf, pct24=0.0):
+    if len(df) < 60: return None
+    df = indicators(df.copy())
+    H=df["high"].values.astype(float); L=df["low"].values.astype(float)
+    C=df["close"].values.astype(float); V=df["volume"].values.astype(float)
+    E20=df["ema20"].values.astype(float); E50=df["ema50"].values.astype(float)
+    RSI=df["rsi"].values.astype(float); VM=df["vol_ma"].values.astype(float)
+    N = len(df) - 2
+    cur = _s(C[N])
     if cur <= 0: return None
 
-    # 1. Flagpole
-    search_end = len(df) - 2
-    search_start = max(0, search_end - 40)
-    best_gain, fp_s, fp_e = 0.0, -1, -1
+    # EMA trend filtresi
+    if not (cur > _s(E20[N]) > _s(E50[N]) * 0.995): return None
 
-    for fe in range(search_end - 4, search_start + 3, -1):
-        for flen in range(3, 13):
-            fs = fe - flen
-            if fs < search_start: break
-            fl = _s(lows[fs]); fh = _s(highs[fe])
-            if fl <= 0: continue
-            g = (fh - fl) / fl * 100
-            if g >= 2.5 and g > best_gain:
-                best_gain, fp_s, fp_e = g, fs, fe
+    # Flagpole bul
+    best_g, fp_s, fp_e = 0.0, -1, -1
+    for fe in range(N-4, max(N-35,5), -1):
+        for fl in range(3, 11):
+            fs = fe - fl
+            if fs < 2: break
+            if _s(C[fe]) <= _s(C[fs]): continue
+            lo = float(np.min(L[fs:fe+1])); hi = float(np.max(H[fs:fe+1]))
+            if lo <= 0: continue
+            g = (hi - lo) / lo * 100
+            move = hi - lo
+            ok = all(_s(C[i]) >= lo + move*0.1 for i in range(fs, fe+1))
+            if g >= 3.0 and g > best_g and ok:
+                best_g, fp_s, fp_e = g, fs, fe
 
-    if fp_s < 0 or best_gain < 2.5: return None
+    if fp_s < 0 or best_g < 3.0: return None
+    fp_height = _s(H[fp_e]) - _s(L[fp_s])
 
-    # Direk yüksekliği (abs fiyat farkı)
-    fp_height = _s(highs[fp_e]) - _s(lows[fp_s])
-
-    # 2. Consolidation
-    cs, ce = fp_e, search_end
+    # Konsolidasyon
+    cs, ce = fp_e, N
     cb = ce - cs
-    if not (4 <= cb <= 20): return None
+    if not (4 <= cb <= 18): return None
+    cH=H[cs:ce+1]; cL=L[cs:ce+1]; cV=V[cs:ce+1]; cR=RSI[cs:ce+1]
+    if len(cH) < 4: return None
 
-    ch = highs[cs:ce+1]; cl = lows[cs:ce+1]; cv = vols[cs:ce+1]
-    if len(ch) < 4: return None
+    ls=slope(cL); hs=slope(cH)
+    # Strict kama: higher lows + lower highs
+    if not (ls > 0.05 and hs < -0.05): return None
 
-    ls = linreg_slope(cl)  # lows slope
-    hs = linreg_slope(ch)  # highs slope
-    is_wedge = ls > 0.03 and hs < -0.03
-    is_flat  = abs(ls) < 0.5 and abs(hs) < 0.5
-    if not (is_wedge or is_flat): return None
+    rsi_c = float(np.mean(cR))
+    if not (35 <= rsi_c <= 72): return None
 
-    # 3. Volume
-    fp_vol_avg  = float(np.mean(vols[fp_s:fp_e+1])) if fp_e > fp_s else 1.0
-    cons_vol_avg = float(np.mean(cv)) if len(cv) > 0 else 1.0
-    vol_dec = (fp_vol_avg - cons_vol_avg) / fp_vol_avg * 100 if fp_vol_avg > 0 else 0.0
+    fp_vol = float(np.mean(V[fp_s:fp_e+1])) if fp_e > fp_s else 1.0
+    cv_avg = float(np.mean(cV)) if len(cV) > 0 else 1.0
+    vdec = (fp_vol - cv_avg) / fp_vol * 100 if fp_vol > 0 else 0.0
+    if vdec < 10: return None
 
-    # 4. Upper trendline & breakout dist
-    xs = np.arange(len(ch))
-    coef = np.polyfit(xs, ch, 1)
-    upper_tl = float(np.polyval(coef, len(ch)))
-    cons_low  = float(np.min(cl))
-    dist = (upper_tl - cur) / cur * 100 if cur > 0 else 99.0
+    xs = np.arange(len(cH))
+    coef = np.polyfit(xs, cH, 1)
+    upper = float(np.polyval(coef, len(cH)))
+    cons_low = float(np.min(cL))
+    dist = (upper - cur) / cur * 100 if cur > 0 else 99.0
+    if dist > 2.0: return None
 
-    # 5. Score
-    score = 0; sigs = []
+    vspike = _s(V[N]) / _s(VM[N]) > 1.5 if _s(VM[N]) > 0 else False
+    
+    score=0; why=[]
+    if best_g>=10: score+=30; why.append(f"🚀 Güçlü direk +%{best_g:.1f}")
+    elif best_g>=6: score+=22; why.append(f"📈 Direk +%{best_g:.1f}")
+    else: score+=15; why.append(f"📈 Direk +%{best_g:.1f}")
+    score+=25; why.append(f"📐 Kama (↑dip:{ls:+.2f}% ↓tepe:{hs:+.2f}%)")
+    if vdec>=50: score+=20; why.append(f"📉 Hacim -%{vdec:.0f}")
+    elif vdec>=30: score+=13; why.append(f"📉 Hacim -%{vdec:.0f}")
+    else: score+=7; why.append(f"↘️ Hacim -%{vdec:.0f}")
+    if 5<=cb<=10: score+=12; why.append(f"⏱️ İdeal kons: {cb} bar")
+    elif cb<=15: score+=6; why.append(f"⏱️ Kons: {cb} bar")
+    if 45<=rsi_c<=60: score+=8; why.append(f"📊 RSI nötr: {rsi_c:.0f}")
+    elif rsi_c<45: score+=5; why.append(f"📊 RSI: {rsi_c:.0f}")
+    if vspike and dist<=0: score+=10; why.append(f"⚡ Kırılım hacmi")
+    elif 0<=dist<=1.0: score+=5; why.append(f"🎯 Kırılım %{dist:.2f} uzakta")
+    elif dist<0: score+=8; why.append(f"✅ Kırıldı +%{abs(dist):.2f}")
 
-    if best_gain >= 8:   score += 30; sigs.append(f"🚀 Güçlü direk +%{best_gain:.1f}")
-    elif best_gain >= 5: score += 22; sigs.append(f"📈 Direk +%{best_gain:.1f}")
-    else:                score += 14; sigs.append(f"📈 Direk +%{best_gain:.1f}")
+    return Sig(symbol=sym,tf=tf,score=min(score,100),why=why,price=cur,
+               fp_gain=best_g,fp_h=fp_height,cb=cb,vdec=vdec,
+               upper=upper,low=cons_low,dist=dist,rsi=rsi_c,
+               vspike=vspike,pct24=pct24)
 
-    if is_wedge:   score += 25; sigs.append(f"📐 Kama (↑low:{ls:+.2f}% ↓high:{hs:+.2f}%)")
-    elif is_flat:  score += 10; sigs.append("➡️ Yatay konsolidasyon")
+def lvl(sig):
+    e = max(sig.upper * 1.001, sig.price)
+    sl = sig.low * 0.997
+    risk = e - sl
+    if risk <= 0: risk = e * 0.02
+    tp1 = e + risk * 1.5
+    tp2 = e + sig.fp_h
+    rr = (tp1 - e) / risk
+    return e, sl, tp1, tp2, rr
 
-    if vol_dec >= 40:   score += 20; sigs.append(f"📉 Hacim -%{vol_dec:.0f}")
-    elif vol_dec >= 25: score += 12; sigs.append(f"📉 Hacim -%{vol_dec:.0f}")
-    elif vol_dec >= 10: score += 6;  sigs.append(f"↘️ Hacim -%{vol_dec:.0f}")
+def msg_sig(sig):
+    e,sl,tp1,tp2,rr = lvl(sig)
+    dual = " 🔥*ÇİFT TF*" if sig.dual else ""
+    bar = "█"*(sig.score//10)+"░"*(10-sig.score//10)
+    w = "\n".join(f"  • {x}" for x in sig.why)
+    return (f"🏳️ *FLAMA* | *{sig.symbol}* [{sig.tf}]{dual}\n"
+            f"Skor: `{sig.score}/100` `{bar}`\n\n"
+            f"*Sinyaller:*\n{w}\n\n"
+            f"*📌 Seviyeleri:*\n"
+            f"Giriş  : `{fmt(e)}`\n"
+            f"Stop   : `{fmt(sl)}`\n"
+            f"Hedef 1: `{fmt(tp1)}` _(1.5R)_\n"
+            f"Hedef 2: `{fmt(tp2)}` _(Direk boyu)_\n"
+            f"R/Ödül : `{rr:.1f}R` | RSI: `{sig.rsi:.0f}`\n"
+            f"Direk +%{sig.fp_gain:.1f} | Kons {sig.cb}bar | Hacim↓%{sig.vdec:.0f}")
 
-    if 5 <= cb <= 12:  score += 15; sigs.append(f"⏱️ İdeal kons: {cb} bar")
-    elif 3 <= cb <= 16: score += 8; sigs.append(f"⏱️ Kons: {cb} bar")
-
-    if 0 <= dist <= 1.5:  score += 10; sigs.append(f"🎯 Kırılım %{dist:.2f} uzakta")
-    elif dist < 0:
-        if dist >= -1.0: score += 8;  sigs.append(f"✅ Kırıldı (+%{abs(dist):.2f})")
-        else:            score += 3;  sigs.append("⚠️ Kırılım geçti")
-
-    return PennantSignal(
-        symbol=symbol, timeframe=tf, score=min(score, 100), signals=sigs,
-        current_price=cur, flagpole_gain_pct=best_gain,
-        flagpole_height_abs=fp_height, consolidation_bars=cb,
-        volume_decline_pct=vol_dec, upper_trendline=upper_tl,
-        cons_low=cons_low, dist_to_breakout_pct=dist,
-        price_change_24h=pct24h,
-    )
-
-# ── Position Levels ───────────────────────────────────────────────────────────
-def calc_levels(sig: PennantSignal):
-    """Giriş, SL, TP1, TP2 hesapla."""
-    entry = sig.upper_trendline * 1.001          # Kırılım + %0.1 buffer
-    sl    = sig.cons_low * 0.998                 # Kons dip - %0.2 buffer
-    risk  = entry - sl
-    if risk <= 0: risk = entry * 0.02            # fallback %2 risk
-    tp1   = entry + risk * 1.5                   # 1.5R
-    tp2   = entry + sig.flagpole_height_abs      # Direk boyu projeksiyon
-    return entry, sl, tp1, tp2
-
-# ── Telegram Messages ─────────────────────────────────────────────────────────
-def msg_signal(sig: PennantSignal) -> str:
-    entry, sl, tp1, tp2 = calc_levels(sig)
-    dual = " 🔥*ÇİFT TF*" if sig.dual_tf else ""
-    bar  = "█" * (sig.score // 10) + "░" * (10 - sig.score // 10)
-    sigs = "\n".join(f"  • {s}" for s in sig.signals)
-    rr   = (tp1 - entry) / (entry - sl) if entry > sl else 0
-    return (
-        f"🏳️ *FLAMA SİNYALİ* | *{sig.symbol}* [{sig.timeframe}]{dual}\n"
-        f"Skor: `{sig.score}/100` `{bar}`\n\n"
-        f"*Sinyaller:*\n{sigs}\n\n"
-        f"*📌 Pozisyon:*\n"
-        f"Giriş:   `{fmt_price(entry)}`\n"
-        f"Stop:    `{fmt_price(sl)}`\n"
-        f"Hedef 1: `{fmt_price(tp1)}` _(1.5R)_\n"
-        f"Hedef 2: `{fmt_price(tp2)}` _(Direk boyu)_\n"
-        f"Risk/Ödül: `{rr:.1f}R`\n\n"
-        f"Direk: `+%{sig.flagpole_gain_pct:.1f}` | "
-        f"Kons: `{sig.consolidation_bars} bar` | "
-        f"Hacim↓: `%{sig.volume_decline_pct:.0f}`"
-    )
-
-def msg_summary(signals: list) -> str:
-    if not signals: return "🔍 Flama bulunamadı."
-    lines = ["🏳️ *FLAMA RADAR ÖZET*\n"]
-    for s in signals[:12]:
-        entry, sl, tp1, _ = calc_levels(s)
-        dual = "🔥" if s.dual_tf else "  "
-        rr = (tp1 - entry) / (entry - sl) if entry > sl else 0
-        lines.append(
-            f"{dual}*{s.symbol}* [{s.timeframe}] `{s.score}/100`\n"
-            f"  Giriş: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}` | "
-            f"TP1: `{fmt_price(tp1)}` | R/R: `{rr:.1f}R`"
-        )
+def msg_sum(sigs):
+    if not sigs: return "🔍 Eşik üstü flama yok."
+    lines = [f"🏳️ *FLAMA RADAR* | {utcnow().strftime('%H:%M UTC')}\n"]
+    for s in sigs[:12]:
+        e,sl,tp1,_,rr = lvl(s)
+        d = "🔥" if s.dual else "▫️"
+        bo = "✅KİRILDI" if s.dist<0 else f"%{s.dist:.1f}🎯"
+        lines.append(f"{d}*{s.symbol}*[{s.tf}] `{s.score}/100`\n"
+                     f"  G:`{fmt(e)}` SL:`{fmt(sl)}` TP:`{fmt(tp1)}` R:{rr:.1f} {bo}")
     return "\n".join(lines)
 
-def msg_exit(pos: Position, exit_price: float) -> str:
-    pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
-    emoji = "✅" if pos.status in ("TP1","TP2") else "❌" if pos.status == "SL" else "⏱️"
-    label = {"TP1":"HEDEF 1 VURDU","TP2":"HEDEF 2 VURDU",
-             "SL":"STOP OLDU","TIMEOUT":"SÜRE DOLDU"}.get(pos.status, pos.status)
-    return (
-        f"{emoji} *{label}* | *{pos.symbol}* [{pos.timeframe}]\n"
-        f"Giriş: `{fmt_price(pos.entry_price)}` → Çıkış: `{fmt_price(exit_price)}`\n"
-        f"Değişim: `{pnl_pct:+.2f}%`\n"
-        f"SL: `{fmt_price(pos.stop_loss)}` | "
-        f"TP1: `{fmt_price(pos.target1)}` | TP2: `{fmt_price(pos.target2)}`\n"
-        f"Direk: `+%{pos.flagpole_gain_pct:.1f}` | Skor: `{pos.score}`"
-    )
+def msg_exit(pos, price):
+    pnl = (price - pos.entry) / pos.entry * 100
+    L = {"TP1":"✅ HEDEF 1 VURDU","TP2":"✅✅ HEDEF 2 VURDU","SL":"❌ STOP OLDU","TIMEOUT":"⏱️ SÜRE DOLDU"}
+    return (f"{L.get(pos.status,pos.status)} | *{pos.symbol}* [{pos.tf}]\n"
+            f"Giriş:`{fmt(pos.entry)}` → Çıkış:`{fmt(price)}`\n"
+            f"Sonuç: `{pnl:+.2f}%`\n"
+            f"SL:`{fmt(pos.sl)}` TP1:`{fmt(pos.tp1)}` TP2:`{fmt(pos.tp2)}`")
 
-# ── Position Monitoring ───────────────────────────────────────────────────────
-def monitor_positions(state: dict) -> dict:
-    positions = [Position(**p) for p in state.get("positions", [])]
-    if not positions:
-        return state
-
-    open_pos = [p for p in positions if p.status == "OPEN"]
-    closed   = [p for p in positions if p.status != "OPEN"]
-
-    still_open = []
-    for pos in open_pos:
+def monitor(state):
+    open_p = [Pos(**p) for p in state.get("positions",[]) if p.get("status")=="OPEN"]
+    closed = [p for p in state.get("positions",[]) if p.get("status")!="OPEN"]
+    still = []
+    for pos in open_p:
         try:
-            price = fetch_last_price(pos.symbol)
-            pos.highest_price = max(pos.highest_price, price)
-
-            # Timeout: 24 saat
-            opened = datetime.fromisoformat(pos.opened_at)
-            age_h  = (utcnow() - opened).total_seconds() / 3600
-            if age_h > 24:
-                pos.status = "TIMEOUT"
-                send_tg(msg_exit(pos, price))
-                closed.append(pos)
-                print(f"  [TIMEOUT] {pos.symbol} [{pos.timeframe}]")
-                continue
-
-            if price >= pos.target2:
-                pos.status = "TP2"
-                send_tg(msg_exit(pos, price))
-                closed.append(pos)
-                print(f"  [TP2 ✅] {pos.symbol} {price}")
-            elif price >= pos.target1:
-                pos.status = "TP1"
-                send_tg(msg_exit(pos, price))
-                closed.append(pos)
-                print(f"  [TP1 ✅] {pos.symbol} {price}")
-            elif price <= pos.stop_loss:
-                pos.status = "SL"
-                send_tg(msg_exit(pos, price))
-                closed.append(pos)
-                print(f"  [SL ❌] {pos.symbol} {price}")
+            price = last_price(pos.symbol)
+            pos.highest = max(pos.highest, price)
+            age = (utcnow()-datetime.fromisoformat(pos.opened_at)).total_seconds()/3600
+            if age > 24: pos.status="TIMEOUT"
+            elif price >= pos.tp2: pos.status="TP2"
+            elif price >= pos.tp1: pos.status="TP1"
+            elif price <= pos.sl: pos.status="SL"
+            if pos.status != "OPEN":
+                tg(msg_exit(pos, price)); closed.append(asdict(pos))
+                print(f"  [{pos.status}] {pos.symbol} fiyat={fmt(price)}")
             else:
-                still_open.append(pos)
-                print(f"  [OPEN] {pos.symbol} [{pos.timeframe}] fiyat={fmt_price(price)} "
-                      f"SL={fmt_price(pos.stop_loss)} TP1={fmt_price(pos.target1)}")
+                still.append(asdict(pos))
+                print(f"  [OPEN] {pos.symbol}[{pos.tf}] fiyat={fmt(price)} SL={fmt(pos.sl)} TP1={fmt(pos.tp1)}")
         except Exception as e:
-            print(f"  [Monitor Error] {pos.symbol}: {e}")
-            still_open.append(pos)
+            print(f"  [Err] {pos.symbol}: {e}"); still.append(asdict(pos))
         time.sleep(0.1)
-
-    state["positions"] = [asdict(p) for p in still_open]
-    state["closed_trades"] = [asdict(p) for p in closed][-200:]  # son 200
+    state["positions"] = still
+    state["closed_trades"] = (closed + state.get("closed_trades",[]))[:300]
     return state
 
-# ── Market Scanner ────────────────────────────────────────────────────────────
-def get_candidates() -> list:
+def candidates():
     try:
-        info = fetch_json(f"{BASE_URL}/fapi/v1/exchangeInfo")
-        active = set()
-        for row in info.get("symbols", []):
-            if row.get("status") != "TRADING": continue
-            if row.get("contractType") != "PERPETUAL": continue
-            if row.get("quoteAsset") != "USDT": continue
-            sym = str(row.get("symbol", "")).upper()
-            if sym.endswith("USDT") and sym[:-4].isalnum() and sym[:-4] not in STABLECOINS:
-                active.add(sym)
-
-        tickers = fetch_json(f"{BASE_URL}/fapi/v1/ticker/24hr")
-        cands = []
-        for row in tickers:
-            sym = str(row.get("symbol","")).upper()
+        info = fetch(f"{BASE_URL}/fapi/v1/exchangeInfo")
+        active = {r["symbol"] for r in info.get("symbols",[])
+                  if r.get("status")=="TRADING" and r.get("contractType")=="PERPETUAL"
+                  and r.get("quoteAsset")=="USDT"
+                  and r.get("symbol","")[:-4].isalnum()
+                  and r.get("symbol","")[:-4] not in STABLE}
+        tickers = fetch(f"{BASE_URL}/fapi/v1/ticker/24hr")
+        out = []
+        for t in tickers:
+            sym = t.get("symbol","")
             if sym not in active: continue
-            try:
-                qv  = float(row.get("quoteVolume", 0))
-                pct = float(row.get("priceChangePercent", 0))
+            try: qv=float(t.get("quoteVolume",0)); pct=float(t.get("priceChangePercent",0))
             except: continue
-            if MIN_VOL <= qv <= MAX_VOL:
-                cands.append((sym, pct, qv))
-
-        cands.sort(key=lambda x: x[2], reverse=True)
-        return cands
+            if MIN_VOL <= qv <= MAX_VOL: out.append((sym, pct, qv))
+        out.sort(key=lambda x: x[2], reverse=True)
+        return out
     except Exception as e:
-        print(f"[Market Error] {e}")
-        return []
+        print(f"[Candidates] {e}"); return []
 
-# ── Main Scan ─────────────────────────────────────────────────────────────────
-def run_scan(state: dict) -> dict:
-    print(f"\n{'='*55}")
-    print(f"🏳️  FLAMA TARAMASI — {utcnow().strftime('%H:%M:%S UTC')}")
-    print(f"{'='*55}")
-
-    candidates = get_candidates()
-    print(f"  {len(candidates)} coin hacim filtresini geçti.\n")
-
-    open_syms = {p["symbol"] for p in state.get("positions", [])}
-    all_signals: list[PennantSignal] = []
-    seen: dict[str, list] = {}  # symbol -> [signals per tf]
-
-    for idx, (sym, pct24h, _) in enumerate(candidates):
-        print(f"  [{idx+1}/{len(candidates)}] {sym}...", end="\r")
-        sym_sigs = []
-        for tf in TIMEFRAMES:
+def scan(state):
+    print(f"\n{'='*50}\n🏳️  TARAMA — {utcnow().strftime('%H:%M:%S UTC')}\n{'='*50}")
+    cands = candidates()
+    print(f"  {len(cands)} coin taranıyor...")
+    open_syms = {p["symbol"] for p in state.get("positions",[]) if p.get("status")=="OPEN"}
+    all_sigs = []
+    for i,(sym,pct24,_) in enumerate(cands):
+        print(f"  [{i+1}/{len(cands)}] {sym}...", end="\r")
+        rs = []
+        for tf in TFS:
             try:
-                df  = fetch_klines(sym, tf, 200)
-                sig = detect_pennant(df, sym, tf, pct24h)
-                if sig and sig.score >= MIN_SCORE:
-                    sym_sigs.append(sig)
+                sig = detect(klines(sym,tf,250), sym, tf, pct24)
+                if sig and sig.score >= MIN_SCORE: rs.append(sig)
             except: pass
             time.sleep(0.05)
-
-        if sym_sigs:
-            tfs = {s.timeframe for s in sym_sigs}
+        if rs:
+            tfs = {s.tf for s in rs}
             if "5m" in tfs and "15m" in tfs:
-                for s in sym_sigs: s.dual_tf = True
-            all_signals.extend(sym_sigs)
-
-    all_signals.sort(key=lambda s: (s.dual_tf, s.score), reverse=True)
-    print(f"\n  ✅ {len(all_signals)} flama tespit edildi.\n")
-
-    # Özet gönder
-    if all_signals:
-        send_tg(msg_summary(all_signals))
-        time.sleep(0.5)
-
-    # Yeni pozisyonlar aç (slot varsa, aynı sembol yoksa)
-    open_count = len([p for p in state.get("positions", []) if p.get("status") == "OPEN"])
-    new_opened = 0
-
-    for sig in all_signals:
-        if open_count + new_opened >= MAX_POSITIONS:
-            break
-        # En iyi sinyal (çift TF veya yüksek skor) + zaten açık değil
-        if sig.symbol in open_syms:
-            continue
-        if not sig.dual_tf and sig.score < MIN_SCORE + 15:
-            continue
-
-        entry, sl, tp1, tp2 = calc_levels(sig)
-        if entry <= 0 or sl >= entry:
-            continue
-
-        pos = Position(
-            symbol=sig.symbol, timeframe=sig.timeframe,
-            entry_price=entry, stop_loss=sl,
-            target1=tp1, target2=tp2,
-            flagpole_gain_pct=sig.flagpole_gain_pct,
-            score=sig.score,
-            opened_at=utcnow().isoformat(),
-            highest_price=entry,
-            status="OPEN",
-        )
-        state.setdefault("positions", []).append(asdict(pos))
-        open_syms.add(sig.symbol)
-        new_opened += 1
-
-        send_tg(msg_signal(sig))
-        print(f"  [AÇILDI] {sig.symbol} [{sig.timeframe}] "
-              f"Giriş={fmt_price(entry)} SL={fmt_price(sl)} "
-              f"TP1={fmt_price(tp1)} TP2={fmt_price(tp2)}")
+                for s in rs: s.dual = True
+            all_sigs.extend(rs)
+    all_sigs.sort(key=lambda s:(s.dual,s.score), reverse=True)
+    print(f"\n  ✅ {len(all_sigs)} flama bulundu.\n")
+    if all_sigs: tg(msg_sum(all_sigs)); time.sleep(0.5)
+    open_cnt = len(open_syms)
+    for sig in all_sigs:
+        if open_cnt >= MAX_POS: break
+        if sig.symbol in open_syms: continue
+        if not sig.dual and sig.score < MIN_SCORE+10: continue
+        if sig.dist > 1.5: continue
+        e,sl,tp1,tp2,rr = lvl(sig)
+        if e<=0 or sl>=e or rr<1.2: continue
+        pos = Pos(symbol=sig.symbol,tf=sig.tf,entry=e,sl=sl,tp1=tp1,tp2=tp2,
+                  fp_gain=sig.fp_gain,score=sig.score,
+                  opened_at=utcnow().isoformat(),highest=e,status="OPEN")
+        state.setdefault("positions",[]).append(asdict(pos))
+        open_syms.add(sig.symbol); open_cnt+=1
+        tg(msg_sig(sig))
+        print(f"  [AÇILDI] {sig.symbol}[{sig.tf}] G={fmt(e)} SL={fmt(sl)} TP1={fmt(tp1)}")
         time.sleep(0.3)
-
     state["last_scan_at"] = utcnow().isoformat()
     return state
 
-# ── Loop ──────────────────────────────────────────────────────────────────────
 def main():
-    print("🏳️  Flama Botu Başladı")
-    print(f"   Min Skor: {MIN_SCORE} | Cooldown: {COOLDOWN_MIN}dk | Max Pozisyon: {MAX_POSITIONS}")
-    print(f"   Telegram: {'✅' if TG_TOKEN else '❌ (konsola yazdırılır)'}\n")
-
+    print(f"🏳️ Flama Botu v2 | Skor≥{MIN_SCORE} | Cooldown:{COOLDOWN_MIN}dk | MaxPos:{MAX_POS}")
+    print(f"   Kriter: Strict kama + EMA trend + RSI filtresi + hacim azalması")
+    print(f"   TG: {'✅' if TG_TOKEN else '❌ (konsola yazdırılır)'}\n")
     while True:
-        state = load_state()
+        state = load_st()
         try:
-            # 1. Açık pozisyonları izle
             if state.get("positions"):
-                print("[Pozisyon İzleme]")
-                state = monitor_positions(state)
-                save_state(state)
-
-            # 2. Cooldown kontrolü
+                state = monitor(state); save_st(state)
             last = state.get("last_scan_at")
-            do_scan = True
-            if last:
-                elapsed = (utcnow() - datetime.fromisoformat(last)).total_seconds()
-                if elapsed < COOLDOWN_MIN * 60:
-                    wait = int(COOLDOWN_MIN * 60 - elapsed)
-                    print(f"[Cooldown] {wait//60}dk {wait%60}sn sonra taranacak.")
-                    do_scan = False
-
-            # 3. Tara
+            do_scan = (not last or
+                       (utcnow()-datetime.fromisoformat(last)).total_seconds() >= COOLDOWN_MIN*60)
             if do_scan:
-                state = run_scan(state)
-                save_state(state)
-
+                state = scan(state); save_st(state)
+            else:
+                elapsed = (utcnow()-datetime.fromisoformat(last)).total_seconds()
+                wait = int(COOLDOWN_MIN*60 - elapsed)
+                print(f"[Cooldown] {wait//60}dk {wait%60}sn kaldı.")
         except Exception as e:
-            print(f"[Döngü Hatası] {e}")
-
+            print(f"[Hata] {e}")
         time.sleep(60)
 
 if __name__ == "__main__":
