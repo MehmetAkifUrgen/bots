@@ -1,1 +1,1 @@
-worker: python -u pennant_scanner.py
+worker: python -u trader_bot.py
