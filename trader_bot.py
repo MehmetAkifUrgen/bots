@@ -28,6 +28,7 @@ BE_PCT        = 0.008
 MAX_OPEN      = 3        # aynı anda max açık pozisyon
 MAX_CONSEC_L  = 2        # ardışık max kayıp
 DAILY_LOSS_L  = 6.0      # günlük max kayıp (USD)
+MAX_HOLD_MIN  = 45       # max pozisyon süresi (dakika) — timeout
 SCAN_EVERY    = int(os.getenv("SCAN_EVERY_SECONDS", "120"))
 MIN_VOL_USD   = float(os.getenv("MIN_QUOTE_VOLUME_USD", "5000000"))
 MAX_VOL_USD   = float(os.getenv("MAX_QUOTE_VOLUME_USD", "5000000000"))
@@ -217,7 +218,7 @@ def msg_close(pos, price, reason, duration_sec, tid):
     pnl   = POSITION_USD * pct
     rmult = pct / SL_PCT
     icon  = "🟢" if pnl >= 0 else "🔴"
-    res_icons = {"TP": "✅ TP HIT", "SL": "❌ STOP", "BE": "🔰 BREAKEVEN"}
+    res_icons = {"TP": "✅ TP HIT", "SL": "❌ STOP", "BE": "🔰 BREAKEVEN", "TIMEOUT": "⏱️ TIMEOUT (45dk)"}
     mins  = duration_sec // 60
     secs  = duration_sec % 60
     return (
@@ -399,7 +400,10 @@ def monitor(state):
 
         # Çıkış kontrolü
         reason = None
-        if side == "LONG":
+        if dur_sec >= MAX_HOLD_MIN * 60:
+            reason = "TIMEOUT"
+            print(f"  ⏱️  [{pos['sym']}] {MAX_HOLD_MIN}dk timeout @ {fp(price)}")
+        elif side == "LONG":
             if   price <= pos["sl"]: reason = "BE" if pos.get("be_hit") else "SL"
             elif price >= pos["tp"]: reason = "TP"
         else:
