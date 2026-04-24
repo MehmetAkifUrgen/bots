@@ -26,7 +26,6 @@ SL_PCT        = 0.01
 TP_PCT        = 0.018
 BE_PCT        = 0.008
 MAX_OPEN      = 3        # aynı anda max açık pozisyon
-MAX_TRADES    = 5        # günlük max işlem
 MAX_CONSEC_L  = 2        # ardışık max kayıp
 DAILY_LOSS_L  = 6.0      # günlük max kayıp (USD)
 SCAN_EVERY    = int(os.getenv("SCAN_EVERY_SECONDS", "120"))
@@ -357,14 +356,11 @@ def can_open(state):
     if open_count >= MAX_OPEN:
         print(f"  ⏳ Max pozisyon dolu ({open_count}/{MAX_OPEN})")
         return False
-    if d["trades"] >= MAX_TRADES:
-        print(f"  ⛔ Günlük limit: {d['trades']}/{MAX_TRADES} işlem")
-        return False
     if d["consec_losses"] >= MAX_CONSEC_L:
-        print(f"  ⛔ {MAX_CONSEC_L} ardışık kayıp")
+        print(f"  ⛔ {MAX_CONSEC_L} ardışık kayıp — bugün trading durduruldu")
         return False
     if d["loss_usd"] >= DAILY_LOSS_L:
-        print(f"  ⛔ Günlük kayıp: ${d['loss_usd']:.2f}/${DAILY_LOSS_L}")
+        print(f"  ⛔ Günlük kayıp limiti: ${d['loss_usd']:.2f}/${DAILY_LOSS_L}")
         return False
     return True
 
@@ -418,7 +414,6 @@ def monitor(state):
             pct = (price - entry) / entry * (1 if side == "LONG" else -1)
             pnl = POSITION_USD * pct
             d   = state["daily"]
-            d["trades"] += 1
             if pnl < 0:
                 d["loss_usd"]      += abs(pnl)
                 d["consec_losses"] += 1
@@ -453,8 +448,8 @@ def scan(state):
     d = state["daily"]
     open_count = len(state.get("positions", []))
     print(f"  Açık: {open_count}/{MAX_OPEN} | "
-          f"Bugün: {d['trades']}/{MAX_TRADES} | "
-          f"Kayıp: ${d['loss_usd']:.2f}/${DAILY_LOSS_L}")
+          f"Ardışık kayıp: {d['consec_losses']}/{MAX_CONSEC_L} | "
+          f"Günlük kayıp: ${d['loss_usd']:.2f}/${DAILY_LOSS_L}")
     print(f"{'='*55}")
 
     if not can_open(state):
@@ -517,7 +512,7 @@ def main():
     print("=" * 55)
     print("🎯 VWAP SCALP BOT — Tüm Binance Futures")
     print(f"   SL:%1 | TP:%1.8 | BE:%0.8 | Kaldıraç:{LEVERAGE}x")
-    print(f"   Max {MAX_OPEN} açık pozisyon | Max {MAX_TRADES}/gün | Max ${DAILY_LOSS_L} kayıp/gün")
+    print(f"   Max {MAX_OPEN} açık pozisyon | Max ${DAILY_LOSS_L} kayıp/gün | {MAX_CONSEC_L} ardışık kayıpta dur")
     print(f"   Tarama: her {SCAN_EVERY}sn | TG: {'✅' if TK else '❌'}")
     print("=" * 55 + "\n")
 
@@ -543,7 +538,7 @@ def main():
             else:
                 open_count = len(state.get("positions", []))
                 print(f"  [Bekle] Açık:{open_count}/{MAX_OPEN} | "
-                      f"Trade:{state['daily']['trades']}/{MAX_TRADES}")
+                      f"Kayıp:{state['daily']['loss_usd']:.2f}/${DAILY_LOSS_L}")
 
         except Exception as e:
             print(f"[HATA] {e}")
