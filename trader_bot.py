@@ -19,8 +19,6 @@ SF   = os.getenv("STATE_FILE", "trader_state.json")
 DB   = os.getenv("TRADE_DB",   "trade_db.json")
 
 # ── PARAMETRELER ──────────────────────────────────────────────────────────────
-MAX_OPEN        = 3
-DAILY_LOSS_L    = 6.0
 MAX_HOLD_MIN    = 120
 POSITION_USD    = 300.0
 SL_PCT          = 0.015      # %1.5 stop
@@ -290,26 +288,15 @@ def load_st():
         try:
             with open(SF) as f: return json.load(f)
         except: pass
-    return {"positions":[],"daily":{"date":utc().strftime("%Y-%m-%d"),
-            "loss_usd":0.0,"consec_losses":0}}
+    return {"positions":[]}
 
 def save_st(s):
     with open(SF,"w") as f: json.dump(s,f,indent=2,ensure_ascii=False)
 
-def reset_daily(state):
-    today = utc().strftime("%Y-%m-%d")
-    if state["daily"].get("date") != today:
-        state["daily"] = {"date":today,"loss_usd":0.0,"consec_losses":0}
-    return state
+def reset_daily(state): return state
 
 def can_open(state):
-    d  = state["daily"]
-    oc = len(state.get("positions",[]))
-    if oc >= MAX_OPEN:
-        print(f"  ⏳ Max pozisyon ({oc}/{MAX_OPEN})"); return False
-    if d["loss_usd"] >= DAILY_LOSS_L:
-        print(f"  ⛔ Günlük kayıp: ${d['loss_usd']:.2f}"); return False
-    return True
+    return True  # limit yok
 
 # ── MONİTÖR ──────────────────────────────────────────────────────────────────
 
@@ -355,12 +342,6 @@ def monitor(state):
             tg(msg_close(pos, price, reason, dur, tid))
             pct = (price-entry)/entry*(1 if side=="LONG" else -1)
             pnl = POSITION_USD * pct
-            d   = state["daily"]
-            if pnl < 0:
-                d["loss_usd"]      += abs(pnl)
-                d["consec_losses"] += 1
-            else:
-                d["consec_losses"] = 0
             print(f"  [{reason}] {pos['sym']} @ {fp(price)} | P&L: ${pnl:+.2f}")
             if len(trades) % 10 == 0:
                 tg(msg_stats(calc_stats(trades)))
@@ -377,17 +358,13 @@ def monitor(state):
 # ── BALINA TARAMASI + POZİSYON AÇ ────────────────────────────────────────────
 
 def whale_scan_and_open(state, universe):
-    if not can_open(state): return state
-
     open_syms = {p["sym"] for p in state.get("positions",[])}
-    slots     = MAX_OPEN - len(open_syms)
-    d         = state["daily"]
 
     print(f"\n  🐋 Balina taraması | {utc().strftime('%H:%M:%S UTC')}")
-    print(f"  Açık:{len(open_syms)}/{MAX_OPEN} | Kayıp:${d['loss_usd']:.2f} | Ardışık:{d['consec_losses']}")
+    print(f"  Açık pozisyon: {len(open_syms)}")
 
     candidates = []
-    for sym, _ in universe[:50]:       # hacme göre top 50
+    for sym, _ in universe[:50]:
         if sym in open_syms: continue
         try:
             w = get_whale_signal(sym)
@@ -400,9 +377,7 @@ def whale_scan_and_open(state, universe):
     candidates.sort(key=lambda x: abs(x["score"]), reverse=True)
     print(f"  {len(candidates)} balina sinyali bulundu.")
 
-    opened = 0
     for w in candidates:
-        if opened >= slots or not can_open(state): break
         if w["sym"] in {p["sym"] for p in state.get("positions",[])}: continue
 
         try: entry = last_price(w["sym"])
@@ -430,10 +405,9 @@ def whale_scan_and_open(state, universe):
         state.setdefault("positions", []).append(pos)
         tg(msg_open(pos, tid))
         print(f"  🚀 AÇILDI: {w['sym']} {side} @ {fp(entry)} | Skor:{w['score']:+d} | ID:{tid}")
-        opened += 1
         time.sleep(0.3)
 
-    if opened == 0 and not candidates:
+    if not candidates:
         print(f"  🔍 Dikkat çekici balina hareketi yok.")
 
     return state
