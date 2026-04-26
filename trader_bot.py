@@ -26,8 +26,13 @@ MAX_HOLD_MIN = 120           # 2 saat timeout
 POSITION_USD = 300.0
 MIN_RR       = 2.0           # minimum risk/reward
 SCAN_EVERY   = int(os.getenv("SCAN_EVERY_SECONDS", "120"))
-MIN_VOL_USD  = float(os.getenv("MIN_QUOTE_VOLUME_USD", "10000000"))   # $10M+
+MIN_VOL_USD  = float(os.getenv("MIN_QUOTE_VOLUME_USD", "10000000"))
 MAX_VOL_USD  = float(os.getenv("MAX_QUOTE_VOLUME_USD", "5000000000"))
+# Balina parametreleri
+WHALE_OI_CHG    = 5.0    # OI %5+ artış = balina girişi
+WHALE_TRADE_USD = 200_000  # $200K+ tek işlem = balina
+WHALE_SCAN_MIN  = 5       # kaç dakikada bir balina taraması
+_last_whale_scan = {"t": None}
 # ─────────────────────────────────────────────────────────────────────────────
 
 STABLE = {"USDC","BUSD","DAI","TUSD","USDP","FDUSD","USDD","FRAX","GUSD","LUSD","USTC","EURC"}
@@ -79,6 +84,154 @@ def add_ind(df):
     df["atr"]  = tr.ewm(alpha=1/14, adjust=False).mean()
     df["vm"]   = df["v"].rolling(20).mean()
     return df
+
+# ── BALİNA TAKİP ─────────────────────────────────────────────────────────────
+
+def whale_oi(sym):
+    """Open Interest değişimi — son 1 saatte %X artış/düşüş"""
+    try:
+        data = get_json(f"{BASE}/futures/data/openInterestHist",
+                        {"symbol":sym,"period":"5m","limit":12})  # 12x5m = 1 saat
+        if len(data) < 2: return 0.0
+        oi_new = float(data[-1]["sumOpenInterest"])
+        oi_old = float(data[0]["sumOpenInterest"])
+        if oi_old <= 0: return 0.0
+        return (oi_new - oi_old) / oi_old * 100
+    except: return 0.0
+
+def whale_top_ratio(sym):
+    """Top trader long/short pozisyon oranı"""
+    try:
+        data = get_json(f"{BASE}/futures/data/topLongShortPositionRatio",
+                        {"symbol":sym,"period":"5m","limit":1})
+        if not data: return 1.0
+        return float(data[-1]["longShortRatio"])
+    except: return 1.0
+
+def whale_taker(sym):
+    """Taker alım/satım oranı — >1.5 = agresif alım, <0.67 = agresif satım"""
+    try:
+        data = get_json(f"{BASE}/futures/data/takerlongshortRatio",
+                        {"symbol":sym,"period":"5m","limit":3})
+        if not data: return 1.0
+        return sum(float(d["buySellRatio"]) for d in data) / len(data)
+    except: return 1.0
+
+def whale_large_trade(sym):
+    """Son 1 dakikada $200K+ tek işlem var mı?"""
+    try:
+        trades = get_json(f"{BASE}/fapi/v1/aggTrades",
+                          {"symbol":sym,"limit":50})
+        price = last_price(sym)
+        for t in trades:
+            qty = float(t.get("q", 0))
+            usd = qty * price
+            if usd >= WHALE_TRADE_USD:
+                return {"usd": usd, "side": "BUY" if not t.get("m") else "SELL"}
+        return None
+    except: return None
+
+def whale_funding(sym):
+    """Funding rate — aşırı negatif/pozitif = sıkışma riski"""
+    try:
+        d = get_json(f"{BASE}/fapi/v1/premiumIndex", {"symbol":sym})
+        return float(d.get("lastFundingRate", 0)) * 100
+    except: return 0.0
+
+def get_whale_signal(sym):
+    """Tüm balina verilerini topla, sinyal üret"""
+    oi_chg  = whale_oi(sym)
+    ratio   = whale_top_ratio(sym)
+    taker   = whale_taker(sym)
+    fund    = whale_funding(sym)
+    big_t   = whale_large_trade(sym)
+
+    signals = []
+    score   = 0
+
+    # OI artışı
+    if oi_chg >= WHALE_OI_CHG:
+        signals.append(f"📈 OI +{oi_chg:.1f}% (balina giriyor)")
+        score += 3
+    elif oi_chg <= -WHALE_OI_CHG:
+        signals.append(f"📉 OI {oi_chg:.1f}% (balina çıkıyor)")
+        score -= 3
+
+    # Top trader oranı
+    if ratio >= 2.0:
+        signals.append(f"🐋 Top trader Long/Short: {ratio:.2f} (LONG dominant)")
+        score += 2
+    elif ratio <= 0.5:
+        signals.append(f"🐋 Top trader Long/Short: {ratio:.2f} (SHORT dominant)")
+        score -= 2
+
+    # Taker oranı
+    if taker >= 1.5:
+        signals.append(f"⚡ Taker alım oranı: {taker:.2f} (agresif ALIŞ)")
+        score += 2
+    elif taker <= 0.67:
+        signals.append(f"⚡ Taker satım oranı: {taker:.2f} (agresif SATIŞ)")
+        score -= 2
+
+    # Büyük işlem
+    if big_t:
+        signals.append(f"💰 Büyük işlem: ${big_t['usd']/1000:.0f}K {big_t['side']}")
+        score += 3 if big_t["side"] == "BUY" else -3
+
+    # Funding
+    if fund <= -0.05:
+        signals.append(f"💸 Funding: {fund:.3f}% (short squeeze riski)")
+        score += 2
+    elif fund >= 0.1:
+        signals.append(f"💸 Funding: {fund:.3f}% (long sıkışması riski)")
+        score -= 2
+
+    direction = "LONG" if score > 0 else "SHORT" if score < 0 else None
+    return {
+        "sym": sym, "score": score, "direction": direction,
+        "signals": signals, "oi_chg": oi_chg, "ratio": ratio,
+        "taker": taker, "funding": fund
+    }
+
+def msg_whale(w):
+    icon  = "🟢" if w["direction"]=="LONG" else ("🔴" if w["direction"]=="SHORT" else "⚪")
+    lines = "\n".join(f"  • {s}" for s in w["signals"])
+    price = ""
+    try: price = f" | `{fp(last_price(w['sym']))}`"
+    except: pass
+    return (
+        f"{icon} *BALİNA AKTİVİTESİ* | `{w['sym']}`{price}\n\n"
+        f"{lines}\n\n"
+        f"Yön: `{w['direction'] or 'NÖTR'}` | Skor: `{w['score']:+d}`\n"
+        f"Zaman: `{ts()}`"
+    )
+
+def run_whale_scan(universe):
+    """Üst 30 hacimli coin içinde balina aktivitesi ara"""
+    now = utc()
+    last = _last_whale_scan["t"]
+    if last and (now - last).total_seconds() < WHALE_SCAN_MIN * 60:
+        return
+    _last_whale_scan["t"] = now
+
+    print(f"\n  🐋 Balina taraması başlıyor ({WHALE_SCAN_MIN}dk aralık)...")
+    alerts = []
+    for sym, _ in universe[:30]:
+        try:
+            w = get_whale_signal(sym)
+            if abs(w["score"]) >= 5:   # güçlü sinyal eşiği
+                alerts.append(w)
+                print(f"  🐋 {sym} skor:{w['score']:+d} yön:{w['direction']}")
+        except: pass
+        time.sleep(0.1)
+
+    alerts.sort(key=lambda x: abs(x["score"]), reverse=True)
+    for w in alerts[:3]:   # en güçlü 3 uyarı
+        tg(msg_whale(w))
+        time.sleep(0.3)
+
+    if not alerts:
+        print("  🐋 Dikkat çekici balina hareketi yok.")
 
 # ── EVREN ─────────────────────────────────────────────────────────────────────
 
@@ -197,6 +350,18 @@ def analyze(sym):
 
     sl_pct = risk / entry * 100
 
+    # ── BALİNA BOOST ──────────────────────────────────────────────────────────
+    whale_boost = False
+    try:
+        w = get_whale_signal(sym)
+        # Balina yönü trend ile aynıysa boost uygula
+        if side == "LONG"  and w["score"] >= 3: whale_boost = True
+        if side == "SHORT" and w["score"] <= -3: whale_boost = True
+        # Balina karşı yöndeyse iptal et
+        if side == "LONG"  and w["score"] <= -5: return None
+        if side == "SHORT" and w["score"] >= 5:  return None
+    except: w = {"score": 0, "oi_chg": 0, "taker": 1.0, "funding": 0}
+
     return {
         "sym": sym, "side": side, "entry": entry,
         "sl": round(sl, 8), "tp1": round(tp1, 8), "tp2": round(tp2, 8),
@@ -205,7 +370,12 @@ def analyze(sym):
         "rsi4": round(rsi4, 1), "rsi1": round(rsi1, 1),
         "dist_ema50": round(dist1, 2),
         "vol_ratio": round(v15/vm15, 2),
-        "atr15": atr15
+        "atr15": atr15,
+        "whale_boost": whale_boost,
+        "whale_score": w["score"],
+        "whale_oi": round(w["oi_chg"], 2),
+        "whale_taker": round(w["taker"], 2),
+        "whale_funding": round(w["funding"], 3)
     }
 
 # ── MESAJLAR ──────────────────────────────────────────────────────────────────
@@ -477,16 +647,28 @@ def main():
 
     while True:
         try:
-            state = load_st()
-            state = reset_daily(state)
+            state    = load_st()
+            state    = reset_daily(state)
+            universe = get_universe()
+
+            # Açık pozisyonları izle
             if state.get("positions"):
                 state = monitor(state)
                 save_st(state)
+
+            # Balina taraması (her 5 dakikada)
+            try:
+                run_whale_scan(universe)
+            except Exception as e:
+                print(f"  [Balina hata] {e}")
+
+            # Yeni sinyal tara
             if can_open(state):
                 state = scan(state)
                 save_st(state)
             else:
                 print(f"  [Bekle] Açık:{len(state.get('positions',[]))}/{MAX_OPEN}")
+
         except Exception as e:
             print(f"[HATA]{e}")
         time.sleep(SCAN_EVERY)
