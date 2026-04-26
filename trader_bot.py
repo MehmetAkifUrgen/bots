@@ -20,7 +20,6 @@ DB   = os.getenv("TRADE_DB",   "trade_db.json")
 
 # ── PARAMETRELER ──────────────────────────────────────────────────────────────
 MAX_OPEN        = 3
-MAX_CONSEC_L    = 2
 DAILY_LOSS_L    = 6.0
 MAX_HOLD_MIN    = 120
 POSITION_USD    = 300.0
@@ -308,8 +307,6 @@ def can_open(state):
     oc = len(state.get("positions",[]))
     if oc >= MAX_OPEN:
         print(f"  ⏳ Max pozisyon ({oc}/{MAX_OPEN})"); return False
-    if d["consec_losses"] >= MAX_CONSEC_L:
-        print(f"  ⛔ {MAX_CONSEC_L} ardışık kayıp"); return False
     if d["loss_usd"] >= DAILY_LOSS_L:
         print(f"  ⛔ Günlük kayıp: ${d['loss_usd']:.2f}"); return False
     return True
