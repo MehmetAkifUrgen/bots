@@ -417,7 +417,7 @@ def whale_scan_and_open(state, universe):
 def main():
     print("="*55)
     print("🐋 BALİNA TAKİP BOTU")
-    print(f"   Min Skor:{WHALE_MIN_SCORE} | Max {MAX_OPEN} pozisyon")
+    print(f"   Min Skor:{WHALE_MIN_SCORE} | Limit yok")
     print(f"   SL:%{SL_PCT*100:.1f} | TP1:%{TP1_PCT*100:.1f} | TP2:%{TP2_PCT*100:.1f}")
     print(f"   Timeout:{MAX_HOLD_MIN}dk | TG:{'✅' if TK else '❌'}")
     print("="*55+"\n")
