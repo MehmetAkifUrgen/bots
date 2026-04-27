@@ -185,7 +185,7 @@ def analyze(sym):
 
         atr15 = calc_atr(df15).iloc[-2]
         if atr15 <= 0: return None
-        entry = float(r15["c"])
+        entry = last_price(sym)
     except: return None
 
     # 4. Funding geçmişi (daha güçlü sinyal için)
