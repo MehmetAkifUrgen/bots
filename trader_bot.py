@@ -1,7 +1,6 @@
 """
-trader_bot.py — Funding Rate + RSI Squeeze Botu
-Aşırı funding → piyasa sıkışması → ters yön
-Funding + RSI + Hacim teyidi
+trader_bot.py — Liquidity Trap & Exhaustion Index (LTEI) Botu
+"Sistemin Bug'ı": Balina tuzağı, stop patlatma ve likidasyon iğnelerini yakalar.
 """
 import json, math, os, time, uuid
 from datetime import datetime, timezone
@@ -20,25 +19,16 @@ DB   = os.getenv("TRADE_DB",   "trade_db.json")
 
 # ── PARAMETRELER ──────────────────────────────────────────────────────────────
 POSITION_USD     = 300.0
-SL_PCT           = 0.02       # %2 stop
-TP1_PCT          = 0.04       # %4 hedef 1 (2R)
-TP2_PCT          = 0.07       # %7 hedef 2 (3.5R)
-MAX_HOLD_MIN     = 240        # 4 saat timeout
-SCAN_EVERY       = int(os.getenv("SCAN_EVERY_SECONDS", "120"))
-MIN_VOL_USD      = float(os.getenv("MIN_QUOTE_VOLUME_USD", "20000000"))   # $20M+
-MAX_VOL_USD      = float(os.getenv("MAX_QUOTE_VOLUME_USD", "5000000000"))
+MAX_HOLD_MIN     = 120        # 2 saat timeout (bu strateji hızlı sonuç verir)
+SCAN_EVERY       = int(os.getenv("SCAN_EVERY_SECONDS", "60")) # Sık tarama önemli
+MIN_VOL_USD      = float(os.getenv("MIN_QUOTE_VOLUME_USD", "30000000"))   # $30M+ 
+MAX_VOL_USD      = float(os.getenv("MAX_QUOTE_VOLUME_USD", "10000000000"))
 
-# Funding eşikleri
-FUND_LONG_THRESH  = -0.05   # funding bu değerin altındaysa → LONG (short squeeze)
-FUND_SHORT_THRESH =  0.10   # funding bu değerin üstündeyse → SHORT (long squeeze)
-
-# RSI eşikleri (1h)
-RSI_OVERSOLD  = 38    # LONG için
-RSI_OVERBOUGHT= 62    # SHORT için
-
-# Hacim çarpanı (15m)
-VOL_MULT = 1.5
-# ─────────────────────────────────────────────────────────────────────────────
+# LTEI STRATEJİ EŞİKLERİ
+WICK_MULTIPLIER = 2.5    # İğne, mum gövdesinden en az 2.5 kat büyük olmalı
+MIN_VOL_SPIKE   = 1.8    # Hacim, ortalamanın en az 1.8 katı olmalı
+MIN_OI_DROP     = -0.8   # OI'de en az %0.8'lik ani düşüş olmalı (Likidasyon kanıtı)
+MAX_SL_PCT      = 0.03   # İğne çok uzunsa en fazla %3 risk al
 
 STABLE = {"USDC","BUSD","DAI","TUSD","USDP","FDUSD","USDD","FRAX","GUSD","LUSD","USTC","EURC"}
 
@@ -63,7 +53,7 @@ def get_json(url, p=None):
     r.raise_for_status()
     return r.json()
 
-def klines(sym, tf, n=100):
+def klines(sym, tf, n=50):
     raw = get_json(f"{BASE}/fapi/v1/klines", {"symbol":sym,"interval":tf,"limit":n})
     df  = pd.DataFrame(raw, columns=["ot","o","h","l","c","v","ct","qv","tr","tb","tq","x"])
     for col in ["o","h","l","c","v"]: df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -71,61 +61,6 @@ def klines(sym, tf, n=100):
 
 def last_price(sym):
     return float(get_json(f"{BASE}/fapi/v1/ticker/price", {"symbol":sym})["price"])
-
-# ── İNDİKATÖRLER ─────────────────────────────────────────────────────────────
-
-def calc_rsi(series, period=14):
-    d = series.diff()
-    g = d.clip(lower=0).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    l = (-d.clip(upper=0)).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    return (100 - 100 / (1 + g / l.replace(0, np.nan))).fillna(50)
-
-def calc_atr(df, period=14):
-    tr = pd.concat([
-        df["h"] - df["l"],
-        (df["h"] - df["c"].shift()).abs(),
-        (df["l"] - df["c"].shift()).abs()
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/period, adjust=False).mean()
-
-# ── VERİ FONKSİYONLARI ───────────────────────────────────────────────────────
-
-def get_funding(sym):
-    try:
-        d = get_json(f"{BASE}/fapi/v1/premiumIndex", {"symbol": sym})
-        return float(d.get("lastFundingRate", 0)) * 100
-    except: return None
-
-def get_funding_history(sym, limit=8):
-    """Son 8 funding periyodunun ortalaması (son ~32 saat)"""
-    try:
-        data = get_json(f"{BASE}/fapi/v1/fundingRate",
-                        {"symbol": sym, "limit": limit})
-        rates = [float(d["fundingRate"]) * 100 for d in data]
-        return sum(rates) / len(rates) if rates else 0.0
-    except: return 0.0
-
-def get_oi_change(sym):
-    """OI değişimi son 1 saatte %"""
-    try:
-        data = get_json(f"{BASE}/futures/data/openInterestHist",
-                        {"symbol": sym, "period": "5m", "limit": 12})
-        if len(data) < 2: return 0.0
-        new = float(data[-1]["sumOpenInterest"])
-        old = float(data[0]["sumOpenInterest"])
-        return (new - old) / old * 100 if old > 0 else 0.0
-    except: return 0.0
-
-def get_long_short_ratio(sym):
-    """Global long/short hesap oranı"""
-    try:
-        data = get_json(f"{BASE}/futures/data/globalLongShortAccountRatio",
-                        {"symbol": sym, "period": "5m", "limit": 1})
-        if not data: return 1.0
-        return float(data[-1]["longShortRatio"])
-    except: return 1.0
-
-# ── EVREN ─────────────────────────────────────────────────────────────────────
 
 def get_universe():
     try:
@@ -149,144 +84,132 @@ def get_universe():
     except Exception as e:
         print(f"[Universe]{e}"); return []
 
-# ── SİNYAL ANALİZİ ───────────────────────────────────────────────────────────
+# ── LTEI SİNYAL ANALİZİ (SİSTEMİN BUG'I) ─────────────────────────────────────
 
-def analyze(sym):
-    # 1. Funding rate al
-    fund = get_funding(sym)
-    if fund is None: return None
-
-    # Funding eşiği geçiyor mu?
-    if fund > FUND_SHORT_THRESH:
-        side = "SHORT"   # Long sıkışması → short aç
-    elif fund < FUND_LONG_THRESH:
-        side = "LONG"    # Short sıkışması → long aç
-    else:
-        return None      # Funding normal, geç
-
-    # 2. RSI teyidi (1h)
+def analyze_trap(sym):
     try:
-        df1h = klines(sym, "1h", 50)
-        if len(df1h) < 20: return None
-        rsi1h = calc_rsi(df1h["c"]).iloc[-2]
-        if side == "LONG"  and rsi1h > RSI_OVERSOLD:   return None  # RSI hâlâ yüksek
-        if side == "SHORT" and rsi1h < RSI_OVERBOUGHT:  return None  # RSI hâlâ düşük
-    except: return None
-
-    # 3. Hacim teyidi (15m)
-    try:
-        df15 = klines(sym, "15m", 50)
-        if len(df15) < 25: return None
-        r15   = df15.iloc[-2]
-        vol   = float(r15["v"])
-        vm    = float(df15["v"].rolling(20).mean().iloc[-2])
-        if math.isnan(vm) or vm <= 0: return None
-        if vol < vm * VOL_MULT: return None   # hacim yeterli değil
-
-        atr15 = calc_atr(df15).iloc[-2]
-        if atr15 <= 0: return None
+        # 5 dakikalık mumları al (iğneleri en net 5m'de yakalarız)
+        df = klines(sym, "5m", 30)
+        if len(df) < 25: return None
+        
+        # Son kapanmış mumu kontrol et
+        idx = -2
+        row = df.iloc[idx]
+        o, h, l, c, v = row['o'], row['h'], row['l'], row['c'], row['v']
+        
+        body = abs(o - c)
+        body = body if body > 0 else (o * 0.0001) # Sıfıra bölünme hatasını engelle
+        
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        
+        # Hacim sıçraması kontrolü
+        vol_ma = df['v'].rolling(20).mean().iloc[idx]
+        vol_spike = v / vol_ma if vol_ma > 0 else 0
+        
+        # 1. Aşama: İğne Tespiti
+        side = None
+        wick_ratio = 0
+        
+        if lower_wick > (body * WICK_MULTIPLIER) and lower_wick > (upper_wick * 2):
+            # Ayı Tuzağı (Bear Trap) -> Fiyat aşağı çakıldı, stopları patlattı, yukarı çekti
+            side = "LONG"
+            wick_ratio = lower_wick / body
+            extreme_price = l # İğnenin ucu (Stop seviyemiz olacak)
+            
+        elif upper_wick > (body * WICK_MULTIPLIER) and upper_wick > (lower_wick * 2):
+            # Boğa Tuzağı (Bull Trap) -> Fiyat yukarı fırladı, FOMO yarattı, geri çakıldı
+            side = "SHORT"
+            wick_ratio = upper_wick / body
+            extreme_price = h # İğnenin ucu (Stop seviyemiz)
+            
+        if not side: return None
+        
+        # 2. Aşama: Hacim Teyidi (İğne sırasında devasa hacim olmalı = Balina yutması)
+        if vol_spike < MIN_VOL_SPIKE: return None
+        
+        # 3. Aşama: OI (Açık Pozisyon) Çöküş Teyidi (Likidasyon Kanıtı)
+        # Sadece fitil atması yetmez, o fitilde insanların patlamış olması (OI düşüşü) şart.
+        try:
+            oi_data = get_json(f"{BASE}/futures/data/openInterestHist", {"symbol": sym, "period": "5m", "limit": 3})
+            oi_drop = 0
+            if oi_data and len(oi_data) >= 2:
+                # Kapanmış mumun (sondan bir önceki) OI verisini al
+                oi_now = float(oi_data[-2]["sumOpenInterest"]) 
+                oi_prev = float(oi_data[-3]["sumOpenInterest"])
+                if oi_prev > 0:
+                    oi_drop = (oi_now - oi_prev) / oi_prev * 100
+        except:
+            return None
+            
+        if oi_drop > MIN_OI_DROP: 
+            return None # OI düşmemişse, sadece normal bir mumdur, likidasyon avı değildir.
+            
+        # Eğer buraya kadar geldiysek, MÜKEMMEL BİR TUZAK YAKALADIK!
+        score = wick_ratio * abs(oi_drop) * vol_spike
+        
+        # ── RİSK VE HEDEF YÖNETİMİ ──
         entry = last_price(sym)
-    except: return None
+        
+        # Stop'u iğnenin ucuna koyuyoruz (Muazzam bir Risk/Reward oranı)
+        if side == "LONG":
+            sl = extreme_price * 0.999 # İğnenin milimetrik altı
+        else:
+            sl = extreme_price * 1.001 # İğnenin milimetrik üstü
+            
+        # Stop çok uzaksa (dev bir iğne ise) max riski sınırla
+        sl_pct = abs(entry - sl) / entry
+        if sl_pct > MAX_SL_PCT:
+            if side == "LONG": sl = entry * (1 - MAX_SL_PCT)
+            else:              sl = entry * (1 + MAX_SL_PCT)
+            sl_pct = MAX_SL_PCT
+            
+        # Hedefleri belirle (Risk'in 2 katı ve 4 katı = 2R ve 4R)
+        if side == "LONG":
+            tp1 = entry * (1 + (sl_pct * 2))
+            tp2 = entry * (1 + (sl_pct * 4))
+        else:
+            tp1 = entry * (1 - (sl_pct * 2))
+            tp2 = entry * (1 - (sl_pct * 4))
 
-    # 4. Funding geçmişi (daha güçlü sinyal için)
-    fund_avg = get_funding_history(sym, limit=8)
-
-    # 5. OI değişimi
-    oi_chg = get_oi_change(sym)
-
-    # 6. L/S oranı
-    ls_ratio = get_long_short_ratio(sym)
-
-    # Seviyeler
-    if side == "LONG":
-        sl  = round(entry * (1 - SL_PCT), 8)
-        tp1 = round(entry * (1 + TP1_PCT), 8)
-        tp2 = round(entry * (1 + TP2_PCT), 8)
-    else:
-        sl  = round(entry * (1 + SL_PCT), 8)
-        tp1 = round(entry * (1 - TP1_PCT), 8)
-        tp2 = round(entry * (1 - TP2_PCT), 8)
-
-    # Skor hesapla (sinyal gücü)
-    score = 0
-    reasons = []
-
-    # Funding ana sinyal
-    if side == "SHORT":
-        reasons.append(f"💸 Funding: +{fund:.3f}% (long sıkışması)")
-        score += 4
-        if fund > 0.2:
-            reasons.append(f"🔥 Aşırı yüksek funding: +{fund:.3f}%")
-            score += 2
-    else:
-        reasons.append(f"💸 Funding: {fund:.3f}% (short sıkışması)")
-        score += 4
-        if fund < -0.1:
-            reasons.append(f"🔥 Aşırı negatif funding: {fund:.3f}%")
-            score += 2
-
-    # RSI
-    if side == "SHORT" and rsi1h > 70:
-        reasons.append(f"📊 RSI aşırı alım: {rsi1h:.0f}")
-        score += 2
-    elif side == "LONG" and rsi1h < 30:
-        reasons.append(f"📊 RSI aşırı satım: {rsi1h:.0f}")
-        score += 2
-    else:
-        reasons.append(f"📊 RSI teyit: {rsi1h:.0f}")
-        score += 1
-
-    # Hacim
-    vol_ratio = vol / vm
-    reasons.append(f"⚡ Hacim: {vol_ratio:.1f}x ortalama")
-    score += 1
-
-    # OI artışı (sıkışmayı destekliyor mu?)
-    if oi_chg > 3 and side == "SHORT":
-        reasons.append(f"📈 OI +{oi_chg:.1f}% (long pozisyon artıyor)")
-        score += 1
-    elif oi_chg < -3 and side == "LONG":
-        reasons.append(f"📉 OI {oi_chg:.1f}% (short pozisyon azalıyor)")
-        score += 1
-
-    # L/S oranı
-    if side == "SHORT" and ls_ratio > 1.5:
-        reasons.append(f"🐋 L/S oran: {ls_ratio:.2f} (long kalabalık)")
-        score += 1
-    elif side == "LONG" and ls_ratio < 0.7:
-        reasons.append(f"🐋 L/S oran: {ls_ratio:.2f} (short kalabalık)")
-        score += 1
-
-    return {
-        "sym": sym, "side": side, "entry": entry,
-        "sl": sl, "tp1": tp1, "tp2": tp2,
-        "score": score, "reasons": reasons,
-        "funding": round(fund, 4),
-        "funding_avg": round(fund_avg, 4),
-        "rsi1h": round(rsi1h, 1),
-        "vol_ratio": round(vol_ratio, 2),
-        "oi_chg": round(oi_chg, 2),
-        "ls_ratio": round(ls_ratio, 2),
-        "atr15": atr15
-    }
+        trap_name = "🐻 Ayı Tuzağı (Aşağı İğne)" if side == "LONG" else "🐂 Boğa Tuzağı (Yukarı İğne)"
+        reasons = [
+            f"🎣 *Tuzak Tipi:* {trap_name}",
+            f"🪡 *İğne / Gövde:* `{wick_ratio:.1f}x` (Dev fitil)",
+            f"🩸 *Likidasyon (OI Düşüşü):* `{oi_drop:.2f}%` (Yakıt bitti)",
+            f"⚡ *Hacim Yutulması:* `{vol_spike:.1f}x` (Balina malı aldı)",
+            f"🎯 *Tuzak Skoru:* `{score:.1f}`"
+        ]
+        
+        return {
+            "sym": sym, "side": side, "entry": entry,
+            "sl": round(sl, 5), "tp1": round(tp1, 5), "tp2": round(tp2, 5),
+            "score": round(score, 1), "reasons": reasons,
+            "wick_ratio": round(wick_ratio, 2), "oi_drop": round(oi_drop, 2),
+            "vol_spike": round(vol_spike, 2), "sl_pct": sl_pct
+        }
+    except Exception as e: 
+        return None
 
 # ── MESAJLAR ──────────────────────────────────────────────────────────────────
 
 def msg_open(pos, tid):
     icon    = "🟢" if pos["side"] == "LONG" else "🔴"
-    side_tr = "LONG — SHORT SQUEEZE" if pos["side"] == "LONG" else "SHORT — LONG SQUEEZE"
+    side_tr = "LONG (Balina ile birlikte)" if pos["side"] == "LONG" else "SHORT (Balina ile birlikte)"
     lines   = "\n".join(f"  • {r}" for r in pos.get("reasons", []))
-    squeeze = "📉 Short Squeeze (kısa pozisyonlar kapanacak)" if pos["side"] == "LONG" \
-              else "📈 Long Squeeze (uzun pozisyonlar kapanacak)"
+    
+    sl_pct  = pos.get("sl_pct", 0.01) * 100
+    tp1_pct = sl_pct * 2
+    tp2_pct = sl_pct * 4
+    
     return (
-        f"{icon} *TRADE AÇILDI* | `{pos['sym']}`\n\n"
-        f"Strateji: `{squeeze}`\n\n"
+        f"{icon} *LTEI: LİKİDASYON AVI YAKALANDI!* | `{pos['sym']}`\n\n"
         f"Yön    : *{side_tr}*\n"
         f"Giriş  : `{fp(pos['entry'])}`\n\n"
-        f"Stop   : `{fp(pos['sl'])}` (-%{SL_PCT*100:.1f})\n"
-        f"Hedef 1: `{fp(pos['tp1'])}` (+%{TP1_PCT*100:.1f} / 2R)\n"
-        f"Hedef 2: `{fp(pos['tp2'])}` (+%{TP2_PCT*100:.1f} / 3.5R)\n\n"
-        f"*Sinyal Gerekçesi (Skor: {pos['score']}):*\n{lines}\n\n"
+        f"Stop   : `{fp(pos['sl'])}` (-%{sl_pct:.2f})\n"
+        f"Hedef 1: `{fp(pos['tp1'])}` (+%{tp1_pct:.2f} / 2R)\n"
+        f"Hedef 2: `{fp(pos['tp2'])}` (+%{tp2_pct:.2f} / 4R)\n\n"
+        f"*Göstergeler:*\n{lines}\n\n"
         f"Pozisyon: `${POSITION_USD:.0f}`\n"
         f"Zaman: `{ts()}` | ID: `{tid}`"
     )
@@ -297,12 +220,11 @@ def msg_close(pos, price, reason, dur_sec, tid):
     pnl  = POSITION_USD * pct
     icon = "🟢" if pnl >= 0 else "🔴"
     labels = {
-        "TP1": "✅ HEDEF 1", "TP2": "✅✅ HEDEF 2",
+        "TP1": "✅ HEDEF 1 (2R)", "TP2": "✅✅ HEDEF 2 (4R)",
         "SL": "❌ STOP", "TIMEOUT": "⏱️ TIMEOUT", "BE": "🔰 BREAKEVEN"
     }
     return (
         f"{icon} *{labels.get(reason, reason)}* | `{pos['sym']}`\n\n"
-        f"Funding: `{pos.get('funding', 0):.4f}%` | RSI: `{pos.get('rsi1h', 0):.0f}`\n\n"
         f"Giriş : `{fp(pos['entry'])}` → Çıkış: `{fp(price)}`\n"
         f"Sonuç : `{pct*100:+.2f}%` | P&L: `${pnl:+.2f}`\n"
         f"Süre  : `{dur_sec//60} dakika`\n"
@@ -313,7 +235,7 @@ def msg_stats(stats):
     if stats["total"] == 0: return "📊 Henüz trade yok."
     wr = stats["wins"] / stats["total"] * 100
     return (
-        f"📊 *BOT İSTATİSTİKLERİ*\n\n"
+        f"📊 *LTEI BOT İSTATİSTİKLERİ*\n\n"
         f"Toplam  : `{stats['total']}`\n"
         f"Kazanan : `{stats['wins']}` (%{wr:.1f})\n"
         f"P&L     : `${stats['total_pnl']:+.2f}`\n"
@@ -323,7 +245,7 @@ def msg_stats(stats):
         f"SHORT WR    : `%{stats.get('short_wr',0):.1f}`"
     )
 
-# ── DB ────────────────────────────────────────────────────────────────────────
+# ── DB & STATE ────────────────────────────────────────────────────────────────
 
 def load_db():
     if os.path.exists(DB):
@@ -343,8 +265,6 @@ def record_trade(pos, price, reason, dur_sec):
         "id": pos.get("trade_id",""), "pair": pos["sym"], "side": pos["side"],
         "entry": pos["entry"], "exit": price, "result": reason,
         "pnl": round(pnl, 4), "score": pos.get("score", 0),
-        "funding": pos.get("funding", 0), "rsi1h": pos.get("rsi1h", 0),
-        "vol_ratio": pos.get("vol_ratio", 0),
         "duration": dur_sec, "hour_utc": utc().hour,
         "date": utc().strftime("%Y-%m-%d"), "timestamp": ts()
     })
@@ -376,8 +296,6 @@ def calc_stats(trades):
         "short_wr": round(len([t for t in shorts if t["pnl"]>0])/len(shorts)*100, 1) if shorts else 0,
     }
 
-# ── STATE ─────────────────────────────────────────────────────────────────────
-
 def load_st():
     if os.path.exists(SF):
         try:
@@ -405,13 +323,13 @@ def monitor(state):
                 pos.get("opened_iso", utc().isoformat()))).total_seconds())
         except: dur = 0
 
-        # Breakeven: TP1'e %50 yaklaşınca
+        # Breakeven: TP1'e ulaştığında veya yarısına geldiğinde
         if not pos.get("be_hit") and pos.get("tp1"):
-            be = entry + (pos["tp1"] - entry) * 0.5 if side == "LONG" \
-                 else entry - (entry - pos["tp1"]) * 0.5
+            be = entry + (pos["tp1"] - entry) * 0.6 if side == "LONG" \
+                 else entry - (entry - pos["tp1"]) * 0.6
             if (side == "LONG" and price >= be) or (side == "SHORT" and price <= be):
                 pos["sl"] = entry; pos["be_hit"] = True
-                tg(f"🔰 *{pos['sym']}* BE'ye taşındı | `{fp(price)}`")
+                tg(f"🔰 *{pos['sym']}* BE'ye taşındı (Risksiz İşlem) | `{fp(price)}`")
                 print(f"  🔰 [{pos['sym']}] BE @ {fp(price)}")
 
         reason = None
@@ -433,11 +351,11 @@ def monitor(state):
             pct = (price - entry) / entry * (1 if side == "LONG" else -1)
             pnl = POSITION_USD * pct
             print(f"  [{reason}] {pos['sym']} @ {fp(price)} | P&L: ${pnl:+.2f}")
-            if len(trades) % 10 == 0:
+            if len(trades) % 5 == 0:
                 tg(msg_stats(calc_stats(trades)))
         else:
             pct = (price - entry) / entry * (1 if side == "LONG" else -1)
-            print(f"  [OPEN] {pos['sym']} {side} | {fp(price)} ({pct*100:+.2f}%) "
+            print(f"  [AÇIK] {pos['sym']} {side} | {fp(price)} ({pct*100:+.2f}%) "
                   f"SL:{fp(pos['sl'])} TP1:{fp(pos['tp1'])} {dur//60}dk")
             still.append(pos)
         time.sleep(0.1)
@@ -449,26 +367,28 @@ def monitor(state):
 
 def scan(state, universe):
     open_syms = {p["sym"] for p in state.get("positions", [])}
-    print(f"\n{'='*55}")
-    print(f"💸 FUNDING SQUEEZE BOT — {utc().strftime('%H:%M:%S UTC')}")
-    print(f"   Açık pozisyon: {len(open_syms)} | {len(universe)} coin")
-    print(f"{'='*55}")
+    print(f"\n{'='*65}")
+    print(f"🎯 LİTEI (LİKİDASYON AVI) SİSTEMİ — {utc().strftime('%H:%M:%S UTC')}")
+    print(f"   Açık pozisyon: {len(open_syms)} | Taranan: {len(universe)} coin")
+    print(f"{'='*65}")
 
     candidates = []
     for i, (sym, _) in enumerate(universe):
-        print(f"  [{i+1}/{len(universe)}] {sym}", end="\r")
+        print(f"  [{i+1}/{len(universe)}] {sym} taranıyor...", end="\r")
         if sym in open_syms: continue
         try:
-            sig = analyze(sym)
+            sig = analyze_trap(sym)
             if sig:
                 candidates.append(sig)
-                print(f"\n  ✅ {sym} {sig['side']} | Fund:{sig['funding']:.3f}% | "
-                      f"RSI:{sig['rsi1h']} | Skor:{sig['score']}")
+                print(f"\n  ✅ {sym} {sig['side']} TUZAĞI BULUNDU! | Skor:{sig['score']}")
         except: pass
         time.sleep(0.06)
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
-    print(f"\n  {len(candidates)} sinyal bulundu.\n")
+    if candidates:
+        print(f"\n  🔥 {len(candidates)} LİKİDASYON TUZAĞI TESPİT EDİLDİ!\n")
+    else:
+        print(f"\n  🔍 Şu an piyasada balina tuzağı yok, bekliyoruz.")
 
     for sig in candidates:
         if sig["sym"] in {p["sym"] for p in state.get("positions", [])}: continue
@@ -480,24 +400,22 @@ def scan(state, universe):
         }
         state.setdefault("positions", []).append(pos)
         tg(msg_open(pos, tid))
-        print(f"  🚀 AÇILDI: {sig['sym']} {sig['side']} @ {fp(sig['entry'])} | ID:{tid}")
+        print(f"  🚀 İŞLEME GİRİLDİ: {sig['sym']} {sig['side']} @ {fp(sig['entry'])} | ID:{tid}")
         time.sleep(0.3)
-
-    if not candidates:
-        print(f"  🔍 Aşırı funding tespit edilmedi.")
 
     return state
 
 # ── ANA DÖNGÜ ─────────────────────────────────────────────────────────────────
 
 def main():
-    print("="*55)
-    print("💸 FUNDING RATE SQUEEZE BOTU")
-    print(f"   SHORT: Funding > +{FUND_SHORT_THRESH}% + RSI > {RSI_OVERBOUGHT}")
-    print(f"   LONG : Funding < {FUND_LONG_THRESH}% + RSI < {RSI_OVERSOLD}")
-    print(f"   SL:%{SL_PCT*100:.0f} | TP1:%{TP1_PCT*100:.0f} | TP2:%{TP2_PCT*100:.0f}")
-    print(f"   Timeout:{MAX_HOLD_MIN}dk | TG:{'✅' if TK else '❌'}")
-    print("="*55+"\n")
+    print("="*65)
+    print("🎯 LİKİDASYON TUZAĞI VE TÜKENMİŞLİK (LTEI) BOTU BAŞLADI")
+    print("="*65)
+    print("🛠️ SİSTEMİN BUG'I DEVREDE:")
+    print(f" - İğne Boyu  : Mumun en az {WICK_MULTIPLIER} katı")
+    print(f" - Hacim Şartı: Ortalamanın en az {MIN_VOL_SPIKE} katı")
+    print(f" - OI Düşüşü  : Anlık %{abs(MIN_OI_DROP)} stop patlaması")
+    print("="*65+"\n")
 
     trades = load_db()
     if trades:
@@ -517,7 +435,7 @@ def main():
             save_st(state)
 
         except Exception as e:
-            print(f"[HATA]{e}")
+            print(f"[HATA] Ana Döngü: {e}")
         time.sleep(SCAN_EVERY)
 
 if __name__ == "__main__":
