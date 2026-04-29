@@ -1,6 +1,6 @@
 """
-trader_bot.py — Whale Pump & Momentum Sniper
-Haber, balina alımı veya ani hacim patlamalarını yakalayarak rüzgarı arkasına alır.
+trader_bot.py — Ultra-Early Pump Sniper (1-Minute Engine)
+Balinaların mal toplamaya başladığı İLK DAKİKAYI yakalar.
 """
 import json, math, os, time, uuid
 from datetime import datetime, timezone
@@ -19,18 +19,18 @@ DB   = os.getenv("TRADE_DB",   "trade_db.json")
 
 # ── PARAMETRELER ──────────────────────────────────────────────────────────────
 POSITION_USD     = 300.0
-MAX_HOLD_MIN     = 60         # 1 saat timeout (Pump biterse çık)
-SCAN_EVERY       = int(os.getenv("SCAN_EVERY_SECONDS", "30")) # Pump anlık olur, 30 saniyede bir tara
-MIN_VOL_USD      = float(os.getenv("MIN_QUOTE_VOLUME_USD", "15000000"))   # $15M+ (Sığ tahtalardan kaçın)
+MAX_HOLD_MIN     = 45         # Pump biterse erken çık
+SCAN_EVERY       = int(os.getenv("SCAN_EVERY_SECONDS", "20")) # 20 saniyede bir ultra hızlı tarama
+MIN_VOL_USD      = float(os.getenv("MIN_QUOTE_VOLUME_USD", "15000000"))   # $15M+ 
 MAX_VOL_USD      = float(os.getenv("MAX_QUOTE_VOLUME_USD", "10000000000"))
 
-# PUMP SNIPER EŞİKLERİ
-MIN_PRICE_SURGE  = 1.5   # Son 6 dakikada fiyat en az %1.5 fırlamış olmalı
-MIN_VOL_MULTIPLIER = 4.0 # Hacim normalin 4 katına çıkmış olmalı
-MIN_OI_SURGE     = 1.0   # Açık pozisyon (Balina parası) en az %1 artmış olmalı
-HARD_SL_PCT      = 0.02  # Anında %2 zararda stop ol
-TS_ACTIVATION    = 1.02  # %2 kârı geçince İzleyen Stop (Trailing) devreye girer
-TS_DROP_PCT      = 0.01  # Zirveden %1 düşerse kârı al ve çık
+# ULTRA ERKEN PUMP EŞİKLERİ (1 Dakikalık Mumlar İçin)
+MIN_PRICE_SURGE  = 0.8   # Sadece %0.8 artsa bile harekete geç (Çok erken)
+MIN_VOL_MULTIPLIER = 5.0 # Ancak hacim normalin en az 5 katı olmalı (Kesin teyit)
+MIN_OI_SURGE     = 0.5   # OI %0.5 artsa yeter (Para girmeye yeni başlıyor)
+HARD_SL_PCT      = 0.02  # %2 Hard Stop
+TS_ACTIVATION    = 1.015 # %1.5 kârı geçince İzleyen Stop (Trailing) devreye girer
+TS_DROP_PCT      = 0.008 # Zirveden %0.8 düşerse kârı al ve çık
 
 STABLE = {"USDC","BUSD","DAI","TUSD","USDP","FDUSD","USDD","FRAX","GUSD","LUSD","USTC","EURC"}
 
@@ -86,50 +86,49 @@ def get_universe():
     except Exception as e:
         return []
 
-# ── PUMP SNIPER ANALİZİ ──────────────────────────────────────────────────────
+# ── ERKEN PUMP ANALİZİ (1M) ──────────────────────────────────────────────────
 
 def analyze_pump(sym):
     try:
-        # 3 dakikalık mumlarla en hızlı şekilde tarıyoruz
-        df = klines(sym, "3m", 30)
+        # Piyasayı 1 dakikalık mumlarla izliyoruz (Gecikmeyi sıfırlamak için)
+        df = klines(sym, "1m", 30)
         if len(df) < 25: return None
         
-        # Son 2 mum (Şu an oluşan ve bir önceki) -> Yaklaşık son 6 dakikalık hareket
+        # Sadece son 2 dakikaya bakıyoruz (Şu anki mum + Bir önceki)
         c_current = df.iloc[-1]['c']
         o_prev    = df.iloc[-2]['o']
         
-        # Fiyat Fırlaması (Pump)
+        # Fiyat sadece ufak bir kıpırdanma yapsa bile (%0.8) yakalayacağız
         price_change_pct = (c_current - o_prev) / o_prev * 100
-        if price_change_pct < MIN_PRICE_SURGE: return None # Fiyat yeterince patlamadıysa geç
+        if price_change_pct < MIN_PRICE_SURGE: return None
         
-        # Hacim Patlaması
-        vol_ma = df['v'].iloc[-22:-2].mean() # Son 20 kapanmış mumun ortalaması
+        # Ancak bu ufak hareketi DOĞRULAYAN şey DEVASA hacimdir
+        vol_ma = df['v'].iloc[-22:-2].mean() # Son 20 dakikanın normal hacmi
         vol_recent = df.iloc[-1]['v'] + df.iloc[-2]['v']
         
         if vol_ma <= 0: return None
         vol_ratio = vol_recent / vol_ma
-        if vol_ratio < MIN_VOL_MULTIPLIER: return None # Hacim yoksa sahte pumptır
+        if vol_ratio < MIN_VOL_MULTIPLIER: return None # Eğer hacim normalin 5 katı değilse sahtedir
         
-        # Açık Pozisyon (Balina Parası) Teyidi
-        oi_data = get_json(f"{BASE}/futures/data/openInterestHist", {"symbol": sym, "period": "5m", "limit": 4})
+        # Açık Pozisyonda ufak kıpırdanma bile yeterli
+        oi_data = get_json(f"{BASE}/futures/data/openInterestHist", {"symbol": sym, "period": "5m", "limit": 2})
         oi_surge = 0
         if oi_data and len(oi_data) >= 2:
             oi_now = float(oi_data[-1]["sumOpenInterest"])
-            oi_old = float(oi_data[-3]["sumOpenInterest"]) # ~10-15 dk öncesi
+            oi_old = float(oi_data[-2]["sumOpenInterest"])
             if oi_old > 0:
                 oi_surge = (oi_now - oi_old) / oi_old * 100
                 
-        # OI %1'den az artmışsa bu yeni para girişi değil, short patlamasıdır. Bize yeni alıcı lazım!
         if oi_surge < MIN_OI_SURGE: return None
         
         score = price_change_pct * vol_ratio * oi_surge
         entry = last_price(sym)
-        sl    = entry * (1 - HARD_SL_PCT) # Başlangıçta %2 Hard Stop
+        sl    = entry * (1 - HARD_SL_PCT)
         
         reasons = [
-            f"🚀 *Fiyat Patlaması:* `+{price_change_pct:.2f}%` (Son 6 dk)",
-            f"🌊 *Hacim:* `{vol_ratio:.1f}x` Katı",
-            f"🐳 *Yeni Para Girişi (OI):* `+{oi_surge:.2f}%`"
+            f"⚡ *Erken Uyarı Fırlaması:* `+{price_change_pct:.2f}%` (Son 2 dk)",
+            f"🌊 *Anormal Hacim:* `{vol_ratio:.1f}x` Katı (Balina alımı başladı)",
+            f"🐳 *Yeni Para Girişi:* `+{oi_surge:.2f}%`"
         ]
         
         return {
@@ -148,8 +147,8 @@ def analyze_pump(sym):
 def msg_open(pos, tid):
     lines = "\n".join(f"  • {r}" for r in pos.get("reasons", []))
     return (
-        f"🚨 *BALİNA PUMP TESPİT EDİLDİ!* | `{pos['sym']}`\n\n"
-        f"Trene Atlandı: *LONG*\n"
+        f"🚨 *ULTRA ERKEN PUMP (İLK MUM) YAKALANDI!* | `{pos['sym']}`\n\n"
+        f"Yön: *LONG*\n"
         f"Giriş Fiyatı : `{fp(pos['entry'])}`\n\n"
         f"Stop Loss    : `{fp(pos['sl'])}` (-%{HARD_SL_PCT*100:.1f})\n"
         f"İzleyen Stop : `%{(TS_ACTIVATION-1)*100:.1f} kârı geçince başlar`\n\n"
@@ -182,7 +181,7 @@ def msg_stats(stats):
     if stats["total"] == 0: return "📊 Henüz trade yok."
     wr = stats["wins"] / stats["total"] * 100
     return (
-        f"📊 *PUMP SNIPER İSTATİSTİKLERİ*\n\n"
+        f"📊 *1M PUMP SNIPER İSTATİSTİKLERİ*\n\n"
         f"Toplam  : `{stats['total']}`\n"
         f"Kazanan : `{stats['wins']}` (%{wr:.1f})\n"
         f"P&L     : `${stats['total_pnl']:+.2f}`\n"
@@ -257,7 +256,6 @@ def monitor(state):
         entry = pos["entry"]
         dur = int((utc() - datetime.fromisoformat(pos.get("opened_iso", utc().isoformat()))).total_seconds())
 
-        # Zirve fiyatı güncelle (Trailing Stop için)
         highest = pos.get("highest_price", entry)
         if price > highest:
             pos["highest_price"] = price
@@ -266,23 +264,21 @@ def monitor(state):
         ts_activation = pos.get("ts_activation", entry * TS_ACTIVATION)
         ts_pct        = pos.get("ts_pct", TS_DROP_PCT)
 
-        # Breakeven: %1 kâra geçerse stop'u maliyete çek ki zarar etmeyelim
+        # Breakeven
         if not pos.get("be_hit") and price >= entry * 1.01:
-            pos["sl"] = entry * 1.002 # Komisyonu kurtaracak kadar üstü
+            pos["sl"] = entry * 1.002
             pos["be_hit"] = True
-            tg(f"🔰 *{pos['sym']}* %1 kârı geçti, Stop maliyete çekildi! Risk 0.")
+            tg(f"🔰 *{pos['sym']}* %1 kârı geçti, Stop maliyete çekildi!")
 
         reason = None
-        
         if dur >= MAX_HOLD_MIN * 60:
             reason = "TIMEOUT"
         elif price <= pos["sl"]:
             reason = "BE" if pos.get("be_hit") else "SL"
         elif highest >= ts_activation:
-            # Fiyat belirlediğimiz kâr seviyesini geçti, TRAILING STOP DEVREDE!
             trailing_stop_price = highest * (1 - ts_pct)
             if price <= trailing_stop_price:
-                reason = "TRAILING_STOP" # Fiyat zirveden %1 düştü, sat ve çık!
+                reason = "TRAILING_STOP"
 
         if reason:
             tid    = pos.get("trade_id", "—")
@@ -308,7 +304,7 @@ def monitor(state):
 def scan(state, universe):
     open_syms = {p["sym"] for p in state.get("positions", [])}
     print(f"\n{'='*65}")
-    print(f"🚀 WHALE PUMP SNIPER — {utc().strftime('%H:%M:%S UTC')}")
+    print(f"🚀 ULTRA ERKEN PUMP (1M) SNIPER — {utc().strftime('%H:%M:%S UTC')}")
     print(f"   Açık pozisyon: {len(open_syms)} | Taranan: {len(universe)} coin")
     print(f"{'='*65}")
 
@@ -320,7 +316,7 @@ def scan(state, universe):
             sig = analyze_pump(sym)
             if sig:
                 candidates.append(sig)
-                print(f"\n  ✅ {sym} PUMP YAKALANDI! | Skor:{sig['score']}")
+                print(f"\n  ✅ {sym} İLK MUM YAKALANDI! | Skor:{sig['score']}")
         except: pass
         time.sleep(0.06)
 
@@ -328,7 +324,7 @@ def scan(state, universe):
     if candidates:
         print(f"\n  🔥 {len(candidates)} COIN'DE BALİNA GİRİŞİ TESPİT EDİLDİ!\n")
     else:
-        print(f"\n  🔍 Şu an piyasa sakin, pump bekleniyor...")
+        print(f"\n  🔍 Şu an piyasa sakin, sinsi para girişi aranıyor...")
 
     for sig in candidates:
         if sig["sym"] in {p["sym"] for p in state.get("positions", [])}: continue
@@ -340,7 +336,7 @@ def scan(state, universe):
         }
         state.setdefault("positions", []).append(pos)
         tg(msg_open(pos, tid))
-        print(f"  🚀 TRENE ATLANDI: {sig['sym']} @ {fp(sig['entry'])} | ID:{tid}")
+        print(f"  🚀 İLK MUMDAN GİRİLDİ: {sig['sym']} @ {fp(sig['entry'])} | ID:{tid}")
         time.sleep(0.3)
 
     return state
@@ -349,14 +345,15 @@ def scan(state, universe):
 
 def main():
     print("="*65)
-    print("🚀 WHALE PUMP & MOMENTUM SNIPER BOTU BAŞLADI")
+    print("🚀 ULTRA ERKEN (1M) PUMP SNIPER BOTU BAŞLADI")
     print("="*65)
-    print("🛠️ STRATEJİ KURALLARI:")
-    print(f" - Fiyat Patlaması: Son 6 dk içinde en az %{MIN_PRICE_SURGE}")
-    print(f" - Hacim Şartı    : Ortalamanın en az {MIN_VOL_MULTIPLIER} katı")
-    print(f" - OI Artışı      : Yeni balina parası en az %{MIN_OI_SURGE}")
-    print(f" - Zarar Kes (SL) : %{HARD_SL_PCT*100}")
-    print(f" - İzleyen Stop   : %{(TS_ACTIVATION-1)*100} kârı geçince zirveden %{TS_DROP_PCT*100} düşerse sat")
+    print("🛠️ İLK MUM YAKALAMA STRATEJİSİ:")
+    print(f" - Tarama Aralığı : Sadece {SCAN_EVERY} Saniye!")
+    print(f" - Fiyat Kıpırdaması: Son 2 dakikada en az %{MIN_PRICE_SURGE} artış (Çok Erken)")
+    print(f" - Hacim Şartı      : Ortalamanın en az {MIN_VOL_MULTIPLIER} katı devasa hacim")
+    print(f" - OI Artışı        : %{MIN_OI_SURGE} yeni para girişi teyidi")
+    print(f" - Zarar Kes (SL)   : %{HARD_SL_PCT*100}")
+    print(f" - İzleyen Stop     : %{(TS_ACTIVATION-1)*100} kârda başlar, %{TS_DROP_PCT*100} düşünce satar")
     print("="*65+"\n")
 
     trades = load_db()
