@@ -1,6 +1,6 @@
 """
-trader_bot.py — Ultra-Early Pump Sniper (1-Minute Engine)
-Balinaların mal toplamaya başladığı İLK DAKİKAYI yakalar.
+trader_bot.py — Ultra-Early Pump Sniper (1-Minute Engine) + Fakeout & Breakout Filters
+Balinaların mal toplamaya başladığı İLK DAKİKAYI yakalar, sahte iğnelere düşmez, trend kırılımlarını avlar.
 """
 import json, math, os, time, uuid
 from datetime import datetime, timezone
@@ -19,18 +19,18 @@ DB   = os.getenv("TRADE_DB",   "trade_db.json")
 
 # ── PARAMETRELER ──────────────────────────────────────────────────────────────
 POSITION_USD     = 300.0
-MAX_HOLD_MIN     = 45         # Pump biterse erken çık
-SCAN_EVERY       = int(os.getenv("SCAN_EVERY_SECONDS", "20")) # 20 saniyede bir ultra hızlı tarama
-MIN_VOL_USD      = float(os.getenv("MIN_QUOTE_VOLUME_USD", "15000000"))   # $15M+ 
+MAX_HOLD_MIN     = 45         
+SCAN_EVERY       = int(os.getenv("SCAN_EVERY_SECONDS", "20")) 
+MIN_VOL_USD      = float(os.getenv("MIN_QUOTE_VOLUME_USD", "15000000"))   
 MAX_VOL_USD      = float(os.getenv("MAX_QUOTE_VOLUME_USD", "10000000000"))
 
-# ULTRA ERKEN PUMP EŞİKLERİ (1 Dakikalık Mumlar İçin)
-MIN_PRICE_SURGE  = 0.8   # Sadece %0.8 artsa bile harekete geç (Çok erken)
-MIN_VOL_MULTIPLIER = 5.0 # Ancak hacim normalin en az 5 katı olmalı (Kesin teyit)
-MIN_OI_SURGE     = 0.5   # OI %0.5 artsa yeter (Para girmeye yeni başlıyor)
-HARD_SL_PCT      = 0.02  # %2 Hard Stop
-TS_ACTIVATION    = 1.015 # %1.5 kârı geçince İzleyen Stop (Trailing) devreye girer
-TS_DROP_PCT      = 0.008 # Zirveden %0.8 düşerse kârı al ve çık
+# ULTRA ERKEN PUMP EŞİKLERİ
+MIN_PRICE_SURGE  = 0.8   
+MIN_VOL_MULTIPLIER = 5.0 
+MIN_OI_SURGE     = 0.5   
+HARD_SL_PCT      = 0.02  
+TS_ACTIVATION    = 1.015 
+TS_DROP_PCT      = 0.008 
 
 STABLE = {"USDC","BUSD","DAI","TUSD","USDP","FDUSD","USDD","FRAX","GUSD","LUSD","USTC","EURC"}
 
@@ -55,11 +55,14 @@ def get_json(url, p=None):
     r.raise_for_status()
     return r.json()
 
-def klines(sym, tf, n=50):
+def klines(sym, tf, n=60):
     raw = get_json(f"{BASE}/fapi/v1/klines", {"symbol":sym,"interval":tf,"limit":n})
     df  = pd.DataFrame(raw, columns=["ot","o","h","l","c","v","ct","qv","tr","tb","tq","x"])
     for col in ["o","h","l","c","v"]: df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+def calc_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
 
 def last_price(sym):
     return float(get_json(f"{BASE}/fapi/v1/ticker/price", {"symbol":sym})["price"])
@@ -86,38 +89,63 @@ def get_universe():
     except Exception as e:
         return []
 
-# ── ERKEN PUMP ANALİZİ (1M) ──────────────────────────────────────────────────
+# ── ERKEN PUMP & FAKEOUT ANALİZİ ─────────────────────────────────────────────
 
 def analyze_pump(sym):
     try:
-        # Piyasayı 1 dakikalık mumlarla izliyoruz (Gecikmeyi sıfırlamak için)
+        # 1. 15 Dakikalık Ana Trend Kontrolü (Düşüş Kırılımı Tespiti İçin)
+        df15 = klines(sym, "15m", 60)
+        if len(df15) < 50: return None
+        ema50_15m = calc_ema(df15['c'], 50).iloc[-1]
+        
+        # 2. 1 Dakikalık Erken Uyarı
         df = klines(sym, "1m", 30)
         if len(df) < 25: return None
         
-        # Sadece son 2 dakikaya bakıyoruz (Şu anki mum + Bir önceki)
-        c_current = df.iloc[-1]['c']
-        o_prev    = df.iloc[-2]['o']
+        row_current = df.iloc[-1]
+        c_current   = row_current['c']
+        o_prev      = df.iloc[-2]['o']
         
-        # Fiyat sadece ufak bir kıpırdanma yapsa bile (%0.8) yakalayacağız
+        # Fiyat Patlaması
         price_change_pct = (c_current - o_prev) / o_prev * 100
         if price_change_pct < MIN_PRICE_SURGE: return None
         
-        # Ancak bu ufak hareketi DOĞRULAYAN şey DEVASA hacimdir
-        vol_ma = df['v'].iloc[-22:-2].mean() # Son 20 dakikanın normal hacmi
+        # Hacim Patlaması
+        vol_ma = df['v'].iloc[-22:-2].mean()
         vol_recent = df.iloc[-1]['v'] + df.iloc[-2]['v']
-        
         if vol_ma <= 0: return None
         vol_ratio = vol_recent / vol_ma
-        if vol_ratio < MIN_VOL_MULTIPLIER: return None # Eğer hacim normalin 5 katı değilse sahtedir
+        if vol_ratio < MIN_VOL_MULTIPLIER: return None
         
-        # Açık Pozisyonda ufak kıpırdanma bile yeterli
+        # 🛡️ FİLTRE 1: İĞNE (WICK) KONTROLÜ (Anlık çıkıp düşenleri engeller)
+        # Eğer şu anki mumun üstünde devasa bir iğne varsa (fiyat geri basılmışsa) uzak dur!
+        candle_size = row_current['h'] - row_current['l']
+        upper_wick  = row_current['h'] - max(row_current['c'], row_current['o'])
+        if candle_size > 0:
+            wick_ratio = upper_wick / candle_size
+            if wick_ratio > 0.35: # Mum boyunun %35'inden fazlası iğneyse fakeout'tur!
+                return None 
+                
+        # 🛡️ FİLTRE 2: TREND VE KIRILIM KONTROLÜ (Senin istediğin özellik)
+        # Fiyat EMA50'den ne kadar uzakta?
+        dist_to_ema_pct = (c_current - ema50_15m) / ema50_15m * 100
+        
+        is_breakout = False
+        if dist_to_ema_pct < -0.8:
+            # Fiyat hala derin bir düşüş trendinde ve EMA50'yi kırmaya çok uzak. 
+            # Bu bir "Ölü Kedi Sıçramasıdır" (Dead Cat Bounce). Bulaşma!
+            return None 
+        elif -0.8 <= dist_to_ema_pct <= 1.5:
+            # Fiyat tam şu an EMA50 direncini test ediyor veya kırıyor!
+            is_breakout = True
+
+        # Açık Pozisyon (Balina Teyidi)
         oi_data = get_json(f"{BASE}/futures/data/openInterestHist", {"symbol": sym, "period": "5m", "limit": 2})
         oi_surge = 0
         if oi_data and len(oi_data) >= 2:
             oi_now = float(oi_data[-1]["sumOpenInterest"])
             oi_old = float(oi_data[-2]["sumOpenInterest"])
-            if oi_old > 0:
-                oi_surge = (oi_now - oi_old) / oi_old * 100
+            if oi_old > 0: oi_surge = (oi_now - oi_old) / oi_old * 100
                 
         if oi_surge < MIN_OI_SURGE: return None
         
@@ -125,9 +153,13 @@ def analyze_pump(sym):
         entry = last_price(sym)
         sl    = entry * (1 - HARD_SL_PCT)
         
+        # Trend durumuna göre etiket
+        trend_status = "🔥 DÜŞÜŞ TRENDİ KIRILIMI (Breakout)" if is_breakout else "📈 Yükseliş Trendi Devamı"
+        
         reasons = [
-            f"⚡ *Erken Uyarı Fırlaması:* `+{price_change_pct:.2f}%` (Son 2 dk)",
-            f"🌊 *Anormal Hacim:* `{vol_ratio:.1f}x` Katı (Balina alımı başladı)",
+            f"🎯 *Yapı:* `{trend_status}`",
+            f"⚡ *Fırlama:* `+{price_change_pct:.2f}%` (Güçlü Gövde, İğne Yok)",
+            f"🌊 *Anormal Hacim:* `{vol_ratio:.1f}x` Katı",
             f"🐳 *Yeni Para Girişi:* `+{oi_surge:.2f}%`"
         ]
         
@@ -147,7 +179,7 @@ def analyze_pump(sym):
 def msg_open(pos, tid):
     lines = "\n".join(f"  • {r}" for r in pos.get("reasons", []))
     return (
-        f"🚨 *ULTRA ERKEN PUMP (İLK MUM) YAKALANDI!* | `{pos['sym']}`\n\n"
+        f"🚨 *ONAYLI PUMP (FAKEOUT FİLTRELİ)!* | `{pos['sym']}`\n\n"
         f"Yön: *LONG*\n"
         f"Giriş Fiyatı : `{fp(pos['entry'])}`\n\n"
         f"Stop Loss    : `{fp(pos['sl'])}` (-%{HARD_SL_PCT*100:.1f})\n"
@@ -304,7 +336,7 @@ def monitor(state):
 def scan(state, universe):
     open_syms = {p["sym"] for p in state.get("positions", [])}
     print(f"\n{'='*65}")
-    print(f"🚀 ULTRA ERKEN PUMP (1M) SNIPER — {utc().strftime('%H:%M:%S UTC')}")
+    print(f"🚀 FAKEOUT FİLTRELİ PUMP SNIPER — {utc().strftime('%H:%M:%S UTC')}")
     print(f"   Açık pozisyon: {len(open_syms)} | Taranan: {len(universe)} coin")
     print(f"{'='*65}")
 
@@ -316,15 +348,15 @@ def scan(state, universe):
             sig = analyze_pump(sym)
             if sig:
                 candidates.append(sig)
-                print(f"\n  ✅ {sym} İLK MUM YAKALANDI! | Skor:{sig['score']}")
+                print(f"\n  ✅ {sym} KALİTELİ PUMP YAKALANDI! | Skor:{sig['score']}")
         except: pass
         time.sleep(0.06)
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
     if candidates:
-        print(f"\n  🔥 {len(candidates)} COIN'DE BALİNA GİRİŞİ TESPİT EDİLDİ!\n")
+        print(f"\n  🔥 {len(candidates)} ONAYLI BALİNA GİRİŞİ TESPİT EDİLDİ!\n")
     else:
-        print(f"\n  🔍 Şu an piyasa sakin, sinsi para girişi aranıyor...")
+        print(f"\n  🔍 Sahte iğneler filtreleniyor, gerçek pump bekleniyor...")
 
     for sig in candidates:
         if sig["sym"] in {p["sym"] for p in state.get("positions", [])}: continue
@@ -336,7 +368,7 @@ def scan(state, universe):
         }
         state.setdefault("positions", []).append(pos)
         tg(msg_open(pos, tid))
-        print(f"  🚀 İLK MUMDAN GİRİLDİ: {sig['sym']} @ {fp(sig['entry'])} | ID:{tid}")
+        print(f"  🚀 İŞLEME GİRİLDİ: {sig['sym']} @ {fp(sig['entry'])} | ID:{tid}")
         time.sleep(0.3)
 
     return state
@@ -345,15 +377,12 @@ def scan(state, universe):
 
 def main():
     print("="*65)
-    print("🚀 ULTRA ERKEN (1M) PUMP SNIPER BOTU BAŞLADI")
+    print("🚀 FAKEOUT KORUMALI & DÜŞÜŞ KIRILIMI (BREAKOUT) SNIPER BAŞLADI")
     print("="*65)
-    print("🛠️ İLK MUM YAKALAMA STRATEJİSİ:")
-    print(f" - Tarama Aralığı : Sadece {SCAN_EVERY} Saniye!")
-    print(f" - Fiyat Kıpırdaması: Son 2 dakikada en az %{MIN_PRICE_SURGE} artış (Çok Erken)")
-    print(f" - Hacim Şartı      : Ortalamanın en az {MIN_VOL_MULTIPLIER} katı devasa hacim")
-    print(f" - OI Artışı        : %{MIN_OI_SURGE} yeni para girişi teyidi")
-    print(f" - Zarar Kes (SL)   : %{HARD_SL_PCT*100}")
-    print(f" - İzleyen Stop     : %{(TS_ACTIVATION-1)*100} kârda başlar, %{TS_DROP_PCT*100} düşünce satar")
+    print("🛠️ AKTİF FİLTRELER:")
+    print(f" 1. İğne Koruması : Fiyat geri basılırsa (İğne > %35) girilmez.")
+    print(f" 2. Trend Teyidi  : Ölü kedi sıçramaları (Deep Downtrend) reddedilir.")
+    print(f" 3. Kırılım Avı   : Düşüş trendini (15m EMA50) tam kıranlar önceliklidir.")
     print("="*65+"\n")
 
     trades = load_db()
