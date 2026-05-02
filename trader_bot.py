@@ -21,7 +21,7 @@ DB   = os.getenv("TRADE_DB",   "trade_db.json")
 POSITION_USD     = 300.0
 MAX_HOLD_MIN     = 45         
 SCAN_EVERY       = int(os.getenv("SCAN_EVERY_SECONDS", "20")) 
-MIN_VOL_USD      = float(os.getenv("MIN_QUOTE_VOLUME_USD", "15000000"))   
+MIN_VOL_USD      = float(os.getenv("MIN_QUOTE_VOLUME_USD", "5000000"))   
 MAX_VOL_USD      = float(os.getenv("MAX_QUOTE_VOLUME_USD", "10000000000"))
 
 # ULTRA ERKEN PUMP EŞİKLERİ
