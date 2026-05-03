@@ -329,36 +329,47 @@ def scan(state, universe):
     print(f"   Açık pozisyon: {len(open_syms)} | Taranan: {len(universe)} sığ coin")
     print(f"{'='*65}")
 
-    candidates = []
+    found = 0
     for i, (sym, _) in enumerate(universe):
         print(f"  [{i+1}/{len(universe)}] {sym} kuluçka kontrolü...", end="\r")
         if sym in open_syms: continue
         try:
             sig = analyze_pump(sym)
             if sig:
-                candidates.append(sig)
                 print(f"\n  ✅ {sym} UYANIŞ YAKALANDI! | Skor:{sig['score']}")
+                
+                # ANINDA İŞLEME GİR VE BİLDİRİM AT (Döngü sonunu bekleme, fiyat kaçmasın!)
+                tid = str(uuid.uuid4())[:8].upper()
+                
+                # İşleme girmeden hemen önce fiyatı milisaniyelik güncelleyelim (Kusursuzluk için)
+                real_entry = last_price(sym)
+                sig['entry'] = real_entry
+                sig['highest_price'] = real_entry
+                
+                # Stop loss'u güncel fiyata göre tekrar sınırla
+                if (real_entry - sig['sl']) / real_entry > HARD_SL_PCT:
+                    sig['sl'] = round(real_entry * (1 - HARD_SL_PCT), 5)
+                sig['ts_activation'] = real_entry * TS_ACTIVATION
+                
+                pos = {
+                    **sig,
+                    "trade_id": tid, "be_hit": False,
+                    "opened_iso": utc().isoformat(), "opened_ts": ts()
+                }
+                state.setdefault("positions", []).append(pos)
+                open_syms.add(sym)
+                found += 1
+                
+                tg(msg_open(pos, tid))
+                print(f"  🚀 İŞLEME GİRİLDİ: {sym} @ {fp(real_entry)} | ID:{tid}")
+                time.sleep(0.3)
         except: pass
         time.sleep(0.06)
 
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    if candidates:
-        print(f"\n  🔥 {len(candidates)} ADET KULUÇKADAN ÇIKAN COİN BULUNDU!\n")
+    if found > 0:
+        print(f"\n  🔥 {found} ADET KULUÇKADAN ÇIKAN COİN İŞLEME ALINDI!\n")
     else:
         print(f"\n  🔍 Şu an sığ tahtalarda yaprak kıpırdamıyor, pusudayız...")
-
-    for sig in candidates:
-        if sig["sym"] in {p["sym"] for p in state.get("positions", [])}: continue
-        tid = str(uuid.uuid4())[:8].upper()
-        pos = {
-            **sig,
-            "trade_id": tid, "be_hit": False,
-            "opened_iso": utc().isoformat(), "opened_ts": ts()
-        }
-        state.setdefault("positions", []).append(pos)
-        tg(msg_open(pos, tid))
-        print(f"  🚀 İŞLEME GİRİLDİ: {sig['sym']} @ {fp(sig['entry'])} | ID:{tid}")
-        time.sleep(0.3)
 
     return state
 
