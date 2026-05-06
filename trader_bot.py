@@ -152,7 +152,9 @@ def analyze_pump(sym):
             "reasons": reasons,
             "highest_price": entry, 
             "ts_activation": entry * TS_ACTIVATION,
-            "ts_pct": TS_DROP_PCT
+            "ts_pct": TS_DROP_PCT,
+            "vol_mult": float(vol_ratio),
+            "stagnation": float(range_pct)
         }
     except Exception as e:
         return None
@@ -230,7 +232,9 @@ def record_trade(pos, price, reason, dur_sec):
         "id": pos.get("trade_id",""), "pair": pos["sym"], "side": "LONG",
         "entry": pos["entry"], "exit": price, "result": reason,
         "pnl": round(pnl, 4), "score": pos.get("score", 0),
-        "duration": dur_sec, "timestamp": ts()
+        "duration": dur_sec, "timestamp": ts(),
+        "vol_mult": pos.get("vol_mult", 0),
+        "stagnation": pos.get("stagnation", 0)
     })
     save_db(trades)
     return trades
@@ -373,6 +377,37 @@ def scan(state, universe):
 
     return state
 
+# ── YAPAY ZEKA LİTE (OTOMATİK ÖĞRENME & OPTİMİZASYON) ─────────────────────────
+
+def optimize_parameters():
+    global MAX_STAGNATION_PCT, MIN_VOL_MULTIPLIER
+    trades = load_db()
+    wins = [t for t in trades if t.get("pnl", 0) > 0 and "vol_mult" in t and "stagnation" in t]
+    
+    if len(wins) >= 5: # Sadece yeterli kazanan veri varsa öğren
+        avg_vol = sum(t["vol_mult"] for t in wins) / len(wins)
+        avg_stag = sum(t["stagnation"] for t in wins) / len(wins)
+        
+        # Sınırları kazananların karakterine göre dinamik ayarla:
+        # Kazananlar ortalama ne kadar hacimle patlamışsa, şartı ona yaklaştır (%80'i)
+        new_vol_mult = max(3.0, avg_vol * 0.8) 
+        # Kazananlar ortalama ne kadar sabitmişse, şartı ona göre daralt
+        new_stag = min(7.0, avg_stag * 1.2)    
+        
+        # Anlamlı bir değişim varsa globale kaydet ve kullanıcıya bildir
+        if abs(new_vol_mult - MIN_VOL_MULTIPLIER) > 0.3 or abs(new_stag - MAX_STAGNATION_PCT) > 0.5:
+            msg = (
+                f"🧠 *BOT ÖĞRENDİ (Makine Öğrenimi Aktif)*\n\n"
+                f"Geçmişteki kârlı işlemleri analiz edip hataları ayıkladım. "
+                f"Yeni sinyalleri kazananların profiline göre filtreleyeceğim:\n\n"
+                f"📈 *Hacim Şartı:* `{MIN_VOL_MULTIPLIER:.1f}x` ➡️ `{new_vol_mult:.1f}x`\n"
+                f"📏 *Sabitlik (Düz Çizgi) Şartı:* `% {MAX_STAGNATION_PCT:.1f}` ➡️ `% {new_stag:.1f}`\n\n"
+                f"_(Artık sahte kırılımlara değil, sadece bu oranları sağlayan kusursuz işlemlere gireceğim)_"
+            )
+            tg(msg)
+            MIN_VOL_MULTIPLIER = round(new_vol_mult, 1)
+            MAX_STAGNATION_PCT = round(new_stag, 1)
+
 # ── ANA DÖNGÜ ─────────────────────────────────────────────────────────────────
 
 def main():
@@ -390,8 +425,16 @@ def main():
         s = calc_stats(trades)
         print(f"  DB: {s['total']} trade | WR:{s['wins']}/{s['total']} | P&L:${s['total_pnl']:+.2f}\n")
 
+    optimize_parameters() # Başlangıçta geçmiş veriden öğren
+
+    last_learn_time = time.time()
+
     while True:
         try:
+            if time.time() - last_learn_time > 3600: # Her saat başı tekrar analiz et ve öğren
+                optimize_parameters()
+                last_learn_time = time.time()
+                
             state    = load_st()
             universe = get_universe()
 
