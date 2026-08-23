@@ -4,3 +4,6 @@ __pycache__/
 railway-variables.txt
 signal_state.json
 paper_trades.csv
+trader_state.json
+trade_db.json
+.DS_Store

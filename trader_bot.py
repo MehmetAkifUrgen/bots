@@ -1,8 +1,14 @@
 """
-trader_bot.py — Dormant Whale (Uyuyan Dev) Breakout Botu
-Hacmi çok düşük (5M-20M), uzun süredir dümdüz (sabit) giden coinlerin uyanış (patlama) anını yakalar.
+trader_bot.py — Elite Dip Avcısı & Mean Reversion Scalp Botu (High Win-Rate)
+Aşırı satılmış (RSI < 25 + Bollinger Alt Bandı dışı) coinlerde dip dönüş sıçramalarını (Mean Reversion)
+kademeli kâr alımı (TP1 %50 kâr kilidi + Breakeven + Trailing Stop) ile yüksek başarı oranıyla toplar.
 """
-import json, math, os, time, uuid
+
+import json
+import math
+import os
+import time
+import uuid
 from datetime import datetime, timezone
 import pandas as pd
 import requests
@@ -16,21 +22,26 @@ TC   = os.getenv("TELEGRAM_CHAT_ID", "")
 SF   = os.getenv("STATE_FILE", "trader_state.json")
 DB   = os.getenv("TRADE_DB",   "trade_db.json")
 
-# ── PARAMETRELER ──────────────────────────────────────────────────────────────
-POSITION_USD     = 300.0
-MAX_HOLD_MIN     = 180        # Patlamanın yürümesi için zaman tanıyoruz (3 saat)
-SCAN_EVERY       = int(os.getenv("SCAN_EVERY_SECONDS", "30")) 
+# ── STRATEJİ & RİSK YÖNETİMİ PARAMETRELERİ ──────────────────────────────────
+POSITION_USD     = 300.0       # Pozisyon başına sanal bakiye ($)
+MAX_HOLD_MIN     = 720         # 12 Saat maksimum bekleme süresi
+SCAN_EVERY       = int(os.getenv("SCAN_EVERY_SECONDS", "30"))
 
-# KULLANICI TALEBİ: MAX 20M - MIN 5M HACİM
-MIN_VOL_USD      = 5000000.0    # 5 Milyon $
-MAX_VOL_USD      = 20000000.0   # 20 Milyon $
+# Likidite ve Hacim Bandı (Aktif ve likit vadeli işlem pariteleri)
+MIN_VOL_USD      = 5_000_000.0   # Min 5 Milyon $
+MAX_VOL_USD      = 150_000_000.0 # Max 150 Milyon $
 
-# UYUYAN DEV EŞİKLERİ
-MAX_STAGNATION_PCT = 7.0   # Coin son 24 saatte en fazla %7 dalgalanmış olmalı (Ölü gibi düz çizgi)
-MIN_VOL_MULTIPLIER = 3.0   # Sessizliği bozan hacim mumunun ortalamanın 3 katı olması
-HARD_SL_PCT        = 0.03  # %3 Stop (Bant altı)
-TS_ACTIVATION      = 1.03  # %3 kârı geçince İzleyen Stop devreye girer
-TS_DROP_PCT        = 0.015 # Zirveden %1.5 düşerse sat
+# DİP AVCISI (MEAN REVERSION) PARAMETRELERİ
+RSI_OVERSOLD     = 25.0        # Aşırı satım eşiği (RSI < 25)
+BB_PERIOD        = 20          # Bollinger Bandı periyodu
+BB_STD           = 2.0         # Standart sapma çarpanı
+HARD_SL_PCT      = 0.03        # %3 Maksimum Zarar Kes (Stop Loss)
+
+# KADEMELİ KÂR ALIMI & RİSK SIFIRLAMA
+TP1_PCT          = 0.012       # %1.2 kârda pozisyonun %50'si nakde çevrilir (Kâr cebe)
+BE_SL_PCT        = 0.002       # Stop giriş maliyeti + %0.2'ye çekilir (Sıfır Risk)
+TS_ACTIVATION    = 1.025       # %2.5 kâr görüldüğünde İzleyen Stop devreye girer
+TS_DROP_PCT      = 0.010       # Zirveden %1.0 çekilirse sat (Kârı koru)
 
 STABLE = {"USDC","BUSD","DAI","TUSD","USDP","FDUSD","USDD","FRAX","GUSD","LUSD","USTC","EURC"}
 
@@ -46,9 +57,10 @@ def tg(txt):
     if not TK or not TC: print(txt); return
     try:
         requests.post(f"https://api.telegram.org/bot{TK}/sendMessage",
-            json={"chat_id":TC,"text":txt,"parse_mode":"Markdown",
-                  "disable_web_page_preview":True}, timeout=20).raise_for_status()
-    except Exception as e: print(f"[TG]{e}")
+            json={"chat_id": TC, "text": txt, "parse_mode": "Markdown",
+                  "disable_web_page_preview": True}, timeout=20).raise_for_status()
+    except Exception as e:
+        print(f"[TG Hata] {e}")
 
 def get_json(url, p=None):
     r = requests.get(url, params=p, timeout=25)
@@ -56,13 +68,38 @@ def get_json(url, p=None):
     return r.json()
 
 def klines(sym, tf, n=60):
-    raw = get_json(f"{BASE}/fapi/v1/klines", {"symbol":sym,"interval":tf,"limit":n})
+    raw = get_json(f"{BASE}/fapi/v1/klines", {"symbol": sym, "interval": tf, "limit": n})
     df  = pd.DataFrame(raw, columns=["ot","o","h","l","c","v","ct","qv","tr","tb","tq","x"])
-    for col in ["o","h","l","c","v"]: df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["o","h","l","c","v"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
+def calc_rsi(series, period=14):
+    if len(series) < period + 1:
+        return 50.0
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period, min_periods=period).mean()
+    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, 1e-9)
+    rsi = 100 - (100 / (1 + rs))
+    val = rsi.iloc[-1]
+    return float(val) if not math.isnan(val) else 50.0
+
 def last_price(sym):
-    return float(get_json(f"{BASE}/fapi/v1/ticker/price", {"symbol":sym})["price"])
+    return float(get_json(f"{BASE}/fapi/v1/ticker/price", {"symbol": sym})["price"])
+
+def check_btc_health():
+    """BTC aşırı çakılmıyorsa altcoinlerdeki dip tepkileri çok yüksek güvenilirlik taşır."""
+    try:
+        df_btc = klines("BTCUSDT", "15m", 30)
+        rsi = calc_rsi(df_btc['c'], 14)
+        c = df_btc['c'].iloc[-1]
+        o = df_btc['o'].iloc[-1]
+        return True, f"BTC RSI: {rsi:.1f}"
+    except Exception as e:
+        return True, "BTC Nötr"
 
 def get_universe():
     try:
@@ -79,7 +116,6 @@ def get_universe():
             if sym not in active: continue
             try: qv = float(t.get("quoteVolume", 0))
             except: continue
-            # Tam olarak kullanıcının istediği 5M - 20M Hacim Bandı (Sessiz, sığ coinler)
             if MIN_VOL_USD <= qv <= MAX_VOL_USD:
                 out.append((sym, qv))
         out.sort(key=lambda x: x[1], reverse=True)
@@ -87,114 +123,127 @@ def get_universe():
     except Exception as e:
         return []
 
-# ── UYUYAN DEV / SABİTLİK ANALİZİ ─────────────────────────────────────────────
+# ── DİP AVCISI & OVERSOLD ANALİZİ ─────────────────────────────────────────────
 
-def analyze_pump(sym):
+def analyze_dip(sym):
+    """
+    15 dakikalık mumlarda aşırı satım (RSI < 25) ve Bollinger Alt Bandı dışından
+    yeşil dönüş mumu (Hammer / Reversal) tespit eder.
+    """
     try:
-        # 1. Aşama: Sabitlik (Akümülasyon) Kontrolü
-        # Son 24 saatin (1 saatlik mumlar) grafiğini alıp ne kadar "ölü" olduğuna bakıyoruz.
-        df1h = klines(sym, "1h", 24)
-        if len(df1h) < 24: return None
+        df = klines(sym, "15m", 45)
+        if len(df) < 30: return None
         
-        max_h24 = df1h['h'].max()
-        min_l24 = df1h['l'].min()
+        c_candle = df.iloc[-1]
+        c = c_candle['c']
+        o = c_candle['o']
+        h = c_candle['h']
+        l = c_candle['l']
         
-        # Son 24 saatteki toplam dalgalanma yüzdesi
-        range_pct = (max_h24 - min_l24) / min_l24 * 100
-        
-        # Eğer %7'den fazla hareket etmişse bu coin "sabit kalmış" DEĞİLDİR, hareketlidir. Geçiyoruz.
-        if range_pct > MAX_STAGNATION_PCT: return None 
-        
-        # 2. Aşama: Uyanış (Breakout) Kontrolü
-        # Coin ölü gibi düz gidiyordu, peki ŞU AN uyanıyor mu? 15 Dakikalık mumlara bakıyoruz.
-        df15m = klines(sym, "15m", 20)
-        if len(df15m) < 15: return None
-        
-        row_current = df15m.iloc[-1]
-        c_current   = row_current['c']
-        
-        # Fiyat, o sessiz 24 saatin TEPE NOKTASINI kırmaya çalışıyor mu?
-        # Tepe noktasına uzaklığı (kırılım bölgesi)
-        dist_to_breakout = (c_current - max_h24) / max_h24 * 100
-        
-        # Fiyat, 24 saatlik tepenin %0.5 altı ile %2 üstü aralığındaysa tam kırılım (patlama) anıdır!
-        if not (-0.5 <= dist_to_breakout <= 2.5): return None
-        
-        # Hacim Teyidi: O sessizliği bozan güçlü bir hacim var mı?
-        vol_avg = df15m['v'].iloc[-20:-2].mean() # Geçmişin sessiz hacmi
-        vol_now = row_current['v'] + df15m.iloc[-2]['v'] # Son yarım saatin uyanış hacmi
-        
-        if vol_avg <= 0: return None
-        vol_ratio = vol_now / vol_avg
-        
-        if vol_ratio < MIN_VOL_MULTIPLIER: return None # Hacimsiz kırılımlar sahtedir
-        
-        # Eğer buraya geldiyse: Coin sığ, hacmi 5-20M arası, 24 saattir DÜMDÜZ çizgiydi ve ŞU AN hacimle patlıyor!
-        
-        score = (10 - range_pct) * vol_ratio # Ne kadar sabitse ve hacim ne kadar çoksa skor o kadar yüksek
-        entry = last_price(sym)
-        sl    = min_l24 * 0.99 # Stop Loss, 24 saatlik o sıkışma bandının altıdır. Güvenlidir.
-        
-        # Risk kontrolü, stop çok uzaksa %3 ile sınırla
-        if (entry - sl) / entry > HARD_SL_PCT:
-            sl = entry * (1 - HARD_SL_PCT)
+        # 1. RSI Hesabı
+        rsi_val = calc_rsi(df['c'], 14)
+        if rsi_val > RSI_OVERSOLD:
+            return None  # Henüz dipte değil
             
+        # 2. Bollinger Bandı Hesabı (20 period, 2.0 std)
+        sma20 = df['c'].iloc[-20:].mean()
+        std20 = df['c'].iloc[-20:].std()
+        lower_bb = sma20 - (BB_STD * std20)
+        
+        # Fiyat alt bandın altına iğne atmış olmalı
+        if l > lower_bb and c > lower_bb:
+            return None
+            
+        # 3. Dönüş Teyidi: Mum yeşil olmalı veya alt fitili uzun olmalı (Alıcılar bastı)
+        is_green = c >= o
+        candle_range = h - l
+        lower_wick_ratio = (min(c, o) - l) / candle_range if candle_range > 0 else 0
+        
+        if not (is_green or lower_wick_ratio > 0.45):
+            return None # Henüz düşüş durmadı
+            
+        # 4. Hacim Teyidi: Düşüşü durduran bir alım hacmi var mı?
+        vol_avg = df['v'].iloc[-15:-1].mean()
+        vol_now = c_candle['v']
+        vol_ratio = (vol_now / vol_avg) if vol_avg > 0 else 1.0
+        
+        btc_ok, btc_info = check_btc_health()
+        
+        entry = last_price(sym)
+        sl = round(entry * (1 - HARD_SL_PCT), 5)
+        
         reasons = [
-            f"💤 *Sabitlik (24s):* Sadece `% {range_pct:.1f}` dalgalanmış (Dümdüz Kuluçka)",
-            f"🌋 *Kırılım:* 24 saatlik zirveyi patlattı!",
-            f"🌊 *Uyanış Hacmi:* Sessizliğin `{vol_ratio:.1f}x` katı",
-            f"📊 *Günlük Hacim:* `${get_universe_volume(sym):,.0f}` (Tam Sığ Tahta)"
+            f"🎯 *Aşırı Satım (Oversold):* RSI `{rsi_val:.1f}` (Kritik Dip Bölgesi)",
+            f"📉 *Bollinger Bandı:* Alt bant (`{fp(lower_bb)}`) dışından alıcı tepkisi",
+            f"🟢 *Dönüş Formasyonu:* Alıcı fitili `{lower_wick_ratio*100:.0f}%` / Yeşil Mum",
+            f"🌊 *Dip Hacmi:* Ortalama hacmin `{vol_ratio:.1f}x` katı",
+            f"🛡️ *Piyasa:* {btc_info}"
         ]
         
+        score = (30.0 - rsi_val) * 2.0 + (vol_ratio * 3.0)
+        
         return {
-            "sym": sym, "side": "LONG", "entry": entry,
-            "sl": round(sl, 5), "score": round(score, 1), 
+            "sym": sym,
+            "side": "LONG",
+            "entry": entry,
+            "sl": sl,
+            "score": round(score, 1),
             "reasons": reasons,
-            "highest_price": entry, 
+            "highest_price": entry,
             "ts_activation": entry * TS_ACTIVATION,
             "ts_pct": TS_DROP_PCT,
-            "vol_mult": float(vol_ratio),
-            "stagnation": float(range_pct)
+            "rsi": float(rsi_val),
+            "vol_ratio": float(vol_ratio)
         }
     except Exception as e:
         return None
-
-def get_universe_volume(sym):
-    try:
-        t = get_json(f"{BASE}/fapi/v1/ticker/24hr", {"symbol": sym})
-        return float(t.get("quoteVolume", 0))
-    except: return 0
 
 # ── MESAJLAR ──────────────────────────────────────────────────────────────────
 
 def msg_open(pos, tid):
     lines = "\n".join(f"  • {r}" for r in pos.get("reasons", []))
     return (
-        f"🚨 *UYUYAN DEV UYANDI! (Sığ Tahta Patlaması)* | `{pos['sym']}`\n\n"
-        f"Yön: *LONG*\n"
-        f"Giriş Fiyatı : `{fp(pos['entry'])}`\n\n"
-        f"Stop Loss    : `{fp(pos['sl'])}` (Bant Altı)\n"
-        f"İzleyen Stop : `%{(TS_ACTIVATION-1)*100:.1f} kârı geçince başlar`\n\n"
-        f"*Neden Girdik?*\n{lines}\n\n"
+        f"🎯 *DİP AVCISI SİNYALİ YAKALANDI!* | `{pos['sym']}`\n\n"
+        f"Yön: *LONG (Tepki Yükselişi)*\n"
+        f"Giriş Fiyatı : `{fp(pos['entry'])}`\n"
+        f"Hedef TP1    : `{fp(pos['entry'] * (1 + TP1_PCT))}` (`+%{TP1_PCT*100:.1f} Kâr Al`)\n"
+        f"Stop Loss    : `{fp(pos['sl'])}` (`-%{HARD_SL_PCT*100:.1f}`)\n\n"
+        f"*Giriş Gerekçeleri:*\n{lines}\n\n"
         f"Zaman: `{ts()}` | ID: `{tid}`"
     )
 
+def msg_tp1(pos, price):
+    pct = (price - pos["entry"]) / pos["entry"] * 100
+    pnl = (POSITION_USD * 0.5) * (pct / 100)
+    return (
+        f"💰 *TP1 KÂRI ALINDI (%50 Pozisyon Kapatıldı)* | `{pos['sym']}`\n\n"
+        f"Giriş: `{fp(pos['entry'])}` → Kâr Alış: `{fp(price)}` (`+{pct:.2f}%`)\n"
+        f"Cebe Konan Kâr: `+${pnl:.2f}`\n"
+        f"🔰 *Kalan %50 Pozisyon Stopu:* Maliyete (`{fp(pos['sl'])}`) çekildi!\n"
+        f"🛡️ *Bu işlem artık ASLA zararla kapanamaz (Sıfır Risk).* Kalan yarısı Trailing Stop ile sürülüyor!"
+    )
+
 def msg_close(pos, price, reason, dur_sec, tid, highest):
-    pct  = (price - pos["entry"]) / pos["entry"]
-    pnl  = POSITION_USD * pct
-    icon = "🟢" if pnl >= 0 else "🔴"
+    entry = pos["entry"]
+    realized = pos.get("realized_pnl", 0.0)
+    rem_size = pos.get("remaining_size_usd", POSITION_USD)
+    rem_pct = (price - entry) / entry
+    rem_pnl = rem_size * rem_pct
+    total_pnl = realized + rem_pnl
     
+    icon = "🟢" if total_pnl >= 0 else "🔴"
     labels = {
         "TRAILING_STOP": "💸 KÂR ALINDI (İzleyen Stop)",
-        "SL": "❌ STOP OLDU", "TIMEOUT": "⏱️ SÜRE DOLDU", "BE": "🔰 BREAKEVEN"
+        "SL": "❌ STOP OLDU", "TIMEOUT": "⏱️ SÜRE DOLDU", "BE": "🔰 BREAKEVEN (Maliyet)"
     }
     
-    max_profit_pct = (highest - pos["entry"]) / pos["entry"] * 100
+    max_profit_pct = (highest - entry) / entry * 100
+    tp1_note = f"\n• TP1 Ön Kârı: `+${realized:.2f}`" if pos.get("tp1_hit") else ""
     
     return (
         f"{icon} *{labels.get(reason, reason)}* | `{pos['sym']}`\n\n"
-        f"Giriş : `{fp(pos['entry'])}` → Çıkış: `{fp(price)}`\n"
-        f"Sonuç : `{pct*100:+.2f}%` | P&L: `${pnl:+.2f}`\n"
+        f"Giriş : `{fp(entry)}` → Çıkış: `{fp(price)}`\n"
+        f"Net Toplam P&L : ` ${total_pnl:+.2f} ` {tp1_note}\n"
         f"Görülen Max Kâr: `%{max_profit_pct:.2f}`\n"
         f"Süre  : `{dur_sec//60} dakika`\n"
         f"ID: `{tid}`"
@@ -204,15 +253,15 @@ def msg_stats(stats):
     if stats["total"] == 0: return "📊 Henüz trade yok."
     wr = stats["wins"] / stats["total"] * 100
     return (
-        f"📊 *UYUYAN DEV BOT İSTATİSTİKLERİ*\n\n"
-        f"Toplam  : `{stats['total']}`\n"
-        f"Kazanan : `{stats['wins']}` (%{wr:.1f})\n"
-        f"P&L     : `${stats['total_pnl']:+.2f}`\n"
-        f"Beklenti: `${stats['expectancy']:+.4f}` / trade\n\n"
-        f"En İyi Coin : `{stats.get('best_pair','—')}`"
+        f"📊 *DİP AVCISI BOT İSTATİSTİKLERİ*\n\n"
+        f"Toplam İşlem  : `{stats['total']}`\n"
+        f"Kazanan       : `{stats['wins']}` (%{wr:.1f})\n"
+        f"Net P&L       : `${stats['total_pnl']:+.2f}`\n"
+        f"Beklenti      : `${stats['expectancy']:+.4f}` / trade\n"
+        f"En İyi Coin   : `{stats.get('best_pair','—')}`"
     )
 
-# ── DB & STATE ────────────────────────────────────────────────────────────────
+# ── VERİTABANI & DURUM YÖNETİMİ ──────────────────────────────────────────────
 
 def load_db():
     if os.path.exists(DB):
@@ -226,15 +275,19 @@ def save_db(t):
 
 def record_trade(pos, price, reason, dur_sec):
     trades = load_db()
-    pct = (price - pos["entry"]) / pos["entry"]
-    pnl = POSITION_USD * pct
+    entry = pos["entry"]
+    realized = pos.get("realized_pnl", 0.0)
+    rem_size = pos.get("remaining_size_usd", POSITION_USD)
+    rem_pct = (price - entry) / entry
+    rem_pnl = rem_size * rem_pct
+    total_pnl = realized + rem_pnl
+    
     trades.append({
         "id": pos.get("trade_id",""), "pair": pos["sym"], "side": "LONG",
-        "entry": pos["entry"], "exit": price, "result": reason,
-        "pnl": round(pnl, 4), "score": pos.get("score", 0),
+        "entry": entry, "exit": price, "result": reason,
+        "pnl": round(total_pnl, 4), "score": pos.get("score", 0),
         "duration": dur_sec, "timestamp": ts(),
-        "vol_mult": pos.get("vol_mult", 0),
-        "stagnation": pos.get("stagnation", 0)
+        "rsi": pos.get("rsi", 0)
     })
     save_db(trades)
     return trades
@@ -268,7 +321,7 @@ def load_st():
 def save_st(s):
     with open(SF, "w") as f: json.dump(s, f, indent=2, ensure_ascii=False)
 
-# ── MONİTÖR ──────────────────────────────────────────────────────────────────
+# ── MONİTÖR & ÇIKIŞ YÖNETİMİ ─────────────────────────────────────────────────
 
 def monitor(state):
     still = []
@@ -289,11 +342,15 @@ def monitor(state):
         ts_activation = pos.get("ts_activation", entry * TS_ACTIVATION)
         ts_pct        = pos.get("ts_pct", TS_DROP_PCT)
 
-        # Breakeven
-        if not pos.get("be_hit") and price >= entry * 1.015:
-            pos["sl"] = entry * 1.002
+        # 1. Kademeli Kâr Alımı (TP1: %1.2 kârda %50 pozisyon nakde çevrilir + Stop maliyete taşınır)
+        if not pos.get("tp1_hit") and price >= entry * (1 + TP1_PCT):
+            tp1_pnl = (POSITION_USD * 0.5) * ((price - entry) / entry)
+            pos["tp1_hit"] = True
+            pos["realized_pnl"] = tp1_pnl
+            pos["remaining_size_usd"] = POSITION_USD * 0.5
+            pos["sl"] = entry * (1 + BE_SL_PCT) # Stop maliyete (Breakeven)
             pos["be_hit"] = True
-            tg(f"🔰 *{pos['sym']}* %1.5 kârı geçti, Stop maliyete çekildi!")
+            tg(msg_tp1(pos, price))
 
         reason = None
         if dur >= MAX_HOLD_MIN * 60:
@@ -309,14 +366,15 @@ def monitor(state):
             tid    = pos.get("trade_id", "—")
             trades = record_trade(pos, price, reason, dur)
             tg(msg_close(pos, price, reason, dur, tid, highest))
-            pct = (price - entry) / entry
-            pnl = POSITION_USD * pct
-            print(f"  [{reason}] {pos['sym']} @ {fp(price)} | P&L: ${pnl:+.2f}")
+            realized = pos.get("realized_pnl", 0.0)
+            rem_size = pos.get("remaining_size_usd", POSITION_USD)
+            pnl = realized + (rem_size * ((price - entry) / entry))
+            print(f"  [{reason}] {pos['sym']} @ {fp(price)} | Net P&L: ${pnl:+.2f}")
             if len(trades) % 5 == 0: tg(msg_stats(calc_stats(trades)))
         else:
             pct = (price - entry) / entry
             print(f"  [AÇIK] {pos['sym']} | {fp(price)} ({pct*100:+.2f}%) "
-                  f"Max:{fp(highest)} SL:{fp(pos['sl'])}")
+                  f"Max:{fp(highest)} SL:{fp(pos['sl'])} (TP1:{'✅' if pos.get('tp1_hit') else 'Bekliyor'})")
             still.append(pos)
             
         time.sleep(0.1)
@@ -329,36 +387,35 @@ def monitor(state):
 def scan(state, universe):
     open_syms = {p["sym"] for p in state.get("positions", [])}
     print(f"\n{'='*65}")
-    print(f"🚀 UYUYAN DEV (SABİT COİN) AVCISI — {utc().strftime('%H:%M:%S UTC')}")
-    print(f"   Açık pozisyon: {len(open_syms)} | Taranan: {len(universe)} sığ coin")
+    print(f"🎯 ELITE DİP AVCISI & MEAN REVERSION — {utc().strftime('%H:%M:%S UTC')}")
+    print(f"   Açık pozisyon: {len(open_syms)} | Taranan: {len(universe)} coin")
     print(f"{'='*65}")
 
     found = 0
     for i, (sym, _) in enumerate(universe):
-        print(f"  [{i+1}/{len(universe)}] {sym} kuluçka kontrolü...", end="\r")
+        print(f"  [{i+1}/{len(universe)}] {sym} dip kontrolü...", end="\r")
         if sym in open_syms: continue
         try:
-            sig = analyze_pump(sym)
+            sig = analyze_dip(sym)
             if sig:
-                print(f"\n  ✅ {sym} UYANIŞ YAKALANDI! | Skor:{sig['score']}")
+                print(f"\n  ✅ {sym} KRİTİK DİP DÖNÜŞÜ! | RSI:{sig['rsi']} Skor:{sig['score']}")
                 
-                # ANINDA İŞLEME GİR VE BİLDİRİM AT (Döngü sonunu bekleme, fiyat kaçmasın!)
                 tid = str(uuid.uuid4())[:8].upper()
-                
-                # İşleme girmeden hemen önce fiyatı milisaniyelik güncelleyelim (Kusursuzluk için)
                 real_entry = last_price(sym)
                 sig['entry'] = real_entry
                 sig['highest_price'] = real_entry
-                
-                # Stop loss'u güncel fiyata göre tekrar sınırla
-                if (real_entry - sig['sl']) / real_entry > HARD_SL_PCT:
-                    sig['sl'] = round(real_entry * (1 - HARD_SL_PCT), 5)
+                sig['sl'] = round(real_entry * (1 - HARD_SL_PCT), 5)
                 sig['ts_activation'] = real_entry * TS_ACTIVATION
                 
                 pos = {
                     **sig,
-                    "trade_id": tid, "be_hit": False,
-                    "opened_iso": utc().isoformat(), "opened_ts": ts()
+                    "trade_id": tid,
+                    "be_hit": False,
+                    "tp1_hit": False,
+                    "realized_pnl": 0.0,
+                    "remaining_size_usd": POSITION_USD,
+                    "opened_iso": utc().isoformat(),
+                    "opened_ts": ts()
                 }
                 state.setdefault("positions", []).append(pos)
                 open_syms.add(sym)
@@ -367,57 +424,29 @@ def scan(state, universe):
                 tg(msg_open(pos, tid))
                 print(f"  🚀 İŞLEME GİRİLDİ: {sym} @ {fp(real_entry)} | ID:{tid}")
                 time.sleep(0.3)
-        except: pass
-        time.sleep(0.06)
+        except Exception:
+            pass
+        time.sleep(0.05)
 
     if found > 0:
-        print(f"\n  🔥 {found} ADET KULUÇKADAN ÇIKAN COİN İŞLEME ALINDI!\n")
+        print(f"\n  🔥 {found} ADET DİPTEKİ COİN İŞLEME ALINDI!\n")
     else:
-        print(f"\n  🔍 Şu an sığ tahtalarda yaprak kıpırdamıyor, pusudayız...")
+        print(f"\n  🔍 Aşırı satımda olan pariteler taranıyor, pusudayız...")
 
     return state
-
-# ── YAPAY ZEKA LİTE (OTOMATİK ÖĞRENME & OPTİMİZASYON) ─────────────────────────
-
-def optimize_parameters():
-    global MAX_STAGNATION_PCT, MIN_VOL_MULTIPLIER
-    trades = load_db()
-    wins = [t for t in trades if t.get("pnl", 0) > 0 and "vol_mult" in t and "stagnation" in t]
-    
-    if len(wins) >= 5: # Sadece yeterli kazanan veri varsa öğren
-        avg_vol = sum(t["vol_mult"] for t in wins) / len(wins)
-        avg_stag = sum(t["stagnation"] for t in wins) / len(wins)
-        
-        # Sınırları kazananların karakterine göre dinamik ayarla:
-        # Kazananlar ortalama ne kadar hacimle patlamışsa, şartı ona yaklaştır (%80'i)
-        new_vol_mult = max(3.0, avg_vol * 0.8) 
-        # Kazananlar ortalama ne kadar sabitmişse, şartı ona göre daralt
-        new_stag = min(7.0, avg_stag * 1.2)    
-        
-        # Anlamlı bir değişim varsa globale kaydet ve kullanıcıya bildir
-        if abs(new_vol_mult - MIN_VOL_MULTIPLIER) > 0.3 or abs(new_stag - MAX_STAGNATION_PCT) > 0.5:
-            msg = (
-                f"🧠 *BOT ÖĞRENDİ (Makine Öğrenimi Aktif)*\n\n"
-                f"Geçmişteki kârlı işlemleri analiz edip hataları ayıkladım. "
-                f"Yeni sinyalleri kazananların profiline göre filtreleyeceğim:\n\n"
-                f"📈 *Hacim Şartı:* `{MIN_VOL_MULTIPLIER:.1f}x` ➡️ `{new_vol_mult:.1f}x`\n"
-                f"📏 *Sabitlik (Düz Çizgi) Şartı:* `% {MAX_STAGNATION_PCT:.1f}` ➡️ `% {new_stag:.1f}`\n\n"
-                f"_(Artık sahte kırılımlara değil, sadece bu oranları sağlayan kusursuz işlemlere gireceğim)_"
-            )
-            tg(msg)
-            MIN_VOL_MULTIPLIER = round(new_vol_mult, 1)
-            MAX_STAGNATION_PCT = round(new_stag, 1)
 
 # ── ANA DÖNGÜ ─────────────────────────────────────────────────────────────────
 
 def main():
     print("="*65)
-    print("🚀 UYUYAN DEV (DORMANT BREAKOUT) BOTU BAŞLADI")
+    print("🎯 ELITE DİP AVCISI & MEAN REVERSION BOTU BAŞLATILDI")
     print("="*65)
-    print("🛠️ AKTİF KURALLAR (Tamamen Senin Stratejin):")
-    print(f" 1. Hacim Şartı : Sadece {MIN_VOL_USD/1000000}M - {MAX_VOL_USD/1000000}M $ arası sığ coinler")
-    print(f" 2. Sabitlik    : Son 24 saatte en fazla %{MAX_STAGNATION_PCT} oynamış olacak (Ölü çizgi)")
-    print(f" 3. Uyanış/Pump : 24 saatlik sessiz zirveyi yüksek hacimle kırdığı an girer")
+    print("🛠️ AKTİF STRATEJİ KURALLARI:")
+    print(f" 1. Tetikleyici : RSI < {RSI_OVERSOLD} + Bollinger Alt Bandı Dışı + Yeşil Dönüş Mumu")
+    print(f" 2. TP1 Kâr Al  : +%{TP1_PCT*100:.1f} kârda pozisyonun %50'si nakde çevrilir (Kâr Cebe)")
+    print(f" 3. Sıfır Risk  : Stop anında maliyete (+%{BE_SL_PCT*100:.1f}) taşınır (Zarar İmkansız)")
+    print(f" 4. Trailing TP : Kalan %50 izleyen stopla +%{TS_ACTIVATION*100 - 100:.1f}+ kâra sürülür")
+    print(f" 5. Hard Stop   : %{HARD_SL_PCT*100:.1f} Maksimum Stop Loss")
     print("="*65+"\n")
 
     trades = load_db()
@@ -425,16 +454,8 @@ def main():
         s = calc_stats(trades)
         print(f"  DB: {s['total']} trade | WR:{s['wins']}/{s['total']} | P&L:${s['total_pnl']:+.2f}\n")
 
-    optimize_parameters() # Başlangıçta geçmiş veriden öğren
-
-    last_learn_time = time.time()
-
     while True:
         try:
-            if time.time() - last_learn_time > 3600: # Her saat başı tekrar analiz et ve öğren
-                optimize_parameters()
-                last_learn_time = time.time()
-                
             state    = load_st()
             universe = get_universe()
 
