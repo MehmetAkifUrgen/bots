@@ -70,13 +70,43 @@ def tg(txt):
     except Exception as e:
         print(f"[TELEGRAM Hata] Mesaj iletilemedi: {e}")
 
-def get_json(url, p=None):
-    r = requests.get(url, params=p, timeout=25)
-    r.raise_for_status()
-    return r.json()
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json"
+}
+
+API_HOSTS = [
+    BASE,
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com"
+]
+
+def get_json(endpoint, p=None):
+    if endpoint.startswith("http"):
+        path = endpoint
+        hosts = [endpoint]
+    else:
+        path = endpoint
+        hosts = [f"{h}{path}" for h in API_HOSTS]
+
+    last_err = None
+    for url in hosts:
+        try:
+            r = requests.get(url, params=p, headers=HEADERS, timeout=20)
+            if r.status_code == 200:
+                return r.json()
+            else:
+                last_err = f"HTTP {r.status_code} ({r.text[:100]})"
+        except Exception as e:
+            last_err = str(e)
+            
+    print(f"[BINANCE API HATA] Endpoint: {endpoint} | Son Hata: {last_err}")
+    raise Exception(f"Tüm Binance hostları başarısız: {last_err}")
 
 def klines(sym, tf, n=60):
-    raw = get_json(f"{BASE}/fapi/v1/klines", {"symbol": sym, "interval": tf, "limit": n})
+    raw = get_json("/fapi/v1/klines" if not BASE else f"{BASE}/fapi/v1/klines", {"symbol": sym, "interval": tf, "limit": n})
     df  = pd.DataFrame(raw, columns=["ot","o","h","l","c","v","ct","qv","tr","tb","tq","x"])
     for col in ["o","h","l","c","v"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -96,7 +126,8 @@ def calc_rsi(series, period=14):
     return float(val) if not math.isnan(val) else 50.0
 
 def last_price(sym):
-    return float(get_json(f"{BASE}/fapi/v1/ticker/price", {"symbol": sym})["price"])
+    r = get_json(f"{BASE}/fapi/v1/ticker/price", {"symbol": sym})
+    return float(r["price"])
 
 def get_universe():
     try:
@@ -116,8 +147,11 @@ def get_universe():
             if MIN_VOL_USD <= qv <= MAX_VOL_USD:
                 out.append((sym, qv))
         out.sort(key=lambda x: x[1], reverse=True)
+        if len(out) == 0:
+            print(f"[UYARI] Universe boş döndü! Aktif sembol: {len(active)}, Ticker: {len(tickers)}")
         return out
     except Exception as e:
+        print(f"[UNIVERSE HATA] Binance pariteleri çekilemedi: {e}")
         return []
 
 # ── SİNYAL MOTORLARI (DİP & PUMP) ───────────────────────────────────────────
