@@ -1,7 +1,8 @@
 """
-trader_bot.py — Elite Dip Avcısı & Mean Reversion Scalp Botu (High Win-Rate)
-Aşırı satılmış (RSI < 25 + Bollinger Alt Bandı dışı) coinlerde dip dönüş sıçramalarını (Mean Reversion)
-kademeli kâr alımı (TP1 %50 kâr kilidi + Breakeven + Trailing Stop) ile yüksek başarı oranıyla toplar.
+trader_bot.py — Çift Motorlu Hibrit Trading Botu (Dip Avcısı + Pump Sniper)
+1. Motor (Dip Avcısı): Aşırı satılmış (RSI < 25 + Bollinger Altı) coinlerin tepki dönüşlerini yakalar.
+2. Motor (Pump Sniper): 24 saatlik sıkışmayı devasa hacimle (3.5x+) kıran patlama coinlerini yakalar.
+Ortak Çıkış: TP1 %1.2 kârda %50 satış + Anında Breakeven (Sıfır Risk) + %2.5 Trailing Stop.
 """
 
 import json
@@ -27,21 +28,25 @@ POSITION_USD     = 300.0       # Pozisyon başına sanal bakiye ($)
 MAX_HOLD_MIN     = 720         # 12 Saat maksimum bekleme süresi
 SCAN_EVERY       = int(os.getenv("SCAN_EVERY_SECONDS", "30"))
 
-# Likidite ve Hacim Bandı (Aktif ve likit vadeli işlem pariteleri)
+# Likidite ve Hacim Bandı
 MIN_VOL_USD      = 5_000_000.0   # Min 5 Milyon $
 MAX_VOL_USD      = 150_000_000.0 # Max 150 Milyon $
 
-# DİP AVCISI (MEAN REVERSION) PARAMETRELERİ
+# 1. MOTOR (DİP AVCISI) PARAMETRELERİ
 RSI_OVERSOLD     = 25.0        # Aşırı satım eşiği (RSI < 25)
-BB_PERIOD        = 20          # Bollinger Bandı periyodu
-BB_STD           = 2.0         # Standart sapma çarpanı
-HARD_SL_PCT      = 0.03        # %3 Maksimum Zarar Kes (Stop Loss)
+BB_PERIOD        = 20
+BB_STD           = 2.0
 
-# KADEMELİ KÂR ALIMI & RİSK SIFIRLAMA
-TP1_PCT          = 0.012       # %1.2 kârda pozisyonun %50'si nakde çevrilir (Kâr cebe)
+# 2. MOTOR (PUMP SNIPER) PARAMETRELERİ
+MAX_STAGNATION_PCT = 7.0       # 24 saatlik sıkışma bandı (%7'den az dalgalanma)
+MIN_VOL_MULTIPLIER = 3.5       # Kırılım hacmi normalin en az 3.5 katı
+
+# KÂR KİLİTLEME VE RİSK SIFIRLAMA
+TP1_PCT          = 0.012       # %1.2 kârda pozisyonun %50'si nakde çevrilir (Kâr Cebe)
 BE_SL_PCT        = 0.002       # Stop giriş maliyeti + %0.2'ye çekilir (Sıfır Risk)
 TS_ACTIVATION    = 1.025       # %2.5 kâr görüldüğünde İzleyen Stop devreye girer
 TS_DROP_PCT      = 0.010       # Zirveden %1.0 çekilirse sat (Kârı koru)
+HARD_SL_PCT      = 0.03        # %3 Maksimum Zarar Kes (Stop Loss)
 
 STABLE = {"USDC","BUSD","DAI","TUSD","USDP","FDUSD","USDD","FRAX","GUSD","LUSD","USTC","EURC"}
 
@@ -90,17 +95,6 @@ def calc_rsi(series, period=14):
 def last_price(sym):
     return float(get_json(f"{BASE}/fapi/v1/ticker/price", {"symbol": sym})["price"])
 
-def check_btc_health():
-    """BTC aşırı çakılmıyorsa altcoinlerdeki dip tepkileri çok yüksek güvenilirlik taşır."""
-    try:
-        df_btc = klines("BTCUSDT", "15m", 30)
-        rsi = calc_rsi(df_btc['c'], 14)
-        c = df_btc['c'].iloc[-1]
-        o = df_btc['o'].iloc[-1]
-        return True, f"BTC RSI: {rsi:.1f}"
-    except Exception as e:
-        return True, "BTC Nötr"
-
 def get_universe():
     try:
         info    = get_json(f"{BASE}/fapi/v1/exchangeInfo")
@@ -123,91 +117,118 @@ def get_universe():
     except Exception as e:
         return []
 
-# ── DİP AVCISI & OVERSOLD ANALİZİ ─────────────────────────────────────────────
+# ── SİNYAL MOTORLARI (DİP & PUMP) ───────────────────────────────────────────
 
-def analyze_dip(sym):
+def analyze_market_candidate(sym):
     """
-    15 dakikalık mumlarda aşırı satım (RSI < 25) ve Bollinger Alt Bandı dışından
-    yeşil dönüş mumu (Hammer / Reversal) tespit eder.
+    Hem 1. Motor (Dip Avcısı) hem de 2. Motor (Pump Sniper) için pariteyi analiz eder.
     """
     try:
-        df = klines(sym, "15m", 45)
-        if len(df) < 30: return None
+        df15m = klines(sym, "15m", 45)
+        if len(df15m) < 30: return None
         
-        c_candle = df.iloc[-1]
+        c_candle = df15m.iloc[-1]
         c = c_candle['c']
         o = c_candle['o']
         h = c_candle['h']
         l = c_candle['l']
         
-        # 1. RSI Hesabı
-        rsi_val = calc_rsi(df['c'], 14)
-        if rsi_val > RSI_OVERSOLD:
-            return None  # Henüz dipte değil
+        rsi_val = calc_rsi(df15m['c'], 14)
+        
+        # ─────────────────────────────────────────────────────────────────
+        # 1. MOTOR: DİP AVCISI (Aşırı Satım & Tepki Yükselişi)
+        # ─────────────────────────────────────────────────────────────────
+        if rsi_val <= RSI_OVERSOLD:
+            sma20 = df15m['c'].iloc[-20:].mean()
+            std20 = df15m['c'].iloc[-20:].std()
+            lower_bb = sma20 - (BB_STD * std20)
             
-        # 2. Bollinger Bandı Hesabı (20 period, 2.0 std)
-        sma20 = df['c'].iloc[-20:].mean()
-        std20 = df['c'].iloc[-20:].std()
-        lower_bb = sma20 - (BB_STD * std20)
-        
-        # Fiyat alt bandın altına iğne atmış olmalı
-        if l > lower_bb and c > lower_bb:
-            return None
-            
-        # 3. Dönüş Teyidi: Mum yeşil olmalı veya alt fitili uzun olmalı (Alıcılar bastı)
-        is_green = c >= o
-        candle_range = h - l
-        lower_wick_ratio = (min(c, o) - l) / candle_range if candle_range > 0 else 0
-        
-        if not (is_green or lower_wick_ratio > 0.45):
-            return None # Henüz düşüş durmadı
-            
-        # 4. Hacim Teyidi: Düşüşü durduran bir alım hacmi var mı?
-        vol_avg = df['v'].iloc[-15:-1].mean()
-        vol_now = c_candle['v']
-        vol_ratio = (vol_now / vol_avg) if vol_avg > 0 else 1.0
-        
-        btc_ok, btc_info = check_btc_health()
-        
-        entry = last_price(sym)
-        sl = round(entry * (1 - HARD_SL_PCT), 5)
-        
-        reasons = [
-            f"🎯 *Aşırı Satım (Oversold):* RSI `{rsi_val:.1f}` (Kritik Dip Bölgesi)",
-            f"📉 *Bollinger Bandı:* Alt bant (`{fp(lower_bb)}`) dışından alıcı tepkisi",
-            f"🟢 *Dönüş Formasyonu:* Alıcı fitili `{lower_wick_ratio*100:.0f}%` / Yeşil Mum",
-            f"🌊 *Dip Hacmi:* Ortalama hacmin `{vol_ratio:.1f}x` katı",
-            f"🛡️ *Piyasa:* {btc_info}"
-        ]
-        
-        score = (30.0 - rsi_val) * 2.0 + (vol_ratio * 3.0)
-        
-        return {
-            "sym": sym,
-            "side": "LONG",
-            "entry": entry,
-            "sl": sl,
-            "score": round(score, 1),
-            "reasons": reasons,
-            "highest_price": entry,
-            "ts_activation": entry * TS_ACTIVATION,
-            "ts_pct": TS_DROP_PCT,
-            "rsi": float(rsi_val),
-            "vol_ratio": float(vol_ratio)
-        }
-    except Exception as e:
+            # Alt banda değmiş veya taşmış mı?
+            if l <= lower_bb or c <= lower_bb:
+                is_green = c >= o
+                candle_range = h - l
+                lower_wick_ratio = (min(c, o) - l) / candle_range if candle_range > 0 else 0
+                
+                # Yeşil mum veya belirgin alıcı fitili
+                if is_green or lower_wick_ratio > 0.40:
+                    entry = last_price(sym)
+                    score = (30.0 - rsi_val) * 2.0
+                    reasons = [
+                        f"🎯 *Strateji:* DİP AVCISI (Mean Reversion)",
+                        f"📉 *Aşırı Satım:* RSI `{rsi_val:.1f}` (Kritik Dip Bölgesi)",
+                        f"📊 *Bollinger Bandı:* Alt bant (`{fp(lower_bb)}`) dışından alıcı tepkisi",
+                        f"🟢 *Dönüş Onayı:* Yeşil Mum / Alıcı fitili `{lower_wick_ratio*100:.0f}%`"
+                    ]
+                    return {
+                        "sym": sym, "mode": "DİP_AVCISI", "side": "LONG",
+                        "entry": entry, "sl": round(entry * (1 - HARD_SL_PCT), 5),
+                        "score": round(score, 1), "reasons": reasons,
+                        "highest_price": entry, "ts_activation": entry * TS_ACTIVATION,
+                        "ts_pct": TS_DROP_PCT, "rsi": float(rsi_val)
+                    }
+
+        # ─────────────────────────────────────────────────────────────────
+        # 2. MOTOR: PUMP SNIPER (Hacimli Sıkışma Kırılımı)
+        # ─────────────────────────────────────────────────────────────────
+        if 52.0 <= rsi_val <= 75.0:
+            df1h = klines(sym, "1h", 30)
+            if len(df1h) >= 24:
+                max_h24 = df1h['h'].iloc[-24:].max()
+                min_l24 = df1h['l'].iloc[-24:].min()
+                range_pct = (max_h24 - min_l24) / min_l24 * 100
+                
+                # 24 saat boyunca %7'den az dalgalanmış (Sıkışmış)
+                if range_pct <= MAX_STAGNATION_PCT:
+                    dist = (c - max_h24) / max_h24 * 100
+                    # 24 saatlik tepeyi kırma anı
+                    if 0.1 <= dist <= 2.5:
+                        candle_range = h - l
+                        body_ratio = (c - o) / candle_range if candle_range > 0 else 0
+                        
+                        # Güçlü yeşil gövde (Tepe iğnesi bırakmamış)
+                        if body_ratio >= 0.45:
+                            vol_avg = df15m['v'].iloc[-20:-2].mean()
+                            vol_now = c_candle['v'] + df15m['v'].iloc[-2]
+                            vol_ratio = (vol_now / vol_avg) if vol_avg > 0 else 1.0
+                            
+                            # Hacim ortalamanın en az 3.5 katı
+                            if vol_ratio >= MIN_VOL_MULTIPLIER:
+                                # 1h Trend Onayı (EMA20 > EMA50)
+                                ema20_1h = df1h['c'].ewm(span=20, adjust=False).mean().iloc[-1]
+                                ema50_1h = df1h['c'].ewm(span=50, adjust=False).mean().iloc[-1]
+                                
+                                if c >= ema20_1h and ema20_1h >= ema50_1h * 0.995:
+                                    entry = last_price(sym)
+                                    score = (10 - range_pct) * vol_ratio
+                                    reasons = [
+                                        f"🚀 *Strateji:* PUMP SNIPER (Volume Breakout)",
+                                        f"🌋 *Kırılım:* 24 saatlik sıkışma zirvesi kırıldı!",
+                                        f"🌊 *Patlama Hacmi:* Sessizliğin `{vol_ratio:.1f}x` katı",
+                                        f"📈 *Momentum RSI:* `{rsi_val:.1f}` | ⏱️ 1h Yükseliş Trendi"
+                                    ]
+                                    return {
+                                        "sym": sym, "mode": "PUMP_SNIPER", "side": "LONG",
+                                        "entry": entry, "sl": round(entry * (1 - 0.025), 5),
+                                        "score": round(score, 1), "reasons": reasons,
+                                        "highest_price": entry, "ts_activation": entry * TS_ACTIVATION,
+                                        "ts_pct": TS_DROP_PCT, "rsi": float(rsi_val)
+                                    }
+        return None
+    except Exception:
         return None
 
 # ── MESAJLAR ──────────────────────────────────────────────────────────────────
 
 def msg_open(pos, tid):
     lines = "\n".join(f"  • {r}" for r in pos.get("reasons", []))
+    icon = "🎯" if pos.get("mode") == "DİP_AVCISI" else "🚀"
+    title = "DİP AVCISI SİNYALİ" if pos.get("mode") == "DİP_AVCISI" else "PUMP SNIPER SİNYALİ"
     return (
-        f"🎯 *DİP AVCISI SİNYALİ YAKALANDI!* | `{pos['sym']}`\n\n"
-        f"Yön: *LONG (Tepki Yükselişi)*\n"
+        f"{icon} *{title}!* | `{pos['sym']}`\n\n"
+        f"Yön: *LONG*\n"
         f"Giriş Fiyatı : `{fp(pos['entry'])}`\n"
         f"Hedef TP1    : `{fp(pos['entry'] * (1 + TP1_PCT))}` (`+%{TP1_PCT*100:.1f} Kâr Al`)\n"
-        f"Stop Loss    : `{fp(pos['sl'])}` (`-%{HARD_SL_PCT*100:.1f}`)\n\n"
+        f"Stop Loss    : `{fp(pos['sl'])}`\n\n"
         f"*Giriş Gerekçeleri:*\n{lines}\n\n"
         f"Zaman: `{ts()}` | ID: `{tid}`"
     )
@@ -239,9 +260,11 @@ def msg_close(pos, price, reason, dur_sec, tid, highest):
     
     max_profit_pct = (highest - entry) / entry * 100
     tp1_note = f"\n• TP1 Ön Kârı: `+${realized:.2f}`" if pos.get("tp1_hit") else ""
+    mode_str = f"Mod: `{pos.get('mode', 'HİBRİT')}`\n"
     
     return (
         f"{icon} *{labels.get(reason, reason)}* | `{pos['sym']}`\n\n"
+        f"{mode_str}"
         f"Giriş : `{fp(entry)}` → Çıkış: `{fp(price)}`\n"
         f"Net Toplam P&L : ` ${total_pnl:+.2f} ` {tp1_note}\n"
         f"Görülen Max Kâr: `%{max_profit_pct:.2f}`\n"
@@ -253,11 +276,11 @@ def msg_stats(stats):
     if stats["total"] == 0: return "📊 Henüz trade yok."
     wr = stats["wins"] / stats["total"] * 100
     return (
-        f"📊 *DİP AVCISI BOT İSTATİSTİKLERİ*\n\n"
+        f"📊 *ÇİFT MOTORLU BOT İSTATİSTİKLERİ*\n\n"
         f"Toplam İşlem  : `{stats['total']}`\n"
         f"Kazanan       : `{stats['wins']}` (%{wr:.1f})\n"
         f"Net P&L       : `${stats['total_pnl']:+.2f}`\n"
-        f"Beklenti      : `${stats['expectancy']:+.4f}` / trade\n"
+        f"Beklenti      : `${stats['expectancy']:+.4f}` / trade\n\n"
         f"En İyi Coin   : `{stats.get('best_pair','—')}`"
     )
 
@@ -284,6 +307,7 @@ def record_trade(pos, price, reason, dur_sec):
     
     trades.append({
         "id": pos.get("trade_id",""), "pair": pos["sym"], "side": "LONG",
+        "mode": pos.get("mode", "HİBRİT"),
         "entry": entry, "exit": price, "result": reason,
         "pnl": round(total_pnl, 4), "score": pos.get("score", 0),
         "duration": dur_sec, "timestamp": ts(),
@@ -369,11 +393,11 @@ def monitor(state):
             realized = pos.get("realized_pnl", 0.0)
             rem_size = pos.get("remaining_size_usd", POSITION_USD)
             pnl = realized + (rem_size * ((price - entry) / entry))
-            print(f"  [{reason}] {pos['sym']} @ {fp(price)} | Net P&L: ${pnl:+.2f}")
+            print(f"  [{reason}] {pos['sym']} ({pos.get('mode')}) @ {fp(price)} | Net P&L: ${pnl:+.2f}")
             if len(trades) % 5 == 0: tg(msg_stats(calc_stats(trades)))
         else:
             pct = (price - entry) / entry
-            print(f"  [AÇIK] {pos['sym']} | {fp(price)} ({pct*100:+.2f}%) "
+            print(f"  [AÇIK] {pos['sym']} ({pos.get('mode')}) | {fp(price)} ({pct*100:+.2f}%) "
                   f"Max:{fp(highest)} SL:{fp(pos['sl'])} (TP1:{'✅' if pos.get('tp1_hit') else 'Bekliyor'})")
             still.append(pos)
             
@@ -387,24 +411,30 @@ def monitor(state):
 def scan(state, universe):
     open_syms = {p["sym"] for p in state.get("positions", [])}
     print(f"\n{'='*65}")
-    print(f"🎯 ELITE DİP AVCISI & MEAN REVERSION — {utc().strftime('%H:%M:%S UTC')}")
+    print(f"⚡ ÇİFT MOTORLU BOT (DİP + PUMP) — {utc().strftime('%H:%M:%S UTC')}")
     print(f"   Açık pozisyon: {len(open_syms)} | Taranan: {len(universe)} coin")
     print(f"{'='*65}")
 
     found = 0
     for i, (sym, _) in enumerate(universe):
-        print(f"  [{i+1}/{len(universe)}] {sym} dip kontrolü...", end="\r")
+        print(f"  [{i+1}/{len(universe)}] {sym} taranıyor...", end="\r")
         if sym in open_syms: continue
         try:
-            sig = analyze_dip(sym)
+            sig = analyze_market_candidate(sym)
             if sig:
-                print(f"\n  ✅ {sym} KRİTİK DİP DÖNÜŞÜ! | RSI:{sig['rsi']} Skor:{sig['score']}")
+                mode_label = "🎯 DİP DÖNÜŞÜ" if sig["mode"] == "DİP_AVCISI" else "🚀 PUMP KIRILIMI"
+                print(f"\n  ✅ {sym} {mode_label}! | Skor:{sig['score']}")
                 
                 tid = str(uuid.uuid4())[:8].upper()
                 real_entry = last_price(sym)
                 sig['entry'] = real_entry
                 sig['highest_price'] = real_entry
-                sig['sl'] = round(real_entry * (1 - HARD_SL_PCT), 5)
+                
+                if sig["mode"] == "DİP_AVCISI":
+                    sig['sl'] = round(real_entry * (1 - HARD_SL_PCT), 5)
+                else:
+                    sig['sl'] = round(real_entry * (1 - 0.025), 5)
+                    
                 sig['ts_activation'] = real_entry * TS_ACTIVATION
                 
                 pos = {
@@ -422,16 +452,16 @@ def scan(state, universe):
                 found += 1
                 
                 tg(msg_open(pos, tid))
-                print(f"  🚀 İŞLEME GİRİLDİ: {sym} @ {fp(real_entry)} | ID:{tid}")
+                print(f"  🚀 İŞLEME GİRİLDİ: {sym} ({sig['mode']}) @ {fp(real_entry)} | ID:{tid}")
                 time.sleep(0.3)
         except Exception:
             pass
         time.sleep(0.05)
 
     if found > 0:
-        print(f"\n  🔥 {found} ADET DİPTEKİ COİN İŞLEME ALINDI!\n")
+        print(f"\n  🔥 {found} ADET FIRSAT İŞLEME ALINDI!\n")
     else:
-        print(f"\n  🔍 Aşırı satımda olan pariteler taranıyor, pusudayız...")
+        print(f"\n  🔍 Dip dönüşleri ve Pump patlamaları taranıyor...")
 
     return state
 
@@ -439,14 +469,12 @@ def scan(state, universe):
 
 def main():
     print("="*65)
-    print("🎯 ELITE DİP AVCISI & MEAN REVERSION BOTU BAŞLATILDI")
+    print("⚡ ÇİFT MOTORLU HİBRİT BOT (DİP AVCISI + PUMP SNIPER) BAŞLADI")
     print("="*65)
-    print("🛠️ AKTİF STRATEJİ KURALLARI:")
-    print(f" 1. Tetikleyici : RSI < {RSI_OVERSOLD} + Bollinger Alt Bandı Dışı + Yeşil Dönüş Mumu")
-    print(f" 2. TP1 Kâr Al  : +%{TP1_PCT*100:.1f} kârda pozisyonun %50'si nakde çevrilir (Kâr Cebe)")
-    print(f" 3. Sıfır Risk  : Stop anında maliyete (+%{BE_SL_PCT*100:.1f}) taşınır (Zarar İmkansız)")
-    print(f" 4. Trailing TP : Kalan %50 izleyen stopla +%{TS_ACTIVATION*100 - 100:.1f}+ kâra sürülür")
-    print(f" 5. Hard Stop   : %{HARD_SL_PCT*100:.1f} Maksimum Stop Loss")
+    print("🛠️ AKTİF MOTORLAR:")
+    print(" 1. Motor (Dip Avcısı) : RSI < 25 + Bollinger Dışı + Yeşil Mum")
+    print(" 2. Motor (Pump Sniper): 24s Sıkışma + 3.5x Hacim Kırılımı + 1h Trend")
+    print(" 3. Kâr & Risk Yönetimi: %1.2 TP1 (%50 Kâr Al) + Breakeven + Trailing Stop")
     print("="*65+"\n")
 
     trades = load_db()
