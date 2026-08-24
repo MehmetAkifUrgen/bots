@@ -59,13 +59,16 @@ def fp(v):
     return f"{v:.6f}"
 
 def tg(txt):
-    if not TK or not TC: print(txt); return
+    if not TK or not TC:
+        print("[TELEGRAM UYARI] TELEGRAM_BOT_TOKEN veya TELEGRAM_CHAT_ID ortam değişkenlerinde bulunamadı!")
+        return
     try:
-        requests.post(f"https://api.telegram.org/bot{TK}/sendMessage",
+        r = requests.post(f"https://api.telegram.org/bot{TK}/sendMessage",
             json={"chat_id": TC, "text": txt, "parse_mode": "Markdown",
-                  "disable_web_page_preview": True}, timeout=20).raise_for_status()
+                  "disable_web_page_preview": True}, timeout=20)
+        r.raise_for_status()
     except Exception as e:
-        print(f"[TG Hata] {e}")
+        print(f"[TELEGRAM Hata] Mesaj iletilemedi: {e}")
 
 def get_json(url, p=None):
     r = requests.get(url, params=p, timeout=25)
@@ -475,7 +478,18 @@ def main():
     print(" 1. Motor (Dip Avcısı) : RSI < 25 + Bollinger Dışı + Yeşil Mum")
     print(" 2. Motor (Pump Sniper): 24s Sıkışma + 3.5x Hacim Kırılımı + 1h Trend")
     print(" 3. Kâr & Risk Yönetimi: %1.2 TP1 (%50 Kâr Al) + Breakeven + Trailing Stop")
-    print("="*65+"\n")
+    print("="*65)
+
+    if TK and TC:
+        print(f"✅ Telegram Aktif | Chat ID: {TC}")
+        tg("🚀 *ÇİFT MOTORLU HİBRİT BOT CANLIYA GEÇTİ!*\n\n"
+           "• 🎯 *1. Motor:* Dip Avcısı (`RSI < 25`)\n"
+           "• 🚀 *2. Motor:* Pump Sniper (`3.5x Hacim`)\n"
+           "• 🛡️ *Kâr Koruması:* `%1.2 TP1 + Breakeven Sıfır Risk`\n\n"
+           f"📍 *Sunucu Saati:* `{ts()}`\n"
+           "📊 165+ Binance Futures paritesi taranıyor...")
+    else:
+        print("⚠️ [UYARI] TELEGRAM_BOT_TOKEN veya TELEGRAM_CHAT_ID eksik! Bildirim gönderilemeyecek.")
 
     trades = load_db()
     if trades:
