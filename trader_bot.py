@@ -138,15 +138,29 @@ SADECE aşağıdaki JSON formatında yanıt ver:
 def get_public_json(endpoint, p=None):
     hosts = [FAPI_BASE, "https://fapi.binance.com", "https://fapi1.binance.com", "https://fapi2.binance.com"]
     last_err = None
-    proxies = get_proxies()
+    
+    # 1. Önce doğrudan (direct) dene (Public veri proxy gerektirmez)
     for h in hosts:
         url = endpoint if endpoint.startswith("http") else f"{h}{endpoint}"
         try:
-            r = requests.get(url, params=p, headers=HEADERS, proxies=proxies, timeout=15)
+            r = requests.get(url, params=p, headers=HEADERS, timeout=12)
             if r.status_code == 200: return r.json()
             last_err = f"HTTP {r.status_code}"
         except Exception as e:
             last_err = str(e)
+            
+    # 2. Doğrudan bağlantı başarısızsa ve proxy tanımlıysa proxy ile dene
+    proxies = get_proxies()
+    if proxies:
+        for h in hosts:
+            url = endpoint if endpoint.startswith("http") else f"{h}{endpoint}"
+            try:
+                r = requests.get(url, params=p, headers=HEADERS, proxies=proxies, timeout=12)
+                if r.status_code == 200: return r.json()
+                last_err = f"Proxy HTTP {r.status_code}"
+            except Exception as e:
+                last_err = str(e)
+                
     raise Exception(f"Binance public API hatası ({endpoint}): {last_err}")
 
 def binance_signed_request(method, path, params=None):
@@ -162,14 +176,24 @@ def binance_signed_request(method, path, params=None):
     auth_headers = {**HEADERS, "X-MBX-APIKEY": API_KEY}
     proxies = get_proxies()
     
-    if method.upper() == "GET": r = requests.get(url, headers=auth_headers, proxies=proxies, timeout=20)
-    elif method.upper() == "POST": r = requests.post(url, headers=auth_headers, proxies=proxies, timeout=20)
-    elif method.upper() == "DELETE": r = requests.delete(url, headers=auth_headers, proxies=proxies, timeout=20)
-    else: raise ValueError(f"Geçersiz method: {method}")
-        
-    if r.status_code != 200:
-        raise Exception(f"Binance Signed API Hatası ({path}): HTTP {r.status_code} - {r.text}")
-    return r.json()
+    for use_proxy in ([proxies, None] if proxies else [None]):
+        try:
+            if method.upper() == "GET": r = requests.get(url, headers=auth_headers, proxies=use_proxy, timeout=18)
+            elif method.upper() == "POST": r = requests.post(url, headers=auth_headers, proxies=use_proxy, timeout=18)
+            elif method.upper() == "DELETE": r = requests.delete(url, headers=auth_headers, proxies=use_proxy, timeout=18)
+            else: raise ValueError(f"Geçersiz method: {method}")
+            
+            if r.status_code == 200:
+                return r.json()
+            elif r.status_code == 407 and use_proxy:
+                continue
+            else:
+                raise Exception(f"HTTP {r.status_code} - {r.text}")
+        except Exception as e:
+            if use_proxy: continue
+            raise Exception(f"Binance Signed API Hatası ({path}): {e}")
+            
+    raise Exception(f"Binance Signed API Hatası ({path}): Bağlantı kurulamadı.")
 
 def klines(sym, tf, n=60):
     raw = get_public_json("/fapi/v1/klines", {"symbol": sym, "interval": tf, "limit": n})
