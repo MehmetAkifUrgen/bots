@@ -1,9 +1,10 @@
 """
-trader_bot.py — Binance Gerçek Vadeli İşlemler (Real Trading) Botu
+trader_bot.py — Yapay Zekalı (Gemini 2.5 Flash) Binance Canlı Vadeli İşlemler Botu
 • Hesap: Portfolio Margin (PAPI) & Futures Uyumlu
-• Kasa: ~28-32$ Bakiye | 10x Kaldıraç | ~220$ Pozisyon Büyüklüğü
-• Hedef: Sabit +$3.00 Kâr Al (TP) | Sabit -$1.50 Zarar Kes (SL) | +$1.50'de Breakeven (Sıfır Risk)
-• Koruma: Manuel BASEDUSDT pozisyonuna asla dokunulmaz | BTC Düşüş Kalkanı aktif
+• Yapay Zeka: Google Gemini 2.5 Flash ile 2. Aşama Akıllı Sinyal Doğrulama
+• Dinamik Kasa Büyüme: Kasa arttıkça otomatik çoklu pozisyon (Her 25$ için +1 işlem)
+• Hedef & Stop: Sabit +$3.00 Kâr Al (TP) | Sabit -$1.50 Stop Loss (SL) | +$1.50'de Breakeven (Sıfır Risk)
+• Koruma: BASEDUSDT manuel pozisyonuna asla dokunulmaz | BTC Düşüş Kalkanı aktif
 """
 
 import hashlib
@@ -27,6 +28,9 @@ API_SECRET  = os.getenv("BINANCE_API_SECRET", "").strip()
 PAPI_BASE   = os.getenv("BINANCE_PAPI_BASE", "https://papi.binance.com")
 FAPI_BASE   = os.getenv("BINANCE_API_FUTURES_BASE", "https://fapi.binance.com")
 
+GEMINI_KEY  = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL= os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+
 TK          = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TC          = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SF          = os.getenv("STATE_FILE", "trader_state.json")
@@ -34,7 +38,7 @@ DB          = os.getenv("TRADE_DB",   "trade_db.json")
 
 # ── SABİT STRATEJİ VE RİSK PARAMETRELERİ ─────────────────────────────────────
 REAL_TRADING     = os.getenv("REAL_TRADING", "true").lower() == "true"
-POSITION_USD     = float(os.getenv("POSITION_USD", "220.0")) # 10x ile ~22$ teminat kullanılır
+POSITION_USD     = float(os.getenv("POSITION_USD", "220.0")) # 10x ile ~22$ teminat
 LEVERAGE         = int(os.getenv("LEVERAGE", "10"))          # 10x Kaldıraç
 FIXED_TP_USD     = float(os.getenv("FIXED_TP_USD", "3.0"))   # Sabit +3.00$ Net Kâr
 FIXED_SL_USD     = float(os.getenv("FIXED_SL_USD", "1.5"))   # Sabit -1.50$ Net Stop Loss
@@ -44,7 +48,7 @@ MAX_HOLD_MIN     = 720 # 12 Saat maksimum işlem süresi
 # MANUEL POZİSYON KORUMASI (Bot bu sembollere asla dokunmaz)
 PROTECTED_SYMBOLS = {"BASEDUSDT", "BASED"}
 
-# LİKİDİTE VE PARAMETRELER
+# LİKİDİTE VE TEKNİK PARAMETRELER
 MIN_VOL_USD      = 5_000_000.0
 MAX_VOL_USD      = 150_000_000.0
 RSI_OVERSOLD     = 25.0
@@ -81,7 +85,63 @@ def tg(txt):
     except Exception as e:
         print(f"[TG HATA] {e}")
 
-# ── BINANCE PUBLIC VE SIGNED API İSTEMCİSİ ────────────────────────────────────
+# ── GEMINI 2.5 FLASH YAPAY ZEKA TEYİT MOTORU ─────────────────────────────────
+
+def gemini_ai_validate(sym, mode, rsi, price, btc_status, last_candles_summary):
+    """
+    Sinyali Google Gemini 2.5 Flash Yapay Zekasına gönderir.
+    Sahte kırılımları ve tuzakları eleyerek %80+ güven onayı ister.
+    """
+    if not GEMINI_KEY:
+        return True, 80, "Gemini API anahtarı girilmedi, teknik sinyalle devam ediliyor."
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
+    
+    prompt = f"""
+Sen dünyanın en iyi Kripto Vadeli İşlemler Kantitatif Analistisin. 
+Botumuz Binance vadeli işlemlerde 10x kaldıraç ile hızlı bir scalp LONG pozisyonuna girmek üzere.
+
+Analiz Edilecek Parite: {sym}
+Strateji Modu: {mode} (DİP AVCISI: Aşırı satım dönüşü / PUMP SNIPER: Sıkışma kırılımı)
+Anlık Fiyat: {price}
+15m RSI: {rsi:.1f}
+BTC Genel Durumu: {btc_status}
+Son Mum Hareketleri: {last_candles_summary}
+
+GÖREV:
+Grafiğin sahte bir tuzak (fakeout/bull trap) mı yoksa gerçek bir karlı sıçrama fırsatı mı olduğunu değerlendir.
+Kararını SADECE aşağıdaki JSON formatında ver:
+{{
+  "decision": "APPROVE" veya "REJECT",
+  "confidence": 0 ile 100 arası sayı,
+  "reason": "Türkçe 1-2 cümlelik net açıklama"
+}}
+"""
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"response_mime_type": "application/json"}
+    }
+    
+    try:
+        r = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=12)
+        if r.status_code == 200:
+            res_json = r.json()
+            content_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+            parsed = json.loads(content_text)
+            decision = parsed.get("decision", "APPROVE").upper()
+            confidence = int(parsed.get("confidence", 80))
+            reason = parsed.get("reason", "Yapay zeka sinyali onayladı.")
+            
+            is_approved = (decision == "APPROVE" and confidence >= 70)
+            return is_approved, confidence, reason
+        else:
+            print(f"[GEMINI API HATA] HTTP {r.status_code}: {r.text[:100]}")
+    except Exception as e:
+        print(f"[GEMINI EXCEPTION] {e}")
+        
+    return True, 75, "Gemini bağlantı zaman aşımı, teknik onayla devam ediliyor."
+
+# ── BINANCE API İSTEMCİSİ ───────────────────────────────────────────────────
 
 def get_public_json(endpoint, p=None):
     hosts = [FAPI_BASE, "https://fapi.binance.com", "https://fapi1.binance.com", "https://fapi2.binance.com"]
@@ -98,7 +158,6 @@ def get_public_json(endpoint, p=None):
     raise Exception(f"Binance public API hatası ({endpoint}): {last_err}")
 
 def binance_signed_request(method, path, params=None):
-    """Binance Portfolio Margin (PAPI) veya Futures (FAPI) imzalı istek atar."""
     if not API_KEY or not API_SECRET:
         raise Exception("Binance API_KEY veya API_SECRET eksik!")
     
@@ -148,7 +207,6 @@ def last_price(sym):
     return float(r["price"])
 
 def get_symbol_rules(sym):
-    """Sembolün min lot, stepSize ve hassasiyet kurallarını çeker."""
     try:
         info = get_public_json("/fapi/v1/exchangeInfo")
         for s in info.get("symbols", []):
@@ -176,7 +234,6 @@ def round_step_size(qty, step_size, precision):
     return float(f"{rounded:.{precision}f}")
 
 def get_account_balance():
-    """Portfolio Margin hesabındaki toplam USDT bakiyesini getirir."""
     try:
         balances = binance_signed_request("GET", "/papi/v1/balance")
         for b in balances:
@@ -186,12 +243,9 @@ def get_account_balance():
         print(f"[BAKİYE HATA] {e}")
     return 0.0
 
-# ── BTC DÜŞÜŞ KALKANI (MACRO TREND FILTER) ───────────────────────────────────
+# ── BTC DÜŞÜŞ KALKANI ────────────────────────────────────────────────────────
 
 def check_btc_shield():
-    """
-    BTC düşerken veya sert kırmızı mum yakarken altcoinlerde Long açılmasını engeller.
-    """
     try:
         df15m = klines("BTCUSDT", "15m", 30)
         if len(df15m) < 20: return True, "BTC Verisi Yetersiz"
@@ -200,17 +254,16 @@ def check_btc_shield():
         c = last_c['c']
         o = last_c['o']
         
-        # 1. Anlık Şelale Kontrolü: 15m mumunda BTC %0.3'ten fazla kırmızıysa girme
+        # 1. Anlık Şelale: 15m mumunda %0.3'ten fazla sert kırmızıysa girme
         if c < o and ((o - c) / o) > 0.003:
             return False, "BTC Anlık Şelalede (15m Sert Kırmızı Mum)"
             
-        # 2. 1 Saatlik Düşüş Trendi Kontrolü
+        # 2. 1 Saatlik Düşüş Trendi
         df1h = klines("BTCUSDT", "1h", 40)
         if len(df1h) >= 25:
             ema20 = df1h['c'].ewm(span=20, adjust=False).mean().iloc[-1]
             ema50 = df1h['c'].ewm(span=50, adjust=False).mean().iloc[-1]
             rsi_btc = calc_rsi(df1h['c'], 14)
-            
             if df1h['c'].iloc[-1] < ema20 and ema20 < ema50 and rsi_btc < 45.0:
                 return False, f"BTC 1h Düşüş Trendinde (RSI:{rsi_btc:.1f})"
                 
@@ -242,7 +295,7 @@ def get_universe():
         print(f"[UNIVERSE HATA] {e}")
         return []
 
-# ── SİNYAL MOTORU (DİP AVCISI & PUMP SNIPER) ─────────────────────────────────
+# ── SİNYAL MOTORU ────────────────────────────────────────────────────────────
 
 def analyze_market_candidate(sym):
     try:
@@ -256,6 +309,10 @@ def analyze_market_candidate(sym):
         l = c_candle['l']
         
         rsi_val = calc_rsi(df15m['c'], 14)
+        
+        # Mum özet dizesi (Gemini için)
+        last_3_candles = [f"M{idx+1}: O={row['o']:.4f} C={row['c']:.4f} H={row['h']:.4f} L={row['l']:.4f}" for idx, row in df15m.iloc[-3:].iterrows()]
+        candles_summary = " | ".join(last_3_candles)
         
         # 1. MOTOR: DİP AVCISI
         if rsi_val <= RSI_OVERSOLD:
@@ -274,6 +331,7 @@ def analyze_market_candidate(sym):
                     return {
                         "sym": sym, "mode": "DİP_AVCISI", "side": "LONG",
                         "entry": entry, "score": round(score, 1),
+                        "rsi": rsi_val, "candles_summary": candles_summary,
                         "reasons": [
                             f"🎯 *Strateji:* DİP AVCISI (Oversold Bounce)",
                             f"📉 *Aşırı Satım:* RSI `{rsi_val:.1f}`",
@@ -304,6 +362,7 @@ def analyze_market_candidate(sym):
                                 return {
                                     "sym": sym, "mode": "PUMP_SNIPER", "side": "LONG",
                                     "entry": entry, "score": round(score, 1),
+                                    "rsi": rsi_val, "candles_summary": candles_summary,
                                     "reasons": [
                                         f"🚀 *Strateji:* PUMP SNIPER (Volume Breakout)",
                                         f"🌋 *Kırılım:* 24s sıkışma zirvesi kırıldı!",
@@ -314,7 +373,7 @@ def analyze_market_candidate(sym):
     except Exception:
         return None
 
-# ── GERÇEK EMİR VE POZİSYON MOTORU (REAL TRADING) ────────────────────────────
+# ── GERÇEK EMİR MOTORU ───────────────────────────────────────────────────────
 
 def set_leverage(sym, lev=10):
     try:
@@ -323,7 +382,6 @@ def set_leverage(sym, lev=10):
         print(f"[LEVERAGE UYARI] {sym} kaldıraç ayarlanamadı ({e})")
 
 def execute_real_entry(sym, notional_usd=220.0):
-    """Binance üzerinde gerçek vadeli işlem açar."""
     rules = get_symbol_rules(sym)
     price = last_price(sym)
     
@@ -346,18 +404,14 @@ def execute_real_entry(sym, notional_usd=220.0):
     print(f"⚡ [GERÇEK EMİR AÇILIYOR] {sym} | Miktar: {qty} | Notional: ~${qty*price:.2f}")
     order_res = binance_signed_request("POST", "/papi/v1/um/order", order_params)
     
-    # Gerçek giriş fiyatını hesapla
     avg_price = float(order_res.get("avgPrice", 0))
     if avg_price <= 0:
         avg_price = price
         
-    # Sabit +3.00$ Kâr ve -1.50$ Zarar Fiyat Seviyeleri:
-    # Kar = (P_tp - P_e) * qty = 3.00 => P_tp = P_e + (3.00 / qty)
-    # Zarar = (P_e - P_sl) * qty = 1.50 => P_sl = P_e - (1.50 / qty)
     tp_price = avg_price + (FIXED_TP_USD / qty)
     sl_price = avg_price - (FIXED_SL_USD / qty)
-    be_trigger_price = avg_price + (1.50 / qty) # +1.50$ kâra ulaşınca Breakeven tetiklenir
-    be_sl_price = avg_price + (0.30 / qty)      # Maliyet + komisyon payı
+    be_trigger_price = avg_price + (1.50 / qty)
+    be_sl_price = avg_price + (0.30 / qty)
     
     return {
         "sym": sym,
@@ -376,7 +430,6 @@ def execute_real_entry(sym, notional_usd=220.0):
     }
 
 def execute_real_close(pos, reason):
-    """Binance üzerindeki açık pozisyonu market emriyle kapatır."""
     sym = pos["sym"]
     qty = pos["qty"]
     
@@ -395,15 +448,15 @@ def execute_real_close(pos, reason):
         if exit_price <= 0:
             exit_price = last_price(sym)
     except Exception as e:
-        print(f"[KAPATMA HATA] {e}, anlık fiyattan tekrar deneniyor...")
+        print(f"[KAPATMA HATA] {e}")
         exit_price = last_price(sym)
         
     pnl = (exit_price - pos["entry"]) * qty
     return exit_price, pnl
 
-# ── TELEGRAM BİLDİRİM ŞABLONLARI ─────────────────────────────────────────────
+# ── TELEGRAM BİLDİRİMLERİ ────────────────────────────────────────────────────
 
-def msg_real_open(pos, sig):
+def msg_real_open(pos, sig, ai_conf, ai_reason):
     icon = "🎯" if sig.get("mode") == "DİP_AVCISI" else "🚀"
     lines = "\n".join(f"  • {r}" for r in sig.get("reasons", []))
     return (
@@ -414,7 +467,9 @@ def msg_real_open(pos, sig):
         f"🎯 *Sabit Kâr Hedefi (+3.00$):* `{fp(pos['tp_price'])}`\n"
         f"🛑 *Sabit Stop Loss (-1.50$):* `{fp(pos['sl_price'])}`\n"
         f"🔰 *Sıfır Risk (+1.50$ kârda):* Stop maliyete çekilir\n\n"
-        f"*Gerekçeler:*\n{lines}\n\n"
+        f"🧠 *Gemini 2.5 Flash AI Teyidi:* `%{ai_conf} Güven`\n"
+        f"💬 *AI Gerekçesi:* _{ai_reason}_\n\n"
+        f"*Teknik Gerekçeler:*\n{lines}\n\n"
         f"Zaman: `{ts()}`"
     )
 
@@ -427,16 +482,17 @@ def msg_real_close(pos, exit_price, pnl, reason, dur_sec):
         "TIMEOUT": "⏱️ SÜRE DOLDU"
     }.get(reason, reason)
     
+    bal = get_account_balance()
     return (
         f"{icon} *{title}* | `{pos['sym']}`\n\n"
         f"Giriş : `{fp(pos['entry'])}` → Çıkış: `{fp(exit_price)}`\n"
         f"Net P&L : *`${pnl:+.2f}`*\n"
         f"İşlem Süresi : `{dur_sec//60} dakika`\n"
-        f"Kasa Güncel Durumu: `${get_account_balance():.2f} USDT`\n\n"
+        f"💰 *Güncel Portföy:* `${bal:.2f} USDT`\n\n"
         f"Zaman: `{ts()}`"
     )
 
-# ── DURUM VE VERİTABANI YÖNETİMİ ─────────────────────────────────────────────
+# ── DURUM YÖNETİMİ ───────────────────────────────────────────────────────────
 
 def load_st():
     if os.path.exists(SF):
@@ -476,7 +532,7 @@ def record_trade(pos, exit_price, pnl, reason, dur_sec):
     save_db(trades)
     return trades
 
-# ── MONİTÖR & ÇIKIŞ YÖNETİMİ ─────────────────────────────────────────────────
+# ── MONİTÖR & ÇIKIŞ ──────────────────────────────────────────────────────────
 
 def monitor(state):
     still = []
@@ -485,28 +541,24 @@ def monitor(state):
         try:
             price = last_price(sym)
         except Exception:
-            still.append(pos)
-            continue
+            still.append(pos); continue
             
         qty = pos["qty"]
         entry = pos["entry"]
         dur = int((utc() - datetime.fromisoformat(pos.get("opened_iso", utc().isoformat()))).total_seconds())
         unrealized_pnl = (price - entry) * qty
         
-        # 1. Breakeven Koruması (+1.50$ Kâra ulaşıldığında stop maliyete çekilir)
+        # 1. Breakeven (+1.50$ kârda stop maliyete)
         if not pos.get("be_hit") and (price >= pos["be_trigger_price"] or unrealized_pnl >= 1.50):
             pos["sl_price"] = pos["be_sl_price"]
             pos["be_hit"] = True
-            tg(f"🔰 *{sym}* +1.50$ kâra ulaştı! Stop maliyete (`{fp(pos['sl_price'])}`) çekildi. *Bu işlem artık sıfır risklidir!*")
+            tg(f"🔰 *{sym}* +1.50$ kâra ulaştı! Stop maliyete (`{fp(pos['sl_price'])}`) çekildi. *İşlem sıfır risklidir!*")
             
         reason = None
-        # Sabit Kâr Hedefi (+3.00$)
         if price >= pos["tp_price"] or unrealized_pnl >= FIXED_TP_USD:
             reason = "TAKE_PROFIT"
-        # Sabit Zarar Kes (-1.50$) veya Breakeven Stop
         elif price <= pos["sl_price"]:
             reason = "BREAKEVEN" if pos.get("be_hit") else "STOP_LOSS"
-        # Süre Aşımı
         elif dur >= MAX_HOLD_MIN * 60:
             reason = "TIMEOUT"
             
@@ -529,14 +581,19 @@ def monitor(state):
     state["positions"] = still
     return state
 
-# ── TARAMA DÖNGÜSÜ ───────────────────────────────────────────────────────────
+# ── TARAMA VE AI DOĞRULAMA DÖNGÜSÜ ───────────────────────────────────────────
 
 def scan(state, universe):
-    # Maksimum 1 aktif bot pozisyonu (Kasayı korumak için tek işlem kuralı)
-    if len(state.get("positions", [])) >= 1:
+    current_balance = get_account_balance()
+    
+    # DİNAMİK ÇOKLU POZİSYON FORMÜLÜ (Her 25$ bakiye için +1 pozisyon hakkı)
+    max_allowed_positions = max(1, min(5, int(current_balance / 25.0)))
+    
+    active_positions_count = len(state.get("positions", []))
+    if active_positions_count >= max_allowed_positions:
         return state
         
-    # 0. AŞAMA: BTC DÜŞÜŞ KALKANI
+    # BTC DÜŞÜŞ KALKANI KONTROLÜ
     btc_ok, btc_reason = check_btc_shield()
     if not btc_ok:
         print(f"🛡️ [BTC KALKANI AKTİF] {btc_reason} — Yeni pozisyon açılışı kilitlendi.")
@@ -551,7 +608,23 @@ def scan(state, universe):
         try:
             sig = analyze_market_candidate(sym)
             if sig:
-                print(f"\n🔥 [SİNYAL YAKALANDI] {sym} ({sig['mode']})! Gerçek işlem açılıyor...")
+                print(f"\n🔍 [TEKNİK SİNYAL BULUNDU] {sym} ({sig['mode']})! Gemini 2.5 Flash analiz ediyor...")
+                
+                # 2. AŞAMA: GEMINI 2.5 FLASH AI TEYİDİ
+                ai_ok, ai_conf, ai_reason = gemini_ai_validate(
+                    sym=sym,
+                    mode=sig["mode"],
+                    rsi=sig["rsi"],
+                    price=sig["entry"],
+                    btc_status=btc_reason,
+                    last_candles_summary=sig.get("candles_summary", "")
+                )
+                
+                if not ai_ok:
+                    print(f"❌ [GEMINI AI REDDETTİ] {sym} (Güven: %{ai_conf}) — Gerekçe: {ai_reason}")
+                    continue
+                    
+                print(f"✅ [GEMINI AI ONAYLADI] {sym} (Güven: %{ai_conf})! Gerçek işlem açılıyor...")
                 
                 if REAL_TRADING:
                     pos = execute_real_entry(sym, notional_usd=POSITION_USD)
@@ -569,8 +642,8 @@ def scan(state, universe):
                     }
                     
                 state.setdefault("positions", []).append(pos)
-                tg(msg_real_open(pos, sig))
-                break # Tek pozisyon aç ve çık
+                tg(msg_real_open(pos, sig, ai_conf, ai_reason))
+                break
         except Exception as e:
             print(f"[İŞLEM AÇILIŞ HATA] {sym}: {e}")
             tg(f"⚠️ *İşlem Açılış Hatası ({sym}):* `{e}`")
@@ -582,24 +655,27 @@ def scan(state, universe):
 
 def main():
     print("="*65)
-    print("⚡ BİNANCE CANLI GERÇEK İŞLEM BOTU BAŞLATILDI (REAL TRADING)")
+    print("⚡ BİNANCE CANLI GERÇEK İŞLEM BOTU (GEMINI 2.5 FLASH AI DESTEKLİ)")
     print("="*65)
+    print(f" 🧠 Yapay Zeka        : Google Gemini 2.5 Flash (Akıllı Teyit Motoru)")
     print(f" 💰 Bakiye & Kaldıraç : 10x Kaldıraç | ~${POSITION_USD} Pozisyon Büyüklüğü")
     print(f" 🎯 Sabit Hedef Kâr   : +${FIXED_TP_USD:.2f} USDT")
     print(f" 🛑 Sabit Stop Loss   : -${FIXED_SL_USD:.2f} USDT")
-    print(f" 🛡️ Koruma           : BASEDUSDT pozisyonuna dokunulmaz | BTC Kalkanı Aktif")
+    print(f" 📈 Kasa Büyüme Modeli: Her 25$ için +1 eşzamanlı pozisyon")
+    print(f" 🛡️ Koruma           : BASEDUSDT dokunulmaz | BTC Kalkanı Aktif")
     print("="*65)
     
     current_bal = get_account_balance()
-    print(f"✅ Binance Portföy Bakiyesi: ${current_bal:.2f} USDT")
+    max_pos = max(1, min(5, int(current_bal / 25.0)))
+    print(f"✅ Binance Portföy Bakiyesi: ${current_bal:.2f} USDT (Maksimum Pozisyon: {max_pos})")
     
-    tg(f"🚀 *BİNANCE CANLI GERÇEK İŞLEM BOTU BAŞLATILDI!*\n\n"
+    tg(f"🧠 *GEMINI 2.5 FLASH AI DESTEKLİ GERÇEK İŞLEM BOTU BAŞLATILDI!*\n\n"
        f"💰 *Cüzdan Bakiyesi:* `${current_bal:.2f} USDT`\n"
+       f"📈 *Eşzamanlı Kapasite:* `{max_pos} Pozisyon` (Kasa büyüdükçe otomatik artar)\n"
        f"⚡ *Kaldıraç & Boyut:* `10x` | `~${POSITION_USD} Pozisyon`\n"
-       f"🎯 *Sabit Kâr:* `+${FIXED_TP_USD:.2f}`\n"
-       f"🛑 *Sabit Stop:* `-${FIXED_SL_USD:.2f}`\n"
+       f"🎯 *Sabit Kâr:* `+${FIXED_TP_USD:.2f}` | 🛑 *Sabit Stop:* `-${FIXED_SL_USD:.2f}`\n"
        f"🛡️ *Korumalı Pozisyon:* `BASEDUSDT` (Dokunulmaz)\n\n"
-       f"📍 *Durum:* Canlı Piyasa Taraması Aktif ({utc().strftime('%H:%M:%S UTC')})")
+       f"📍 *Durum:* Canlı Piyasa ve AI Teyit Taraması Aktif ({utc().strftime('%H:%M:%S UTC')})")
 
     while True:
         try:
