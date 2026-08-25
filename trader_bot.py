@@ -42,8 +42,8 @@ LEVERAGE         = int(os.getenv("LEVERAGE", "10"))          # 10x Kaldıraç
 SCAN_EVERY       = int(os.getenv("SCAN_EVERY_SECONDS", "25"))
 MAX_HOLD_MIN     = 720 # 12 Saat maksimum bekleme
 
-# MANUEL POZİSYON KORUMASI (Bot bu sembollere asla dokunmaz)
-PROTECTED_SYMBOLS = {"BASEDUSDT", "BASED"}
+# MANUEL POZİSYON KORUMASI VE HANTAL COİN KARA LİSTESİ (Bot bu sembollere asla girmez)
+PROTECTED_SYMBOLS = {"BASEDUSDT", "BASED", "TRXUSDT", "TRX", "FDUSDUSDT", "USDCUSDT"}
 
 # LİKİDİTE VE TEKNİK FİLTRELER
 MIN_VOL_USD      = 5_000_000.0
@@ -530,10 +530,25 @@ def record_trade(pos, exit_price, pnl, reason, dur_sec):
 
 # ── ANLIK MONİTÖR & TRAILING KÂR MOTORU ──────────────────────────────────────
 
+def get_real_open_symbols():
+    try:
+        positions = binance_signed_request("GET", "/papi/v1/um/positionRisk")
+        return {p.get("symbol") for p in positions if float(p.get("positionAmt", 0)) != 0}
+    except Exception:
+        return None
+
 def monitor(state):
+    real_open = get_real_open_symbols()
     still = []
+    
     for pos in state.get("positions", []):
         sym = pos["sym"]
+        
+        # Eğer pozisyon Binance üzerinde manuel kapatılmışsa durumdan temizle
+        if real_open is not None and sym not in real_open:
+            print(f"ℹ️ [{sym}] Binance üzerinde kapatılmış, takip listesinden çıkarıldı.")
+            continue
+            
         try: price = last_price(sym)
         except Exception:
             still.append(pos); continue
