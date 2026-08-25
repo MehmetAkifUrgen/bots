@@ -1,10 +1,10 @@
 """
-trader_bot.py — Yapay Zekalı (Gemini 2.5 Flash) & Dinamik Korumalı Binance Vadeli Botu
+trader_bot.py — Yapay Zekalı (Gemini 2.5 Flash) & Dinamik Oransal Korumalı Binance Vadeli Botu
 • Hesap: Portfolio Margin (PAPI) & Futures Uyumlu
-• Kasa Yönetimi: Kasa arttıkça/azaldıkça dinamik pozisyon büyüklüğü (~%70 serbest teminat * 10x)
-• Trailing Take Profit: Minimum +$3.00'da devreye girer, kâr yükseldikçe izler ve zirveden çeker
-• Hızlı Stop Loss: 1 saniyelik anlık izleme ile sabit -$1.50 stop (Kayma ve gecikme engellendi)
-• Koruma: BASEDUSDT dokunulmaz | BTC Düşüş Kalkanı aktif | Gemini 2.5 Flash AI Teyitli
+• Kasa & Pozisyon Yönetimi: Kasa durumuna göre dinamik pozisyon büyüklüğü (~%70 serbest teminat * 10x)
+• Dinamik Oransal Kâr (Trailing TP): Pozisyon büyüklüğüne göre orantılı kâr hedefi (~%1.3 kârda Trailing başlar)
+• Hızlı Anlık İzleme: 1.5 saniyelik ultra hızlı döngü ile kaymasız Breakeven, SL ve Trailing TP
+• Koruma: BASEDUSDT dokunulmaz | BTC Düşüş Kalkanı aktif | Gemini 2.5 Flash AI Teyitli | Proxy Desteği
 """
 
 import hashlib
@@ -39,11 +39,8 @@ DB          = os.getenv("TRADE_DB",   "trade_db.json")
 # ── STRATEJİ VE RİSK PARAMETRELERİ ───────────────────────────────────────────
 REAL_TRADING     = os.getenv("REAL_TRADING", "true").lower() == "true"
 LEVERAGE         = int(os.getenv("LEVERAGE", "10"))          # 10x Kaldıraç
-MIN_TP_USD       = 3.00  # Trailing Kâr Alımın devreye gireceği MİNİMUM kâr (+3.00$)
-TRAILING_DROP_USD= 0.75  # Zirve kârdan 0.75$ geri çekilirse pozisyonu kapat ve kârı al
-BASE_SL_USD      = 1.50  # Maksimum Zarar Kes (-1.50$)
-BE_PROFIT_USD    = 1.50  # +1.50$ kâr görüldüğünde Stop maliyete çekilir (Sıfır Risk)
-MAX_HOLD_MIN     = 720   # 12 Saat maksimum bekleme
+SCAN_EVERY       = int(os.getenv("SCAN_EVERY_SECONDS", "25"))
+MAX_HOLD_MIN     = 720 # 12 Saat maksimum bekleme
 
 # MANUEL POZİSYON KORUMASI (Bot bu sembollere asla dokunmaz)
 PROTECTED_SYMBOLS = {"BASEDUSDT", "BASED"}
@@ -63,6 +60,13 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json"
 }
+
+PROXY_URL   = os.getenv("FIXIE_URL") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or ""
+
+def get_proxies():
+    if PROXY_URL:
+        return {"http": PROXY_URL, "https": PROXY_URL}
+    return None
 
 def utc():  return datetime.now(timezone.utc)
 def ts():   return utc().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -130,13 +134,6 @@ SADECE aşağıdaki JSON formatında yanıt ver:
     return True, 75, "Teknik teyitle devam ediliyor."
 
 # ── BINANCE API İSTEMCİSİ ───────────────────────────────────────────────────
-
-PROXY_URL   = os.getenv("FIXIE_URL") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or ""
-
-def get_proxies():
-    if PROXY_URL:
-        return {"http": PROXY_URL, "https": PROXY_URL}
-    return None
 
 def get_public_json(endpoint, p=None):
     hosts = [FAPI_BASE, "https://fapi.binance.com", "https://fapi1.binance.com", "https://fapi2.binance.com"]
@@ -350,7 +347,7 @@ def analyze_market_candidate(sym):
     except Exception:
         return None
 
-# ── DİNAMİK KASA BÜYÜKLÜĞÜ VE GERÇEK EMİR MOTORU ─────────────────────────────
+# ── DİNAMİK ORANSAL KÂR & EMİR MOTORU ────────────────────────────────────────
 
 def set_leverage(sym, lev=10):
     try: binance_signed_request("POST", "/papi/v1/um/leverage", {"symbol": sym, "leverage": lev})
@@ -358,9 +355,8 @@ def set_leverage(sym, lev=10):
 
 def execute_real_entry(sym, available_balance):
     """
-    Kasa durumuna göre dinamik pozisyon büyüklüğü belirleyip gerçek işlem açar.
+    Kasa ve pozisyon büyüklüğüne göre dinamik oransal kâr ve stop hedefleri belirler.
     """
-    # Kasanın %70'ini teminat olarak kullanıp 10x kaldıraçla pozisyon açar
     usable_margin = max(10.0, available_balance * 0.70)
     notional_usd = usable_margin * LEVERAGE
     
@@ -378,24 +374,35 @@ def execute_real_entry(sym, available_balance):
         "symbol": sym, "side": "BUY", "type": "MARKET", "quantity": str(qty)
     }
     
-    print(f"⚡ [GERÇEK EMİR AÇILIYOR] {sym} | Miktar: {qty} | Notional: ~${qty*price:.2f} (Kasa: ${available_balance:.2f})")
+    actual_notional = qty * price
+    print(f"⚡ [GERÇEK EMİR AÇILIYOR] {sym} | Miktar: {qty} | Notional: ~${actual_notional:.2f} (Kasa: ${available_balance:.2f})")
     order_res = binance_signed_request("POST", "/papi/v1/um/order", order_params)
     
     avg_price = float(order_res.get("avgPrice", 0))
     if avg_price <= 0: avg_price = price
         
-    # Kasa bazlı dinamik Stop Loss (En fazla kasanın %5'i veya 1.50$)
-    dyn_sl_usd = min(BASE_SL_USD, max(0.80, available_balance * 0.05))
+    # DİNAMİK ORANSAL HEDEFLER (Pozisyon büyüklüğüne göre ayarlanır):
+    # Trailing TP Tetikleme: Pozisyonun ~%1.2 - %1.4'ü (Örn: 220$'da 2.50$ - 3.00$, 150$'da 1.80$)
+    dyn_tp_trigger_usd = max(1.80, round(actual_notional * 0.013, 2))
+    # Breakeven Tetikleme: Pozisyonun ~%0.7'si (Örn: 220$'da 1.50$, 150$'da 1.00$)
+    dyn_be_trigger_usd = max(0.80, round(actual_notional * 0.007, 2))
+    # Stop Loss: Pozisyonun ~%0.7'si (En fazla 1.50$ kayıp)
+    dyn_sl_usd = min(1.50, max(0.80, round(actual_notional * 0.007, 2)))
+    # Trailing Geri Çekilme Payı: Kâr hedefinin %25'i (Örn: 0.60$ - 0.75$)
+    dyn_trailing_drop_usd = max(0.40, round(dyn_tp_trigger_usd * 0.25, 2))
     
     sl_price = avg_price - (dyn_sl_usd / qty)
-    be_trigger_price = avg_price + (BE_PROFIT_USD / qty)
+    be_trigger_price = avg_price + (dyn_be_trigger_usd / qty)
     be_sl_price = avg_price + (0.30 / qty)
     
     return {
         "sym": sym, "side": "LONG", "entry": avg_price, "qty": qty,
-        "notional_usd": round(qty * avg_price, 2),
+        "notional_usd": round(actual_notional, 2),
         "sl_price": sl_price,
         "dyn_sl_usd": dyn_sl_usd,
+        "dyn_tp_trigger_usd": dyn_tp_trigger_usd,
+        "dyn_be_trigger_usd": dyn_be_trigger_usd,
+        "dyn_trailing_drop_usd": dyn_trailing_drop_usd,
         "be_trigger_price": be_trigger_price,
         "be_sl_price": be_sl_price,
         "trailing_active": False,
@@ -435,9 +442,9 @@ def msg_real_open(pos, sig, ai_conf, ai_reason):
         f"Yön: *LONG (10x Kaldıraç)*\n"
         f"Giriş Fiyatı : `{fp(pos['entry'])}`\n"
         f"Pozisyon Büyüklüğü : `${pos['notional_usd']}` ({pos['qty']} adet)\n\n"
-        f"📈 *Trailing Kâr Alımı:* Minimum `+${MIN_TP_USD:.2f}` geçilince devreye girer (Limitsiz Kâr)\n"
-        f"🛑 *Sabit Stop Loss:* `-${pos['dyn_sl_usd']:.2f}` (`{fp(pos['sl_price'])}`)\n"
-        f"🔰 *Sıfır Risk (+1.50$ kârda):* Stop maliyete çekilir\n\n"
+        f"📈 *Dinamik Trailing Kâr:* `+${pos['dyn_tp_trigger_usd']:.2f}` geçilince başlar (Limitsiz Kâr!)\n"
+        f"🛑 *Dinamik Stop Loss:* `-${pos['dyn_sl_usd']:.2f}` (`{fp(pos['sl_price'])}`)\n"
+        f"🔰 *Sıfır Risk (+${pos['dyn_be_trigger_usd']:.2f} kârda):* Stop maliyete çekilir\n\n"
         f"🧠 *Gemini 2.5 Flash AI Teyidi:* `%{ai_conf} Güven`\n"
         f"💬 *AI Gerekçesi:* _{ai_reason}_\n\n"
         f"*Teknik Gerekçeler:*\n{lines}\n\n"
@@ -497,7 +504,7 @@ def record_trade(pos, exit_price, pnl, reason, dur_sec):
     save_db(trades)
     return trades
 
-# ── HIZLI ANLIK MONİTÖR & TRAILING KÂR ALIM MOTORU ───────────────────────────
+# ── ANLIK MONİTÖR & TRAILING KÂR MOTORU ──────────────────────────────────────
 
 def monitor(state):
     still = []
@@ -517,26 +524,29 @@ def monitor(state):
             pos["highest_profit_usd"] = unrealized_pnl
             
         highest_pnl = pos["highest_profit_usd"]
+        dyn_tp_trigger = pos.get("dyn_tp_trigger_usd", 2.50)
+        dyn_be_trigger = pos.get("dyn_be_trigger_usd", 1.20)
+        dyn_trailing_drop = pos.get("dyn_trailing_drop_usd", 0.60)
         
-        # 1. TRAILING TAKE PROFIT AKTİVASYONU (+3.00$ kâra ulaşıldığında devreye girer)
-        if unrealized_pnl >= MIN_TP_USD or pos.get("trailing_active"):
+        # 1. TRAILING TAKE PROFIT AKTİVASYONU (Oransal kâra ulaşıldığında devreye girer)
+        if unrealized_pnl >= dyn_tp_trigger or pos.get("trailing_active"):
             if not pos.get("trailing_active"):
                 pos["trailing_active"] = True
-                tg(f"🚀 *{sym}* +${unrealized_pnl:.2f} kâra ulaştı! *Trailing Kâr Takibi Aktif Edildi!* Fiyat yükseldikçe kâr sürülecek.")
+                tg(f"🚀 *{sym}* +${unrealized_pnl:.2f} kâra ulaştı! *Trailing Kâr Takibi Aktif Edildi!* Fiyat yükseldikçe kâr sürülüyor.")
                 
-            # Zirveden 0.75$ geri çekilme stopu
-            trailing_exit_pnl = highest_pnl - TRAILING_DROP_USD
+            # Zirveden geri çekilme stopu
+            trailing_exit_pnl = highest_pnl - dyn_trailing_drop
             trailing_exit_price = entry + (trailing_exit_pnl / qty)
             pos["trailing_sl_price"] = max(pos.get("trailing_sl_price", pos["sl_price"]), trailing_exit_price)
             
-        # 2. BREAKEVEN KORUMASI (+1.50$ kârda stop maliyet + komisyon payına çekilir)
-        if not pos.get("be_hit") and (price >= pos["be_trigger_price"] or unrealized_pnl >= BE_PROFIT_USD):
+        # 2. BREAKEVEN KORUMASI (Oransal +%0.7 kârda stop maliyet + komisyon payına çekilir)
+        if not pos.get("be_hit") and (price >= pos.get("be_trigger_price", entry * 1.008) or unrealized_pnl >= dyn_be_trigger):
             pos["sl_price"] = pos["be_sl_price"]
             pos["be_hit"] = True
             tg(f"🔰 *{sym}* +${unrealized_pnl:.2f} kâra ulaştı! Stop maliyete (`{fp(pos['sl_price'])}`) çekildi. *İşlem artık sıfır risklidir!*")
 
         reason = None
-        # Trailing Kâr Tetiklenmesi (Zirveden çekildiğinde kârı al)
+        # Trailing Kâr Tetiklenmesi (Zirveden çekilince sat)
         if pos.get("trailing_active") and price <= pos["trailing_sl_price"]:
             reason = "TRAILING_TP"
         # Stop Loss veya Breakeven Stop
@@ -605,7 +615,9 @@ def scan(state, universe):
                         "sym": sym, "side": "LONG", "entry": sig["entry"],
                         "qty": round(200.0 / sig["entry"], 2),
                         "notional_usd": 200.0, "sl_price": sig["entry"] * 0.993,
-                        "dyn_sl_usd": 1.50, "be_trigger_price": sig["entry"] * 1.008,
+                        "dyn_sl_usd": 1.50, "dyn_tp_trigger_usd": 2.50,
+                        "dyn_be_trigger_usd": 1.20, "dyn_trailing_drop_usd": 0.60,
+                        "be_trigger_price": sig["entry"] * 1.008,
                         "be_sl_price": sig["entry"] * 1.001, "trailing_active": False,
                         "highest_profit_usd": 0.0, "trailing_sl_price": sig["entry"] * 0.993,
                         "opened_iso": utc().isoformat(), "opened_ts": ts(), "be_hit": False
@@ -621,16 +633,16 @@ def scan(state, universe):
         
     return state
 
-# ── ANA DÖNGÜ (HIZLI ANLIK İZLEME MOTORU) ────────────────────────────────────
+# ── ANA DÖNGÜ ────────────────────────────────────────────────────────────────
 
 def main():
     print("="*65)
-    print("⚡ BİNANCE GERÇEK İŞLEM BOTU (GEMINI 2.5 FLASH & TRAILING KÂR)")
+    print("⚡ BİNANCE GERÇEK İŞLEM BOTU (GEMINI 2.5 FLASH & DİNAMİK ORANSAL KÂR)")
     print("="*65)
     print(" 🧠 Yapay Zeka         : Google Gemini 2.5 Flash Onay Motoru")
-    print(" 💸 Trailing Kâr Alım  : Min +$3.00'dan sonra sınırsız kâr takibi")
-    print(" 🛑 Hızlı Stop Loss    : 1 saniyelik anlık izleme ile sabit -$1.50")
-    print(" 📈 Dinamik Kasa       : Bakiye değiştikçe pozisyon ve stop otomatik ölçeklenir")
+    print(" 💸 Dinamik Trailing   : Pozisyona orantılı (~%1.3) kâr hedefi ve limitsiz sürüş")
+    print(" 🛑 Hızlı Stop Loss    : 1.5 saniyelik anlık izleme ile sıfır kaymalı çıkış")
+    print(" 📈 Dinamik Kasa       : Bakiye azaldıkça/arttıkça pozisyon ve kâr orantılanır")
     print(" 🛡️ Koruma             : BASEDUSDT dokunulmaz | BTC Kalkanı Aktif")
     print("="*65)
     
@@ -638,11 +650,11 @@ def main():
     max_pos = max(1, min(5, int(current_bal / 25.0)))
     print(f"✅ Portföy Bakiyesi: ${current_bal:.2f} USDT (Eşzamanlı Kapasite: {max_pos} İşlem)")
     
-    tg(f"🚀 *YAPAY ZEKA VE TRAILING KÂR DESTEKLİ BOT GÜNCELLENDİ!*\n\n"
+    tg(f"🚀 *DİNAMİK ORANSAL KÂR & GEMINI AI BOT GÜNCELLENDİ!*\n\n"
        f"💰 *Güncel Kasa:* `${current_bal:.2f} USDT`\n"
-       f"💸 *Kâr Kuralı:* Minimum `+${MIN_TP_USD:.2f}` görüldüğünde *Trailing Kâr Takibi* başlar (Limitsiz Kâr!)\n"
-       f"🛑 *Stop Loss:* `-${BASE_SL_USD:.2f}` (Hızlı 1 saniyelik anlık takip)\n"
-       f"📈 *Dinamik Boyutlandırma:* Kasa azaldıkça veya arttıkça pozisyonlar otomatik ayarlanır.\n\n"
+       f"📈 *Dinamik Kâr Kuralı:* Pozisyon büyüklüğüne göre orantılı (~%1.3) kârda *Trailing Kâr Takibi* başlar.\n"
+       f"🛑 *Stop Loss:* 1.5 saniyelik ultra hızlı takiple sıfır gecikme.\n"
+       f"🛡️ *Korumalı:* `BASEDUSDT` dokunulmaz | BTC Kalkanı devrede.\n\n"
        f"📍 *Durum:* Canlı Piyasa Taraması Aktif ({utc().strftime('%H:%M:%S UTC')})")
 
     last_scan_time = 0
@@ -650,13 +662,11 @@ def main():
         try:
             state = load_st()
             
-            # Açık pozisyon varsa her 1.5 saniyede bir ultra hızlı kontrol et (Kaymayı engellemek için)
             if state.get("positions"):
                 state = monitor(state)
                 save_st(state)
                 time.sleep(1.5)
             else:
-                # Açık pozisyon yoksa 20 saniyede bir yeni sinyal tara
                 now = time.time()
                 if now - last_scan_time >= 20:
                     universe = get_universe()
