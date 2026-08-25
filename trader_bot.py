@@ -682,16 +682,25 @@ def main():
        f"📍 *Durum:* Canlı Piyasa Taraması Aktif ({utc().strftime('%H:%M:%S UTC')})")
 
     last_scan_time = 0
+    last_heartbeat_time = 0
+    
     while True:
         try:
             state = load_st()
+            now = time.time()
+            
+            # Her 60 saniyede bir Railway loglarına durum bildirimi yaz
+            if now - last_heartbeat_time >= 60:
+                current_bal = get_account_balance()
+                open_count = len(state.get("positions", []))
+                print(f"💓 [CANLI DURUM] Kasa: ${current_bal:.2f} USDT | Açık Bot Pozisyonu: {open_count} | Saat: {utc().strftime('%H:%M:%S UTC')}", flush=True)
+                last_heartbeat_time = now
             
             if state.get("positions"):
                 state = monitor(state)
                 save_st(state)
                 time.sleep(1.5)
             else:
-                now = time.time()
                 if now - last_scan_time >= 20:
                     universe = get_universe()
                     state = scan(state, universe)
@@ -700,7 +709,7 @@ def main():
                 time.sleep(1.0)
                 
         except Exception as e:
-            print(f"[HATA] Ana Döngü: {e}")
+            print(f"[HATA] Ana Döngü: {e}", flush=True)
             time.sleep(2.0)
 
 if __name__ == "__main__":
