@@ -131,13 +131,21 @@ SADECE aşağıdaki JSON formatında yanıt ver:
 
 # ── BINANCE API İSTEMCİSİ ───────────────────────────────────────────────────
 
+PROXY_URL   = os.getenv("FIXIE_URL") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or ""
+
+def get_proxies():
+    if PROXY_URL:
+        return {"http": PROXY_URL, "https": PROXY_URL}
+    return None
+
 def get_public_json(endpoint, p=None):
     hosts = [FAPI_BASE, "https://fapi.binance.com", "https://fapi1.binance.com", "https://fapi2.binance.com"]
     last_err = None
+    proxies = get_proxies()
     for h in hosts:
         url = endpoint if endpoint.startswith("http") else f"{h}{endpoint}"
         try:
-            r = requests.get(url, params=p, headers=HEADERS, timeout=15)
+            r = requests.get(url, params=p, headers=HEADERS, proxies=proxies, timeout=15)
             if r.status_code == 200: return r.json()
             last_err = f"HTTP {r.status_code}"
         except Exception as e:
@@ -155,10 +163,11 @@ def binance_signed_request(method, path, params=None):
     sig = hmac.new(API_SECRET.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
     url = f"{PAPI_BASE}{path}?{query}&signature={sig}"
     auth_headers = {**HEADERS, "X-MBX-APIKEY": API_KEY}
+    proxies = get_proxies()
     
-    if method.upper() == "GET": r = requests.get(url, headers=auth_headers, timeout=20)
-    elif method.upper() == "POST": r = requests.post(url, headers=auth_headers, timeout=20)
-    elif method.upper() == "DELETE": r = requests.delete(url, headers=auth_headers, timeout=20)
+    if method.upper() == "GET": r = requests.get(url, headers=auth_headers, proxies=proxies, timeout=20)
+    elif method.upper() == "POST": r = requests.post(url, headers=auth_headers, proxies=proxies, timeout=20)
+    elif method.upper() == "DELETE": r = requests.delete(url, headers=auth_headers, proxies=proxies, timeout=20)
     else: raise ValueError(f"Geçersiz method: {method}")
         
     if r.status_code != 200:
