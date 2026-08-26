@@ -240,14 +240,20 @@ def msg_real_open(pos, sig, ai_conf, ai_reason):
     icon = "🎯" if sig.get("mode") == "DİP_AVCISI" else "🚀"
     lines = "\n".join(f"  • {r}" for r in sig.get("reasons", []))
     lev = pos.get("leverage", DEFAULT_LEVERAGE)
+    tp_val = float(pos.get("dyn_tp_trigger_usd", DEFAULT_TP_TRIGGER_USD))
+    drop_val = float(pos.get("dyn_trailing_drop_usd", DEFAULT_TRAILING_DROP))
+    lock_val = tp_val - drop_val
+    sl_val = float(pos.get("dyn_sl_usd", DEFAULT_SL_USD))
+    be_val = float(pos.get("dyn_be_trigger_usd", DEFAULT_BE_TRIGGER_USD))
+    
     return (
         f"{icon} *GERÇEK POZİSYON AÇILDI!* | `{pos['sym']}`\n\n"
         f"Yön: *LONG ({lev}x Kaldıraç)*\n"
         f"Giriş Fiyatı : `{fp(pos['entry'])}`\n"
         f"Pozisyon Büyüklüğü : `${pos['notional_usd']}` ({pos['qty']} adet)\n\n"
-        f"📈 *Trailing Kâr:* `+${pos['dyn_tp_trigger_usd']:.2f}` geçilince başlar (+${pos['dyn_tp_trigger_usd'] - pos['dyn_trailing_drop_usd']:.2f} kilitlenir)\n"
-        f"🛑 *Stop Loss:* `-${pos['dyn_sl_usd']:.2f}` (`{fp(pos['sl_price'])}`)\n"
-        f"🔰 *Sıfır Risk (+${pos['dyn_be_trigger_usd']:.2f} kârda):* Stop maliyete çekilir\n\n"
+        f"📈 *Trailing Kâr:* `+${tp_val:.2f}` geçilince başlar (+${lock_val:.2f} kilitlenir)\n"
+        f"🛑 *Stop Loss:* `-${sl_val:.2f}` (`{fp(pos['sl_price'])}`)\n"
+        f"🔰 *Sıfır Risk (+${be_val:.2f} kârda):* Stop maliyete çekilir\n\n"
         f"🧠 *Gemini 2.5 Flash AI Teyidi:* `%{ai_conf} Güven`\n"
         f"💬 *AI Gerekçesi:* _{ai_reason}_\n\n"
         f"*Teknik Gerekçeler:*\n{lines}\n\n"
@@ -256,20 +262,24 @@ def msg_real_open(pos, sig, ai_conf, ai_reason):
 
 def msg_real_close(pos, exit_price, pnl, reason, dur_sec):
     icon = "🟢" if pnl >= 0 else "🔴"
+    abs_pnl = abs(pnl)
     title = {
         "TRAILING_TP": f"💸 TRAILING KÂR ALINDI (+${pnl:.2f})",
-        "STOP_LOSS": f"❌ STOP OLDU (-${abs(pnl):.2f})",
+        "STOP_LOSS": f"❌ STOP OLDU (-${abs_pnl:.2f})",
         "BREAKEVEN": "🔰 BAŞA BAŞ KAPANDI (Sıfır Risk)",
         "TIMEOUT": "⏱️ SÜRE DOLDU"
     }.get(reason, reason)
     
     eq, free_m = get_account_balances()
+    highest_pnl = float(pos.get("highest_profit_usd", pnl))
+    dur_min = dur_sec // 60
+    
     return (
         f"{icon} *{title}* | `{pos['sym']}`\n\n"
         f"Giriş : `{fp(pos['entry'])}` → Çıkış: `{fp(exit_price)}`\n"
         f"Net P&L : *`${pnl:+.2f} USDT`*\n"
-        f"Görülen Zirve Kâr : `+${pos.get('highest_profit_usd', pnl):.2f}`\n"
-        f"İşlem Süresi : `{dur_sec//60} dakika`\n"
+        f"Görülen Zirve Kâr : `+${highest_pnl:.2f}`\n"
+        f"İşlem Süresi : `{dur_min} dakika`\n"
         f"💰 *Güncel Varlık:* `${eq:.2f} USDT` (Serbest: `${free_m:.2f}`)\n\n"
         f"Zaman: `{ts()}`"
     )
