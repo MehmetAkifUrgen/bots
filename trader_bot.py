@@ -654,7 +654,7 @@ def scan(state, universe):
         return state
         
     # Yetersiz serbest teminat koruması (-2019 hatasını önler)
-    if free_margin < 9.0:
+    if free_margin < 5.0:
         return state
         
     btc_ok, btc_reason = check_btc_shield()
