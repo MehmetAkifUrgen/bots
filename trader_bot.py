@@ -239,9 +239,10 @@ def execute_real_close(pos, reason):
 def msg_real_open(pos, sig, ai_conf, ai_reason):
     icon = "🎯" if sig.get("mode") == "DİP_AVCISI" else "🚀"
     lines = "\n".join(f"  • {r}" for r in sig.get("reasons", []))
+    lev = pos.get("leverage", DEFAULT_LEVERAGE)
     return (
         f"{icon} *GERÇEK POZİSYON AÇILDI!* | `{pos['sym']}`\n\n"
-        f"Yön: *LONG (10x Kaldıraç)*\n"
+        f"Yön: *LONG ({lev}x Kaldıraç)*\n"
         f"Giriş Fiyatı : `{fp(pos['entry'])}`\n"
         f"Pozisyon Büyüklüğü : `${pos['notional_usd']}` ({pos['qty']} adet)\n\n"
         f"📈 *Trailing Kâr:* `+${pos['dyn_tp_trigger_usd']:.2f}` geçilince başlar (+${pos['dyn_tp_trigger_usd'] - pos['dyn_trailing_drop_usd']:.2f} kilitlenir)\n"
