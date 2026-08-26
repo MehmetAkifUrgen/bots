@@ -1,6 +1,7 @@
 """
-trader_bot.py — Saf Trend & Kırılım Odaklı (SADECE LONG) Yapay Zekalı Binance Vadeli Botu
-• İşlem Yönü: SADECE LONG (Yükseliş trendindeki geri çekilmeler ve hacimli direnç kırılımları)
+trader_bot.py — Basamak Akümülasyonu (Staircase) & Hacimli Kırılım LONG Vadeli Botu
+• 1. Strateji: BASAMAK_AKUMULASYONU (Sıkışan dipler, daralan Bollinger, sessiz tırmanış LONG)
+• 2. Strateji: BREAKOUT_LONG (24s Direnç Kırılımı & Hacim Patlaması)
 • Kaldıraç: 20x - 25x Dinamik Kaldıraç ($250 Pozisyon için sadece ~$12.50 teminat)
 • Hedef Pozisyon: Tam $250.00 USDT
 • Net Trailing Stop: +$2.00 kârda devreye girer ve stopu hemen +$1.00 kâra kilitler (Zirveden $1.00 çekilince satar)
@@ -106,12 +107,12 @@ def gemini_ai_validate(sym, mode, rsi, price, btc_status, last_candles_summary):
 Sen dünyanın en disiplinli ve profesyonel Kripto Vadeli Scalp Uzmanısın.
 Botumuz Binance vadeli işlemlerde 20x kaldıraç ile $250 büyüklüğünde LONG pozisyonuna girmek üzere.
 
-Parite: {sym} | Yön: LONG | Strateji: {mode} | Fiyat: {price} | 15m RSI: {rsi:.1f}
+Parite: {sym} | Strateji: {mode} | Fiyat: {price} | 15m RSI: {rsi:.1f}
 BTC Durumu: {btc_status}
 Son Mumlar: {last_candles_summary}
 
-GÖREV: Bu sinyalin sahte bir tuzak mı yoksa yüksek olasılıklı bir LONG kâr fırsatı mı olduğunu ÇOK SIKI değerlendir.
-Düşüş riski yüksekse veya tuzaksa REJECT ver. Sadece çok net fırsatları APPROVE et.
+GÖREV: Bu paritedeki basamak yapısının / kırılımın güçlü bir LONG kâr fırsatı olup olmadığını değerlendir.
+Şüpheli bir tuzak veya sert çöküş riski varsa REJECT ver. Sadece net ve kaliteli fırsatları APPROVE et.
 
 SADECE aşağıdaki JSON formatında yanıt ver:
 {{
@@ -319,73 +320,76 @@ def get_universe():
         print(f"[UNIVERSE HATA] {e}", flush=True)
         return []
 
-# ── SADECE LONG SİNYAL MOTORU (TREND & BREAKOUT) ─────────────────────────────
+# ── BASAMAK AKÜMÜLASYONU VE KIRILIM SİNYAL MOTORU ────────────────────────────
 
 def analyze_market_candidate(sym):
     """
-    SADECE Yükseliş Trendindeki pariteleri inceler:
-    1. Trend İçi Dip Alımı (Pullback Bounce LONG)
-    2. Hacimli Direnç Kırılımı (Momentum Breakout LONG - %100 Backtest Başarılı)
+    1. BASAMAK AKÜMÜLASYONU (BASED Tarzı Yükselen Dipler + Dar Sıkışma)
+    2. MOMENTUM BREAKOUT (24s Zirve Kırılımı + Hacim Patlaması)
     """
     try:
-        df1h = klines(sym, "1h", 45)
-        if len(df1h) < 30: return None
+        df15m = klines(sym, "15m", 60)
+        if len(df15m) < 48: return None
         
-        df15m = klines(sym, "15m", 45)
-        if len(df15m) < 30: return None
-        
-        c1h = df1h['c'].iloc[-1]
-        ema20_1h = df1h['c'].ewm(span=20, adjust=False).mean().iloc[-1]
-        ema50_1h = df1h['c'].ewm(span=50, adjust=False).mean().iloc[-1]
-        
-        # SADECE 1 Saatlikte Yükseliş Trendinde Olan Pariteler
-        if c1h <= ema50_1h or ema20_1h < ema50_1h:
-            return None
-            
         c15 = df15m.iloc[-1]
         c, o, h, l = c15['c'], c15['o'], c15['h'], c15['l']
         rsi_15m = calc_rsi(df15m['c'], 14)
         
+        sma20 = df15m['c'].rolling(20).mean().iloc[-1]
+        std20 = df15m['c'].rolling(20).std().iloc[-1]
+        bb_width = (2.0 * std20) / sma20 * 100
+        
+        ema20 = df15m['c'].ewm(span=20, adjust=False).mean().iloc[-1]
+        ema50 = df15m['c'].ewm(span=50, adjust=False).mean().iloc[-1]
+        
         last_3_candles = [f"M{idx+1}: O={row['o']:.4f} C={row['c']:.4f} H={row['h']:.4f} L={row['l']:.4f}" for idx, row in df15m.iloc[-3:].iterrows()]
         candles_summary = " | ".join(last_3_candles)
         
-        # 1. STRATEJİ: TREND İÇİ DİP DÖNÜŞÜ (PULLBACK BOUNCE LONG)
-        if rsi_15m <= 38.0 and (c >= o or (c - l) > (h - c)):
-            sma20 = df15m['c'].iloc[-20:].mean()
-            std20 = df15m['c'].iloc[-20:].std()
-            lower_bb = sma20 - (2.0 * std20)
-            
-            if l <= lower_bb or c <= sma20:
-                entry = last_price(sym)
-                return {
-                    "sym": sym, "side": "LONG", "mode": "PULLBACK_LONG",
-                    "entry": entry, "rsi": rsi_15m, "candles_summary": candles_summary,
-                    "reasons": [
-                        f"📈 *Trend:* 1h Güçlü Yükseliş Trendi (EMA20 > EMA50)",
-                        f"🎯 *Dip Girişi:* 15m Bollinger Alt Bandından Alıcı Tepkisi (RSI: `{rsi_15m:.1f}`)",
-                        f"🌊 *Yön:* Güçlü trend yönünde LONG"
-                    ]
-                }
-                
-        # 2. STRATEJİ: HACİMLİ DİRENÇ KIRILIMI (BREAKOUT LONG - BACKTEST %100 WIN)
-        if 52.0 <= rsi_15m <= 72.0:
-            max_h24 = df1h['h'].iloc[-24:].max()
-            dist = (c - max_h24) / max_h24 * 100
-            if 0.1 <= dist <= 2.2:
-                vol_avg = df15m['v'].iloc[-20:-2].mean()
-                vol_now = c15['v'] + df15m['v'].iloc[-2]
-                vol_ratio = (vol_now / vol_avg) if vol_avg > 0 else 1.0
-                if vol_ratio >= MIN_VOL_MULTIPLIER:
+        # ── 1. STRATEJİ: BASAMAK AKÜMÜLASYONU (STAIRCASE ACCUMULATION) ──
+        # 12 saati 4 parçaya bölüp dipleri kontrol et: Dip1 < Dip2 < Dip3 < Dip4
+        p1_min = df15m["l"].iloc[-48:-36].min()
+        p2_min = df15m["l"].iloc[-36:-24].min()
+        p3_min = df15m["l"].iloc[-24:-12].min()
+        p4_min = df15m["l"].iloc[-12:].min()
+        
+        if p1_min < p2_min < p3_min < p4_min:
+            # Bollinger Sıkışması dar olmalı (patlamaya hazır akümülasyon)
+            if bb_width <= 4.2 and ema20 >= ema50:
+                # Fiyat EMA20 desteğine yakın ve alıcı mumu yakmışsa
+                if c >= ema20 * 0.997 and 45.0 <= rsi_15m <= 68.0:
+                    step_gain = (p4_min - p1_min) / p1_min * 100
                     entry = last_price(sym)
                     return {
-                        "sym": sym, "side": "LONG", "mode": "BREAKOUT_LONG",
+                        "sym": sym, "side": "LONG", "mode": "BASAMAK_AKUMULASYONU",
                         "entry": entry, "rsi": rsi_15m, "candles_summary": candles_summary,
                         "reasons": [
-                            f"🚀 *Kırılım:* 24s Zirve Kırıldı (Breakout LONG)",
-                            f"🔥 *Hacim:* `{vol_ratio:.1f}x` katı alıcı hacmi",
-                            f"📈 *Trend:* 1h Yükseliş Onaylı"
+                            f"🪜 *Basamak Yapısı:* 4 Kademeli Yükselen Dip (Adım Kazancı: `+%{step_gain:.1f}`)",
+                            f"🎯 *Sıkışma (Squeeze):* Bollinger Bandı Daraldı (`%{bb_width:.1f}`)",
+                            f"📈 *Trend Desteği:* 15m EMA20 üzerinde sessiz tırmanış"
                         ]
                     }
+
+        # ── 2. STRATEJİ: HACİMLİ DİRENÇ KIRILIMI (MOMENTUM BREAKOUT LONG) ──
+        if 52.0 <= rsi_15m <= 74.0 and ema20 > ema50:
+            df1h = klines(sym, "1h", 30)
+            if len(df1h) >= 24:
+                max_h24 = df1h['h'].iloc[-24:].max()
+                dist = (c - max_h24) / max_h24 * 100
+                if 0.1 <= dist <= 2.2:
+                    vol_avg = df15m['v'].iloc[-20:-2].mean()
+                    vol_now = c15['v'] + df15m['v'].iloc[-2]
+                    vol_ratio = (vol_now / vol_avg) if vol_avg > 0 else 1.0
+                    if vol_ratio >= MIN_VOL_MULTIPLIER:
+                        entry = last_price(sym)
+                        return {
+                            "sym": sym, "side": "LONG", "mode": "BREAKOUT_LONG",
+                            "entry": entry, "rsi": rsi_15m, "candles_summary": candles_summary,
+                            "reasons": [
+                                f"🚀 *Kırılım:* 24s Ana Direnç Kırıldı (Breakout LONG)",
+                                f"🔥 *Hacim:* `{vol_ratio:.1f}x` katı güçlü alıcı hacmi",
+                                f"📈 *Trend:* 1h ve 15m EMA20 > EMA50 Onaylı"
+                            ]
+                        }
 
         return None
     except Exception:
@@ -479,7 +483,7 @@ def execute_real_close(pos, reason):
 # ── TELEGRAM BİLDİRİMLERİ ────────────────────────────────────────────────────
 
 def msg_real_open(pos, sig, ai_conf, ai_reason):
-    icon = "🚀" if sig.get("mode") == "BREAKOUT_LONG" else "📈"
+    icon = "🪜" if sig.get("mode") == "BASAMAK_AKUMULASYONU" else "🚀"
     lines = "\n".join(f"  • {r}" for r in sig.get("reasons", []))
     lev = pos.get("leverage", DEFAULT_LEVERAGE)
     tp_val = float(pos.get("dyn_tp_trigger_usd", DEFAULT_TP_TRIGGER_USD))
@@ -490,6 +494,7 @@ def msg_real_open(pos, sig, ai_conf, ai_reason):
     
     return (
         f"{icon} *GERÇEK LONG POZİSYONU AÇILDI!* | `{pos['sym']}`\n\n"
+        f"Strateji: *{sig['mode']}*\n"
         f"Yön: *LONG ({lev}x Kaldıraç)*\n"
         f"Giriş Fiyatı : `{fp(pos['entry'])}`\n"
         f"Pozisyon Büyüklüğü : `${pos['notional_usd']}` ({pos['qty']} adet)\n\n"
@@ -670,7 +675,7 @@ def scan(state, universe):
         try:
             sig = analyze_market_candidate(sym)
             if sig:
-                print(f"\n🔍 [TEKNİK LONG SİNYALİ] {sym} ({sig['mode']})! Gemini 2.5 Flash analiz ediyor...", flush=True)
+                print(f"\n🔍 [TEKNİK SİNYAL] {sym} ({sig['mode']})! Gemini 2.5 Flash analiz ediyor...", flush=True)
                 
                 ai_ok, ai_conf, ai_reason = gemini_ai_validate(
                     sym=sym, mode=sig["mode"], rsi=sig["rsi"],
@@ -714,10 +719,11 @@ def scan(state, universe):
 
 def main():
     print("="*65, flush=True)
-    print("⚡ BİNANCE SAF LONG & TREND AVCISI (GEMINI 2.5 FLASH)", flush=True)
+    print("🪜 BİNANCE BASAMAK AKÜMÜLASYONU & KIRILIM AVCISI (GEMINI 2.5 FLASH)", flush=True)
     print("="*65, flush=True)
     print(" 🧠 Yapay Zeka         : Google Gemini 2.5 Flash (%80+ Güven Filtresi)", flush=True)
-    print(" 📈 Strateji           : SADECE Yükseliş Trendinde LONG (Pullback + Breakout)", flush=True)
+    print(" 🪜 1. Strateji        : BASAMAK AKÜMÜLASYONU (Yükselen Dipler + Dar Sıkışma)", flush=True)
+    print(" 🚀 2. Strateji        : BREAKOUT LONG (24s Direnç Kırılımı + Hacim)", flush=True)
     print(" ⚡ Kaldıraç & Boyut   : 20x - 25x Kaldıraç | Tam $250.00 Pozisyon", flush=True)
     print(" 💸 Trailing Stop      : +$2.00 kârda başlar, +$1.00 kârı kilitler ve sürer", flush=True)
     print(" 🔰 Başa Baş Koruma    : +$1.00 kârda stop maliyete çekilir (Sıfır Risk)", flush=True)
@@ -728,14 +734,15 @@ def main():
     eq, free_m = get_account_balances()
     print(f"✅ Toplam Varlık: ${eq:.2f} USDT | Serbest Teminat: ${free_m:.2f} USDT", flush=True)
     
-    tg(f"🚀 *BİNANCE SAF LONG & TREND AVCISI BAŞLATILDI!*\n\n"
+    tg(f"🚀 *BİNANCE BASAMAK AKÜMÜLASYONU & KIRILIM AVCISI BAŞLATILDI!*\n\n"
        f"💰 *Toplam Varlık:* `${eq:.2f} USDT` (Serbest: `${free_m:.2f}`)\n"
-       f"📈 *İşlem Yönü:* Yalnızca 1h Yükseliş Trendinde *LONG*.\n"
+       f"🪜 *Ana Strateji:* `BASAMAK_AKUMULASYONU` (Yükselen Dipler + Sıkışma).\n"
+       f"🚀 *2. Strateji:* `BREAKOUT_LONG` (24s Zirve Kırılımı).\n"
        f"⚡ *Pozisyon Boyutu:* `20x Kaldıraç` ile tam `$250.00 USDT`.\n"
        f"💸 *Trailing Kâr:* `+$2.00` kârda başlar, `+$1.00` kilitler.\n"
        f"🔰 *Başa Baş:* `+$1.00` kârda stop maliyete çekilir.\n"
        f"🛑 *Stop Loss:* `-$1.50` anlık çıkış.\n"
-       f"🛡️ *Korumalı:* `BASEDUSDT` dokunulmaz | BTC Kalkanı devrede.\n\n"
+       f"🛡️ *Korumalı:* `BASEDUSDT` dokunulmaz.\n\n"
        f"📍 *Durum:* Canlı Piyasa Taraması Aktif ({utc().strftime('%H:%M:%S UTC')})")
 
     last_scan_time = 0
