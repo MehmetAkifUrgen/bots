@@ -40,8 +40,9 @@ DB          = os.getenv("TRADE_DB",   "trade_db.json")
 
 # ── STRATEJİ VE RİSK PARAMETRELERİ ───────────────────────────────────────────
 REAL_TRADING     = os.getenv("REAL_TRADING", "true").lower() == "true"
-LEVERAGE         = int(os.getenv("LEVERAGE", "10"))          # 10x Kaldıraç
-SCAN_EVERY       = int(os.getenv("SCAN_EVERY_SECONDS", "25"))
+TARGET_NOTIONAL  = 250.0       # Hedef Pozisyon Büyüklüğü: Tam $250.00 USDT
+DEFAULT_LEVERAGE = 20          # 20x Kaldıraç (Destekliyorsa 20x-25x ayarlanır)
+SCAN_EVERY       = int(os.getenv("SCAN_EVERY_SECONDS", "20"))
 MAX_HOLD_MIN     = 720 # 12 Saat maksimum bekleme
 
 # KULLANICININ İSTEDİĞİ NET KÂR VE STOP PARAMETRELERİ
@@ -54,12 +55,12 @@ DEFAULT_SL_USD          = 1.50  # -$1.50 Stop Loss
 PROTECTED_SYMBOLS = {"BASEDUSDT", "BASED", "TRXUSDT", "TRX", "FDUSDUSDT", "USDCUSDT"}
 
 # LİKİDİTE VE TEKNİK FİLTRELER
-MIN_VOL_USD      = 5_000_000.0
-MAX_VOL_USD      = 150_000_000.0
+MIN_VOL_USD      = 8_000_000.0   # Yüksek likidite
+MAX_VOL_USD      = 200_000_000.0
 RSI_OVERSOLD     = 25.0
 BB_PERIOD        = 20
 BB_STD           = 2.0
-MAX_STAGNATION_PCT = 7.0
+MAX_STAGNATION_PCT = 6.0
 MIN_VOL_MULTIPLIER = 3.5
 
 STABLE = {"USDC","BUSD","DAI","TUSD","USDP","FDUSD","USDD","FRAX","GUSD","LUSD","USTC","EURC"}
@@ -105,19 +106,21 @@ def gemini_ai_validate(sym, mode, rsi, price, btc_status, last_candles_summary):
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
     prompt = f"""
-Sen dünyanın en iyi Kripto Vadeli İşlemler Analistisin.
-Botumuz Binance vadeli işlemlerde 10x kaldıraç ile scalp LONG pozisyonuna girmek üzere.
+Sen dünyanın en disiplinli ve profesyonel Kripto Vadeli Scalp Uzmanısın.
+Botumuz Binance vadeli işlemlerde 20x kaldıraç ile $250 büyüklüğünde LONG pozisyonuna girmek üzere.
 
 Parite: {sym} | Mod: {mode} | Fiyat: {price} | 15m RSI: {rsi:.1f}
 BTC Durumu: {btc_status}
 Son Mumlar: {last_candles_summary}
 
-GÖREV: Bu sinyalin sahte bir tuzak mı yoksa karlı bir dönüş/patlama mı olduğunu değerlendir.
+GÖREV: Bu sinyalin sahte bir tuzak mı yoksa yüksek olasılıklı bir kâr fırsatı mı olduğunu ÇOK SIKI şekilde değerlendir.
+Kararsızsan veya risk yüksekse REJECT ver. Sadece çok net ve güçlü fırsatları APPROVE et.
+
 SADECE aşağıdaki JSON formatında yanıt ver:
 {{
   "decision": "APPROVE" veya "REJECT",
   "confidence": 0 ile 100 arası sayı,
-  "reason": "Türkçe 1-2 cümlelik net açıklama"
+  "reason": "Türkçe net ve profesyonel 1-2 cümlelik açıklama"
 }}
 """
     payload = {
@@ -134,317 +137,69 @@ SADECE aşağıdaki JSON formatında yanıt ver:
             decision = parsed.get("decision", "APPROVE").upper()
             confidence = int(parsed.get("confidence", 80))
             reason = parsed.get("reason", "Yapay zeka sinyali onayladı.")
-            is_approved = (decision == "APPROVE" and confidence >= 70)
+            # Yüksek güven eşiği (%80+)
+            is_approved = (decision == "APPROVE" and confidence >= 80)
             return is_approved, confidence, reason
     except Exception as e:
         print(f"[GEMINI EXCEPTION] {e}", flush=True)
         
-    return True, 75, "Teknik teyitle devam ediliyor."
-
-# ── BINANCE API İSTEMCİSİ ───────────────────────────────────────────────────
-
-def get_public_json(endpoint, p=None):
-    hosts = [FAPI_BASE, "https://fapi.binance.com", "https://fapi1.binance.com", "https://fapi2.binance.com"]
-    last_err = None
-    
-    # 1. Önce doğrudan dene
-    for h in hosts:
-        url = endpoint if endpoint.startswith("http") else f"{h}{endpoint}"
-        try:
-            r = requests.get(url, params=p, headers=HEADERS, timeout=12)
-            if r.status_code == 200: return r.json()
-            last_err = f"HTTP {r.status_code}"
-        except Exception as e:
-            last_err = str(e)
-            
-    # 2. Proxy varsa proxy ile dene
-    proxies = get_proxies()
-    if proxies:
-        for h in hosts:
-            url = endpoint if endpoint.startswith("http") else f"{h}{endpoint}"
-            try:
-                r = requests.get(url, params=p, headers=HEADERS, proxies=proxies, timeout=12)
-                if r.status_code == 200: return r.json()
-                last_err = f"Proxy HTTP {r.status_code}"
-            except Exception as e:
-                last_err = str(e)
-                
-    raise Exception(f"Binance public API hatası ({endpoint}): {last_err}")
-
-def binance_signed_request(method, path, params=None):
-    if not API_KEY or not API_SECRET:
-        raise Exception("Binance API_KEY veya API_SECRET eksik!")
-    if params is None: params = {}
-    params["timestamp"] = int(time.time() * 1000)
-    params["recvWindow"] = 10000
-    
-    query = urllib.parse.urlencode(params)
-    sig = hmac.new(API_SECRET.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
-    url = f"{PAPI_BASE}{path}?{query}&signature={sig}"
-    auth_headers = {**HEADERS, "X-MBX-APIKEY": API_KEY}
-    proxies = get_proxies()
-    
-    for use_proxy in ([proxies, None] if proxies else [None]):
-        try:
-            if method.upper() == "GET": r = requests.get(url, headers=auth_headers, proxies=use_proxy, timeout=18)
-            elif method.upper() == "POST": r = requests.post(url, headers=auth_headers, proxies=use_proxy, timeout=18)
-            elif method.upper() == "DELETE": r = requests.delete(url, headers=auth_headers, proxies=use_proxy, timeout=18)
-            else: raise ValueError(f"Geçersiz method: {method}")
-            
-            if r.status_code == 200:
-                return r.json()
-            elif r.status_code == 407 and use_proxy:
-                continue
-            else:
-                raise Exception(f"HTTP {r.status_code} - {r.text}")
-        except Exception as e:
-            if use_proxy: continue
-            raise Exception(f"Binance Signed API Hatası ({path}): {e}")
-            
-    raise Exception(f"Binance Signed API Hatası ({path}): Bağlantı kurulamadı.")
-
-def klines(sym, tf, n=60):
-    raw = get_public_json("/fapi/v1/klines", {"symbol": sym, "interval": tf, "limit": n})
-    df  = pd.DataFrame(raw, columns=["ot","o","h","l","c","v","ct","qv","tr","tb","tq","x"])
-    for col in ["o","h","l","c","v"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
-
-def calc_rsi(series, period=14):
-    if len(series) < period + 1: return 50.0
-    delta = series.diff()
-    gain = delta.clip(lower=0).rolling(window=period, min_periods=period).mean()
-    loss = (-delta.clip(upper=0)).rolling(window=period, min_periods=period).mean()
-    rs = gain / loss.replace(0, 1e-9)
-    rsi = 100 - (100 / (1 + rs))
-    val = rsi.iloc[-1]
-    return float(val) if not math.isnan(val) else 50.0
-
-def last_price(sym):
-    r = get_public_json("/fapi/v1/ticker/price", {"symbol": sym})
-    return float(r["price"])
-
-def get_symbol_rules(sym):
-    try:
-        info = get_public_json("/fapi/v1/exchangeInfo")
-        for s in info.get("symbols", []):
-            if s.get("symbol") == sym:
-                step_size, min_qty = 1.0, 1.0
-                for f in s.get("filters", []):
-                    if f.get("filterType") == "LOT_SIZE":
-                        step_size = float(f.get("stepSize", 1.0))
-                        min_qty = float(f.get("minQty", 1.0))
-                return {
-                    "stepSize": step_size, "minQty": min_qty,
-                    "quantityPrecision": int(s.get("quantityPrecision", 2)),
-                    "pricePrecision": int(s.get("pricePrecision", 2))
-                }
-    except Exception: pass
-    return {"stepSize": 1.0, "minQty": 1.0, "quantityPrecision": 2, "pricePrecision": 2}
-
-def round_step_size(qty, step_size, precision):
-    if step_size <= 0: return round(qty, precision)
-    steps = math.floor(qty / step_size)
-    rounded = steps * step_size
-    return float(f"{rounded:.{precision}f}")
-
-def get_account_balances():
-    """
-    Portföyün toplam varlığını (equity) ve KULLANILABİLİR SERBEST TEMİNATINI (free_margin) döner.
-    """
-    equity = 0.0
-    free_margin = 0.0
-    try:
-        acc = binance_signed_request("GET", "/papi/v1/account")
-        equity = float(acc.get("accountEquity", 0))
-        free_margin = float(acc.get("totalAvailableBalance", 0))
-        return equity, free_margin
-    except Exception:
-        pass
-        
-    try:
-        balances = binance_signed_request("GET", "/papi/v1/balance")
-        for b in balances:
-            if b.get("asset") == "USDT":
-                eq = float(b.get("totalWalletBalance", 0))
-                return eq, max(0.0, eq * 0.50)
-    except Exception as e:
-        print(f"[BAKİYE HATA] {e}", flush=True)
-        
-    return equity, free_margin
-
-# ── BTC DÜŞÜŞ KALKANI ────────────────────────────────────────────────────────
-
-def check_btc_shield():
-    try:
-        df15m = klines("BTCUSDT", "15m", 30)
-        if len(df15m) < 20: return True, "BTC Verisi Yetersiz"
-        last_c = df15m.iloc[-1]
-        c, o = last_c['c'], last_c['o']
-        
-        # 1. Anlık Şelale: 15m mumunda %0.3'ten fazla sert kırmızıysa girme
-        if c < o and ((o - c) / o) > 0.003:
-            return False, "BTC Anlık Şelalede (15m Sert Kırmızı Mum)"
-            
-        # 2. 1 Saatlik Düşüş Trendi
-        df1h = klines("BTCUSDT", "1h", 40)
-        if len(df1h) >= 25:
-            ema20 = df1h['c'].ewm(span=20, adjust=False).mean().iloc[-1]
-            ema50 = df1h['c'].ewm(span=50, adjust=False).mean().iloc[-1]
-            rsi_btc = calc_rsi(df1h['c'], 14)
-            if df1h['c'].iloc[-1] < ema20 and ema20 < ema50 and rsi_btc < 45.0:
-                return False, f"BTC 1h Düşüş Trendinde (RSI:{rsi_btc:.1f})"
-                
-        return True, "BTC Uygun (Piyasa Onaylı)"
-    except Exception as e:
-        return True, f"BTC Kontrol Hatası ({e})"
-
-def get_universe():
-    try:
-        info    = get_public_json("/fapi/v1/exchangeInfo")
-        active  = {r["symbol"] for r in info.get("symbols", [])
-                   if r.get("status") == "TRADING"
-                   and r.get("contractType") == "PERPETUAL"
-                   and r.get("quoteAsset") == "USDT"
-                   and r.get("symbol","")[:-4] not in STABLE
-                   and r.get("symbol") not in PROTECTED_SYMBOLS}
-        tickers = get_public_json("/fapi/v1/ticker/24hr")
-        out = []
-        for t in tickers:
-            sym = t.get("symbol", "")
-            if sym not in active: continue
-            try: qv = float(t.get("quoteVolume", 0))
-            except: continue
-            if MIN_VOL_USD <= qv <= MAX_VOL_USD:
-                out.append((sym, qv))
-        out.sort(key=lambda x: x[1], reverse=True)
-        return out
-    except Exception as e:
-        print(f"[UNIVERSE HATA] {e}", flush=True)
-        return []
-
-# ── SİNYAL MOTORU ────────────────────────────────────────────────────────────
-
-def analyze_market_candidate(sym):
-    try:
-        df15m = klines(sym, "15m", 45)
-        if len(df15m) < 30: return None
-        
-        c_candle = df15m.iloc[-1]
-        c, o, h, l = c_candle['c'], c_candle['o'], c_candle['h'], c_candle['l']
-        rsi_val = calc_rsi(df15m['c'], 14)
-        
-        last_3_candles = [f"M{idx+1}: O={row['o']:.4f} C={row['c']:.4f} H={row['h']:.4f} L={row['l']:.4f}" for idx, row in df15m.iloc[-3:].iterrows()]
-        candles_summary = " | ".join(last_3_candles)
-        
-        # 1. MOTOR: DİP AVCISI
-        if rsi_val <= RSI_OVERSOLD:
-            sma20 = df15m['c'].iloc[-20:].mean()
-            std20 = df15m['c'].iloc[-20:].std()
-            lower_bb = sma20 - (BB_STD * std20)
-            
-            if (l <= lower_bb or c <= lower_bb):
-                is_green = c >= o
-                candle_range = h - l
-                lower_wick_ratio = (min(c, o) - l) / candle_range if candle_range > 0 else 0
-                if is_green or lower_wick_ratio > 0.40:
-                    entry = last_price(sym)
-                    score = (30.0 - rsi_val) * 2.0
-                    return {
-                        "sym": sym, "mode": "DİP_AVCISI", "side": "LONG",
-                        "entry": entry, "score": round(score, 1),
-                        "rsi": rsi_val, "candles_summary": candles_summary,
-                        "reasons": [
-                            f"🎯 *Strateji:* DİP AVCISI (Oversold Bounce)",
-                            f"📉 *Aşırı Satım:* RSI `{rsi_val:.1f}`",
-                            f"📊 *Bollinger Bandı:* Alt bant dışından alıcı tepkisi"
-                        ]
-                    }
-
-        # 2. MOTOR: PUMP SNIPER
-        if 52.0 <= rsi_val <= 75.0:
-            df1h = klines(sym, "1h", 30)
-            if len(df1h) >= 24:
-                max_h24 = df1h['h'].iloc[-24:].max()
-                min_l24 = df1h['l'].iloc[-24:].min()
-                range_pct = (max_h24 - min_l24) / min_l24 * 100
-                if range_pct <= MAX_STAGNATION_PCT:
-                    dist = (c - max_h24) / max_h24 * 100
-                    if 0.1 <= dist <= 2.5:
-                        candle_range = h - l
-                        body_ratio = (c - o) / candle_range if candle_range > 0 else 0
-                        if body_ratio >= 0.45:
-                            vol_avg = df15m['v'].iloc[-20:-2].mean()
-                            vol_now = c_candle['v'] + df15m['v'].iloc[-2]
-                            vol_ratio = (vol_now / vol_avg) if vol_avg > 0 else 1.0
-                            if vol_ratio >= MIN_VOL_MULTIPLIER:
-                                entry = last_price(sym)
-                                score = (10 - range_pct) * vol_ratio
-                                return {
-                                    "sym": sym, "mode": "PUMP_SNIPER", "side": "LONG",
-                                    "entry": entry, "score": round(score, 1),
-                                    "rsi": rsi_val, "candles_summary": candles_summary,
-                                    "reasons": [
-                                        f"🚀 *Strateji:* PUMP SNIPER (Volume Breakout)",
-                                        f"🌋 *Kırılım:* 24s sıkışma zirvesi kırıldı!",
-                                        f"🌊 *Hacim:* `{vol_ratio:.1f}x` katı patlama"
-                                    ]
-                                }
-        return None
-    except Exception:
-        return None
+    return False, 50, "Yapay zeka yanıt veremedi, güvenlik gereği pas geçildi."
 
 # ── EMİR VE TEMİNAT YÖNETİMİ ────────────────────────────────────────────────
 
-def set_leverage(sym, lev=10):
-    try: binance_signed_request("POST", "/papi/v1/um/leverage", {"symbol": sym, "leverage": lev})
-    except Exception as e: print(f"[LEVERAGE UYARI] {sym} kaldıraç ayarlanamadı ({e})", flush=True)
+def set_optimal_leverage(sym, target_lev=20):
+    for lev in [target_lev, 20, 15, 12, 10]:
+        try:
+            binance_signed_request("POST", "/papi/v1/um/leverage", {"symbol": sym, "leverage": lev})
+            return lev
+        except Exception:
+            continue
+    return 10
 
 def execute_real_entry(sym, free_margin):
     """
-    Serbest teminata göre güvenli pozisyon büyüklüğü hesaplar.
+    Kullanıcının isteği: 20x kaldıraç ile $250'lık pozisyon açar.
+    $250 notional için 20x'te sadece $12.50 teminat gerekir.
     """
-    usable_margin = max(8.0, min(22.0, free_margin * 0.70))
-    notional_usd = usable_margin * LEVERAGE
+    actual_lev = set_optimal_leverage(sym, target_lev=20)
+    time.sleep(0.15)
     
     rules = get_symbol_rules(sym)
     price = last_price(sym)
     
-    raw_qty = notional_usd / price
+    # $250 pozisyon büyüklüğü hedefi
+    target_usd = TARGET_NOTIONAL
+    max_safe_notional = free_margin * actual_lev * 0.85
+    actual_notional_target = min(target_usd, max_safe_notional)
+    
+    raw_qty = actual_notional_target / price
     qty = round_step_size(raw_qty, rules["stepSize"], rules["quantityPrecision"])
     if qty < rules["minQty"]: qty = rules["minQty"]
-        
-    set_leverage(sym, LEVERAGE)
-    time.sleep(0.15)
     
     order_params = {
         "symbol": sym, "side": "BUY", "type": "MARKET", "quantity": str(qty)
     }
     
     actual_notional = qty * price
-    print(f"⚡ [GERÇEK EMİR AÇILIYOR] {sym} | Miktar: {qty} | Notional: ~${actual_notional:.2f} (Serbest Teminat: ${free_margin:.2f})", flush=True)
+    print(f"⚡ [GERÇEK EMİR AÇILIYOR] {sym} | Kaldıraç: {actual_lev}x | Miktar: {qty} | Büyüklük: ${actual_notional:.2f} (Serbest Teminat: ${free_margin:.2f})", flush=True)
     order_res = binance_signed_request("POST", "/papi/v1/um/order", order_params)
     
     avg_price = float(order_res.get("avgPrice", 0))
     if avg_price <= 0: avg_price = price
         
-    # KULLANICININ İSTEDİĞİ NET HEDEFLER:
-    # +$2.00 kârda Trailing Stop başlar
     dyn_tp_trigger_usd = DEFAULT_TP_TRIGGER_USD
-    # Trailing Stop geri çekilme payı: $1.00 (+2$'da stop hemen +1$'a kilitlenir)
     dyn_trailing_drop_usd = DEFAULT_TRAILING_DROP
-    # +$1.00 kârda Stop Maliyet seviyesine çekilir
     dyn_be_trigger_usd = DEFAULT_BE_TRIGGER_USD
-    # Stop Loss -$1.50
     dyn_sl_usd = DEFAULT_SL_USD
     
     sl_price = avg_price - (dyn_sl_usd / qty)
     be_trigger_price = avg_price + (dyn_be_trigger_usd / qty)
-    be_sl_price = avg_price + (0.15 / qty)
+    be_sl_price = avg_price + (0.20 / qty)
     
     return {
         "sym": sym, "side": "LONG", "entry": avg_price, "qty": qty,
         "notional_usd": round(actual_notional, 2),
+        "leverage": actual_lev,
         "sl_price": sl_price,
         "dyn_sl_usd": dyn_sl_usd,
         "dyn_tp_trigger_usd": dyn_tp_trigger_usd,
