@@ -1,11 +1,18 @@
 """
-trader_bot.py — Yapay Zeka Beyinli (Gemini 2.5 Flash) Bileşik Büyüme Scalp Robotu
-• Karar Verici: %100 Google Gemini 2.5 Flash (Yapay Zeka Onayı ve Fırsat Değerlendirmesi)
-• Büyüme Stratejisi: 20x Kaldıraç ile $250 Notional (Kasadan sadece $12.50 teminat bağlanır)
-• Hızlı Kâr Hedefi: +$1.80 - $3.00 Trailing Stop ile zirveyi yakalar
-• Sıfır Risk (Breakeven): +$1.00 kârda stop hemen maliyete (+0.20$ kârla) çekilir
-• Hızlı Stop Loss: -$1.00 seviyesinde anlık koruma
-• Koruma: BASEDUSDT dokunulmaz | BTC Düşüş Kalkanı | Serbest Teminat Koruması
+trader_bot.py — Yapay Zeka Beyinli (Gemini 2.5 Flash) Bileşik Scalp Robotu
+• Mod Yönetimi: Varsayılan SİMÜLASYON (Fake Para). Telegram komutu ile GERÇEK moda geçebilir!
+• Telegram Komutları:
+    /gercek   -> Gerçek Binance vadeli işlem modunu açar
+    /fake     -> Simülasyon (Fake Para) moduna geçer
+    /rapor    -> Günlük kâr/zarar ve işlem karnesini Telegram'a döker
+    /durum    -> Anlık kasa ve açık pozisyon durumunu gösterir
+    /kapat    -> Açık olan işlemi piyasa fiyatından hemen kapatır
+• Karar Verici: %100 Google Gemini 2.5 Flash Master AI
+• Pozisyon: 20x Kaldıraç | $250 Notional Scalp
+• Trailing Kâr: +$1.80 kârda başlar, zirveden $0.80 çekilince satar (+1.00$ kâr garanti)
+• Başa Baş: +$1.00 kârda stop maliyete (+0.10$) çekilir (Sıfır Risk)
+• Stop Loss: -$1.00 seviyesinde anlık koruma
+• Koruma: BASEDUSDT dokunulmaz | BTC Düşüş Kalkanı Aktif
 """
 
 import hashlib
@@ -38,11 +45,12 @@ SF          = os.getenv("STATE_FILE", "trader_state.json")
 DB          = os.getenv("TRADE_DB",   "trade_db.json")
 
 # ── STRATEJİ VE RİSK PARAMETRELERİ ───────────────────────────────────────────
-REAL_TRADING     = os.getenv("REAL_TRADING", "true").lower() == "true"
-TARGET_NOTIONAL  = 250.0       # Hedef Pozisyon: Tam $250.00 USDT
-DEFAULT_LEVERAGE = 20          # 20x Kaldıraç ($250 için sadece $12.50 teminat)
-SCAN_EVERY       = int(os.getenv("SCAN_EVERY_SECONDS", "15"))
-MAX_HOLD_MIN     = 360 # 6 Saat maksimum bekleme
+# Varsayılan olarak FAKE PARA (Simülasyon). Telegramdan /gercek yazarak değiştirilebilir.
+REAL_TRADING_DEFAULT = os.getenv("REAL_TRADING", "false").lower() == "true"
+TARGET_NOTIONAL      = 250.0       # Hedef Pozisyon: Tam $250.00 USDT
+DEFAULT_LEVERAGE     = 20          # 20x Kaldıraç ($250 için sadece $12.50 teminat)
+SCAN_EVERY           = int(os.getenv("SCAN_EVERY_SECONDS", "15"))
+MAX_HOLD_MIN         = 360         # 6 Saat maksimum bekleme
 
 # BİLEŞİK BÜYÜME VE HIZLI SCALP KÂR/ZARAR PARAMETRELERİ
 DEFAULT_TP_TRIGGER_USD  = 1.80  # +$1.80 kârda Trailing Stop başlar
@@ -93,20 +101,144 @@ def tg(txt):
     except Exception as e:
         print(f"[TG HATA] {e}", flush=True)
 
+# ── TELEGRAM KOMUT DİNLEYİCİ (INTERACTIVE BOT) ───────────────────────────────
+
+LAST_UPDATE_ID = 0
+
+def handle_telegram_commands(state):
+    global LAST_UPDATE_ID
+    if not TK: return state
+    
+    try:
+        url = f"https://api.telegram.org/bot{TK}/getUpdates"
+        params = {"offset": LAST_UPDATE_ID + 1, "timeout": 1}
+        r = requests.get(url, params=params, timeout=5)
+        if r.status_code != 200: return state
+        
+        updates = r.json().get("result", [])
+        for u in updates:
+            LAST_UPDATE_ID = u.get("update_id", LAST_UPDATE_ID)
+            msg = u.get("message", {})
+            text = msg.get("text", "").strip().lower()
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+            
+            if not text: continue
+            
+            # 1. /gercek veya /real
+            if text in ["/gercek", "/real", "gercek", "real"]:
+                state["real_trading"] = True
+                save_st(state)
+                tg("🔴 *MOD DEĞİŞTİRİLDİ: GERÇEK İŞLEM MODU AKTİF!* ⚡\n\nBundan sonraki tüm sinyaller Binance hesabında gerçek parayla açılacaktır.")
+                print("⚡ [MOD DEĞİŞTİ] GERÇEK İŞLEM MODU AKTİF EDİLDİ.", flush=True)
+                
+            # 2. /fake veya /paper veya /simulasyon
+            elif text in ["/fake", "/paper", "/simulasyon", "fake", "paper"]:
+                state["real_trading"] = False
+                save_st(state)
+                tg("🟢 *MOD DEĞİŞTİRİLDİ: SİMÜLASYON (FAKE PARA) MODU AKTİF!* 🧪\n\nİşlemler sanal bakiye ile canlı piyasa fiyatlarında test edilecektir. Hesabındaki gerçek paraya dokunulmaz.")
+                print("🧪 [MOD DEĞİŞTİ] SİMÜLASYON MODU AKTİF EDİLDİ.", flush=True)
+                
+            # 3. /rapor veya /kar veya /gunsonu
+            elif text in ["/rapor", "/kar", "/gunsonu", "/pnl", "rapor"]:
+                send_performance_report()
+                
+            # 4. /durum veya /status
+            elif text in ["/durum", "/status", "durum"]:
+                eq, free_m = get_account_balances()
+                is_real = state.get("real_trading", REAL_TRADING_DEFAULT)
+                mode_str = "🔴 GERÇEK İŞLEM" if is_real else "🟢 SİMÜLASYON (FAKE PARA)"
+                open_positions = state.get("positions", [])
+                
+                pos_txt = "Açık pozisyon yok."
+                if open_positions:
+                    p = open_positions[0]
+                    cur_p = last_price(p["sym"])
+                    pnl = (cur_p - p["entry"]) * p["qty"]
+                    pos_txt = f"• *{p['sym']}* | Giriş: `{fp(p['entry'])}` | Anlık: `{fp(cur_p)}` | PnL: *`${pnl:+.2f} USDT`*"
+                
+                tg(f"📊 *CANLI SİSTEM DURUMU*\n\n"
+                   f"⚙️ *Çalışma Modu:* `{mode_str}`\n"
+                   f"💰 *Hesap Varlığı:* `${eq:.2f} USDT` (Serbest: `${free_m:.2f}`)\n"
+                   f"📌 *Aktif Pozisyon:* {pos_txt}\n\n"
+                   f"Komutlar: `/gercek`, `/fake`, `/rapor`, `/kapat`")
+                   
+            # 5. /kapat (Mevcut işlemi hemen kapat)
+            elif text in ["/kapat", "/close", "kapat"]:
+                if state.get("positions"):
+                    for p in state["positions"]:
+                        cur_p = last_price(p["sym"])
+                        pnl = (cur_p - p["entry"]) * p["qty"]
+                        if state.get("real_trading", REAL_TRADING_DEFAULT):
+                            execute_real_close(p, "MANUEL_TELEGRAM_KAPATMA")
+                        record_trade(p, cur_p, pnl, "MANUEL_TELEGRAM_KAPATMA", 60)
+                        tg(f"🔒 *{p['sym']}* Telegram komutuyla anında kapatıldı! Net PnL: *`${pnl:+.2f} USDT`*")
+                    state["positions"] = []
+                    save_st(state)
+                else:
+                    tg("ℹ️ Şu anda kapatılacak açık pozisyon bulunmuyor.")
+                    
+            # 6. /yardim veya /help
+            elif text in ["/yardim", "/help", "yardim"]:
+                tg("🤖 *TELEGRAM BOT KOMUTLARI:*\n\n"
+                   "• `/fake` -> Simülasyon (Fake Para) moduna geç\n"
+                   "• `/gercek` -> Gerçek Binance vadeli işlem moduna geç\n"
+                   "• `/rapor` -> Günün/Toplamın kâr-zarar raporunu al\n"
+                   "• `/durum` -> Anlık kasa ve pozisyon durumunu gör\n"
+                   "• `/kapat` -> Açık olan pozisyonu hemen kapat")
+    except Exception as e:
+        print(f"[TG KOMUT HATA] {e}", flush=True)
+        
+    return state
+
+def send_performance_report():
+    trades = load_db()
+    if not trades:
+        tg("📊 *Henüz tamamlanmış bir işlem bulunmuyor.* Bot piyasayı taramaya devam ediyor!")
+        return
+        
+    df_t = pd.DataFrame(trades)
+    tot = len(df_t)
+    wins = df_t[df_t["pnl"] > 0]
+    losses = df_t[df_t["pnl"] < 0]
+    
+    win_cnt = len(wins)
+    loss_cnt = len(losses)
+    wr = (win_cnt / tot * 100) if tot > 0 else 0
+    total_net = df_t["pnl"].sum()
+    
+    gross_win = wins["pnl"].sum()
+    gross_loss = abs(losses["pnl"].sum())
+    pf = (gross_win / gross_loss) if gross_loss > 0 else 99.0
+    
+    recent_lines = []
+    for _, row in df_t.tail(6).iterrows():
+        icon = "🟢" if row["pnl"] >= 0 else "🔴"
+        recent_lines.append(f"{icon} `{row['pair']}` -> *${row['pnl']:+.2f}* ({row['result']})")
+        
+    rec_txt = "\n".join(recent_lines)
+    
+    tg(f"📊 *GÜN SONU / PERFORMANS RAPORU*\n"
+       f"━━━━━━━━━━━━━━━━━━━━\n"
+       f"• *Toplam İşlem:* `{tot}`\n"
+       f"• *Kazanılan:* `{win_cnt}` (%{wr:.1f} Win Rate)\n"
+       f"• *Kaybedilen:* `{loss_cnt}`\n"
+       f"• *Kâr Faktörü (PF):* `{pf:.2f}`\n"
+       f"━━━━━━━━━━━━━━━━━━━━\n"
+       f"💰 *TOPLAM NET KÂR/ZARAR:* *`${total_net:+.2f} USDT`*\n"
+       f"━━━━━━━━━━━━━━━━━━━━\n"
+       f"*Son İşlemler:*\n{rec_txt}\n\n"
+       f"Zaman: `{ts()}`")
+
 # ── GEMINI 2.5 FLASH ANA YAPAY ZEKA BEYNİ (MASTER SCALP AI) ──────────────────
 
 def gemini_master_ai_decision(sym, price, rsi_15m, rsi_5m, vol_ratio, btc_status, candles_summary):
-    """
-    Tüm kararı Google Gemini 2.5 Flash Yapay Zekası verir.
-    Mum yapısını, hacim artışını ve piyasa psikolojisini analiz ederek APPROVE veya REJECT kararı üretir.
-    """
     if not GEMINI_KEY:
         return True, 80, "Gemini anahtarı girilmedi, teknik onayla devam ediliyor."
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
     prompt = f"""
 Sen dünyanın en başarılı Kripto Vadeli Scalp Fon Yöneticisisin.
-Amacımız: Küçük bir kasayı ($30) 20x kaldıraç ile $250 büyüklüğünde LONG scalp pozisyonları açarak adım adım büyütmek.
+Amacımız: Kasayı 20x kaldıraç ile $250 büyüklüğünde LONG scalp pozisyonları açarak adım adım büyütmek.
 
 GÖREV: Aşağıdaki pariteye ait anlık mumları, hacim patlamasını ve piyasa yapısını titizlikle incele.
 
@@ -126,8 +258,7 @@ SADECE aşağıdaki JSON formatında yanıt ver:
 {{
   "decision": "APPROVE" veya "REJECT",
   "confidence": 0 ile 100 arası sayı,
-  "reason": "Türkçe net 1-2 cümlelik profesyonel açıklama",
-  "target_tp_usd": 1.80 ile 3.00 arası sayı
+  "reason": "Türkçe net 1-2 cümlelik profesyonel açıklama"
 }}
 """
     payload = {
@@ -144,7 +275,6 @@ SADECE aşağıdaki JSON formatında yanıt ver:
             decision = parsed.get("decision", "APPROVE").upper()
             confidence = int(parsed.get("confidence", 80))
             reason = parsed.get("reason", "Yapay zeka alıcı baskısını onayladı.")
-            # %80 ve üzeri güven eşiği
             is_approved = (decision == "APPROVE" and confidence >= 80)
             return is_approved, confidence, reason
     except Exception as e:
@@ -288,7 +418,6 @@ def check_btc_shield():
         last_c = df15m.iloc[-1]
         c, o = last_c['c'], last_c['o']
         
-        # 15m mumunda %0.35'ten sert düşüş varsa alımları kilitle
         if c < o and ((o - c) / o) > 0.0035:
             return False, "BTC Anlık Şelalede (15m Sert Kırmızı Mum)"
             
@@ -331,12 +460,6 @@ def get_universe():
 # ── YAPAY ZEKA GÖZLEM VE SİNYAL ADAY MOTORU ──────────────────────────────────
 
 def analyze_market_candidate(sym, btc_status):
-    """
-    1. Basamak Yapısı (Staircase)
-    2. Hacim İvmesi (Volume Surge Velocity)
-    3. 24s Zirve Kırılımı (Momentum Breakout)
-    Tespit edilen adaylar tüm mum detaylarıyla birlikte Gemini 2.5 Flash'a gönderilir.
-    """
     try:
         df15m = klines(sym, "15m", 50)
         if len(df15m) < 40: return None
@@ -356,11 +479,9 @@ def analyze_market_candidate(sym, btc_status):
         ema20 = df15m['c'].ewm(span=20, adjust=False).mean().iloc[-1]
         ema50 = df15m['c'].ewm(span=50, adjust=False).mean().iloc[-1]
         
-        # Son 4 mumun özeti
         last_4 = [f"M{idx+1}: O={row['o']:.4f} C={row['c']:.4f} H={row['h']:.4f} L={row['l']:.4f} V={row['v']:.0f}" for idx, row in df15m.iloc[-4:].iterrows()]
         candles_summary = " | ".join(last_4)
         
-        # 1. MODEL: BASAMAK YÜKSELİŞİ (4 Kademeli Higher Lows)
         p1 = df15m["l"].iloc[-48:-36].min() if len(df15m) >= 48 else df15m["l"].iloc[-36:-24].min()
         p2 = df15m["l"].iloc[-24:-12].min()
         p3 = df15m["l"].iloc[-12:].min()
@@ -372,7 +493,6 @@ def analyze_market_candidate(sym, btc_status):
             strategy_name = "BASAMAK_AKÜMÜLASYONU" if is_staircase else "HACİMLİ_BREAKOUT"
             entry = last_price(sym)
             
-            # Tam yetki Google Gemini 2.5 Flash'ta!
             ai_approved, ai_confidence, ai_reason = gemini_master_ai_decision(
                 sym=sym, price=entry, rsi_15m=rsi_15m, rsi_5m=rsi_5m,
                 vol_ratio=vol_ratio, btc_status=btc_status,
@@ -415,7 +535,6 @@ def execute_real_entry(sym, free_margin):
     rules = get_symbol_rules(sym)
     price = last_price(sym)
     
-    # Serbest teminata göre güvenli pozisyon büyüklüğü ($10 min, $250 max)
     target_usd = TARGET_NOTIONAL
     max_safe_notional = free_margin * actual_lev * 0.85
     actual_notional_target = min(target_usd, max(10.0, max_safe_notional))
@@ -435,7 +554,6 @@ def execute_real_entry(sym, free_margin):
     avg_price = float(order_res.get("avgPrice", 0))
     if avg_price <= 0: avg_price = price
         
-    # Dinamik Oransal Kâr ve Stop (Pozisyon büyüklüğüne göre otomatik ölçeklenir)
     scale_factor = min(1.0, max(0.40, actual_notional / 250.0))
     dyn_tp_trigger_usd = round(DEFAULT_TP_TRIGGER_USD * scale_factor, 2)
     dyn_trailing_drop_usd = round(DEFAULT_TRAILING_DROP * scale_factor, 2)
@@ -462,7 +580,8 @@ def execute_real_entry(sym, free_margin):
         "trailing_sl_price": sl_price,
         "order_id": order_res.get("orderId", str(uuid.uuid4())[:8]),
         "opened_iso": utc().isoformat(), "opened_ts": ts(),
-        "be_hit": False
+        "be_hit": False,
+        "is_real": True
     }
 
 def execute_real_close(pos, reason):
@@ -486,7 +605,8 @@ def execute_real_close(pos, reason):
 
 # ── TELEGRAM BİLDİRİMLERİ ────────────────────────────────────────────────────
 
-def msg_real_open(pos, sig):
+def msg_real_open(pos, sig, is_real=False):
+    icon = "🔴 *[GERÇEK İŞLEM]*" if is_real else "🧪 *[SİMÜLASYON / FAKE PARA]*"
     lines = "\n".join(f"  • {r}" for r in sig.get("reasons", []))
     lev = pos.get("leverage", DEFAULT_LEVERAGE)
     tp_val = float(pos.get("dyn_tp_trigger_usd", DEFAULT_TP_TRIGGER_USD))
@@ -496,7 +616,7 @@ def msg_real_open(pos, sig):
     be_val = float(pos.get("dyn_be_trigger_usd", DEFAULT_BE_TRIGGER_USD))
     
     return (
-        f"🤖 *YAPAY ZEKA (GEMINI 2.5) LONG AÇTI!* | `{pos['sym']}`\n\n"
+        f"{icon} *YAPAY ZEKA LONG AÇTI!* | `{pos['sym']}`\n\n"
         f"Strateji: *{sig['mode']}*\n"
         f"Yön: *LONG ({lev}x Kaldıraç)*\n"
         f"Giriş Fiyatı : `{fp(pos['entry'])}`\n"
@@ -504,18 +624,21 @@ def msg_real_open(pos, sig):
         f"📈 *Trailing Kâr:* `+${tp_val:.2f}` geçilince başlar (+${lock_val:.2f} kilitlenir)\n"
         f"🛑 *Stop Loss:* `-${sl_val:.2f}` (`{fp(pos['sl_price'])}`)\n"
         f"🔰 *Sıfır Risk (+${be_val:.2f} kârda):* Stop maliyete çekilir\n\n"
-        f"*Yapay Zeka Analiz Detayları:*\n{lines}\n\n"
-        f"Zaman: `{ts()}`"
+        f"*Yapay Zeka Analizi:*\n{lines}\n\n"
+        f"Zaman: `{ts()}`\n"
+        f"_(Komutlar: `/durum`, `/rapor`, `/gercek`, `/fake`)_"
     )
 
-def msg_real_close(pos, exit_price, pnl, reason, dur_sec):
+def msg_real_close(pos, exit_price, pnl, reason, dur_sec, is_real=False):
+    prefix = "🔴 [GERÇEK]" if is_real else "🧪 [SİMÜLASYON]"
     icon = "🟢" if pnl >= 0 else "🔴"
     abs_pnl = abs(pnl)
     title = {
         "TRAILING_TP": f"💸 TRAILING KÂR ALINDI (+${pnl:.2f})",
         "STOP_LOSS": f"❌ STOP OLDU (-${abs_pnl:.2f})",
         "BREAKEVEN": "🔰 BAŞA BAŞ KAPANDI (Sıfır Risk)",
-        "TIMEOUT": "⏱️ SÜRE DOLDU"
+        "TIMEOUT": "⏱️ SÜRE DOLDU",
+        "MANUEL_TELEGRAM_KAPATMA": "🛑 TELEGRAM İLE KAPATILDI"
     }.get(reason, reason)
     
     eq, free_m = get_account_balances()
@@ -523,12 +646,12 @@ def msg_real_close(pos, exit_price, pnl, reason, dur_sec):
     dur_min = dur_sec // 60
     
     return (
-        f"{icon} *{title}* | `{pos['sym']}`\n\n"
+        f"{icon} {prefix} *{title}* | `{pos['sym']}`\n\n"
         f"Giriş : `{fp(pos['entry'])}` → Çıkış: `{fp(exit_price)}`\n"
         f"Net P&L : *`${pnl:+.2f} USDT`*\n"
         f"Görülen Zirve Kâr : `+${highest_pnl:.2f}`\n"
         f"İşlem Süresi : `{dur_min} dakika`\n"
-        f"💰 *Güncel Varlık:* `${eq:.2f} USDT` (Serbest: `${free_m:.2f}`)\n\n"
+        f"💰 *Hesap Varlığı:* `${eq:.2f} USDT` (Serbest: `${free_m:.2f}`)\n\n"
         f"Zaman: `{ts()}`"
     )
 
@@ -539,7 +662,7 @@ def load_st():
         try:
             with open(SF) as f: return json.load(f)
         except Exception: pass
-    return {"positions": []}
+    return {"positions": [], "real_trading": REAL_TRADING_DEFAULT}
 
 def save_st(s):
     with open(SF, "w") as f: json.dump(s, f, indent=2, ensure_ascii=False)
@@ -560,7 +683,9 @@ def record_trade(pos, exit_price, pnl, reason, dur_sec):
         "id": pos.get("order_id", ""), "pair": pos["sym"], "side": "LONG",
         "entry": pos["entry"], "exit": exit_price, "qty": pos["qty"],
         "notional": pos["notional_usd"], "pnl": round(pnl, 2),
-        "result": reason, "duration": dur_sec, "timestamp": ts()
+        "result": reason, "duration": dur_sec,
+        "is_real": pos.get("is_real", False),
+        "timestamp": ts()
     })
     save_db(trades)
     return trades
@@ -576,12 +701,14 @@ def get_real_open_symbols():
 
 def monitor(state):
     real_open = get_real_open_symbols()
+    is_real = state.get("real_trading", REAL_TRADING_DEFAULT)
     still = []
     
     for pos in state.get("positions", []):
         sym = pos["sym"]
+        pos_is_real = pos.get("is_real", is_real)
         
-        if real_open is not None and sym not in real_open:
+        if pos_is_real and real_open is not None and sym not in real_open:
             print(f"ℹ️ [{sym}] Binance üzerinde kapatılmış, takip listesinden çıkarıldı.", flush=True)
             continue
             
@@ -607,7 +734,8 @@ def monitor(state):
             if not pos.get("trailing_active"):
                 pos["trailing_active"] = True
                 locked_profit = max(1.00, unrealized_pnl - dyn_trailing_drop)
-                tg(f"🚀 *{sym}* `+${unrealized_pnl:.2f}` kâra ulaştı! *Trailing Kâr Takibi Aktif Edildi!*\nStop seviyesi `+${locked_profit:.2f}` kâra kilitlendi.")
+                prefix = "🔴 [GERÇEK]" if pos_is_real else "🧪 [SİMÜLASYON]"
+                tg(f"🚀 {prefix} *{sym}* `+${unrealized_pnl:.2f}` kâra ulaştı! *Trailing Kâr Takibi Aktif Edildi!*\nStop seviyesi `+${locked_profit:.2f}` kâra kilitlendi.")
                 
             trailing_exit_pnl = highest_pnl - dyn_trailing_drop
             trailing_exit_price = entry + (trailing_exit_pnl / qty)
@@ -617,7 +745,8 @@ def monitor(state):
         if not pos.get("be_hit") and (price >= pos.get("be_trigger_price", entry * 1.004) or unrealized_pnl >= dyn_be_trigger):
             pos["sl_price"] = pos["be_sl_price"]
             pos["be_hit"] = True
-            tg(f"🔰 *{sym}* `+${unrealized_pnl:.2f}` kâra ulaştı! Stop maliyete (`{fp(pos['sl_price'])}`) çekildi. *İşlem artık sıfır risklidir!*")
+            prefix = "🔴 [GERÇEK]" if pos_is_real else "🧪 [SİMÜLASYON]"
+            tg(f"🔰 {prefix} *{sym}* `+${unrealized_pnl:.2f}` kâra ulaştı! Stop maliyete (`{fp(pos['sl_price'])}`) çekildi. *İşlem artık sıfır risklidir!*")
 
         reason = None
         if pos.get("trailing_active") and price <= pos["trailing_sl_price"]:
@@ -628,15 +757,16 @@ def monitor(state):
             reason = "TIMEOUT"
             
         if reason:
-            if REAL_TRADING: exit_price, real_pnl = execute_real_close(pos, reason)
+            if pos_is_real: exit_price, real_pnl = execute_real_close(pos, reason)
             else: exit_price, real_pnl = price, unrealized_pnl
                 
             record_trade(pos, exit_price, real_pnl, reason, dur)
-            tg(msg_real_close(pos, exit_price, real_pnl, reason, dur))
+            tg(msg_real_close(pos, exit_price, real_pnl, reason, dur, is_real=pos_is_real))
             print(f"🔒 [{reason}] {sym} @ {fp(exit_price)} | Net P&L: ${real_pnl:+.2f}", flush=True)
         else:
             trail_str = f"| Trailing Stop: {fp(pos['trailing_sl_price'])}" if pos.get("trailing_active") else ""
-            print(f"  [AÇIK POZİSYON] {sym} | Fiyat: {fp(price)} | PnL: ${unrealized_pnl:+.2f} (Zirve: ${highest_pnl:+.2f}) | SL: {fp(pos['sl_price'])} {trail_str}", flush=True)
+            prefix = "[GERÇEK]" if pos_is_real else "[SİMÜLASYON]"
+            print(f"  {prefix} {sym} | Fiyat: {fp(price)} | PnL: ${unrealized_pnl:+.2f} (Zirve: ${highest_pnl:+.2f}) | SL: {fp(pos['sl_price'])} {trail_str}", flush=True)
             still.append(pos)
             
     state["positions"] = still
@@ -646,15 +776,13 @@ def monitor(state):
 
 def scan(state, universe):
     eq, free_margin = get_account_balances()
+    is_real = state.get("real_trading", REAL_TRADING_DEFAULT)
     
-    # Küçük kasalarda (< $70) sadece 1 aktif bot pozisyonuna izin ver
     max_allowed_positions = 1 if eq < 70.0 else max(1, min(4, int(eq / 35.0)))
-    
     if len(state.get("positions", [])) >= max_allowed_positions:
         return state
         
-    # Yetersiz serbest teminat koruması (-2019 hatasını önler)
-    if free_margin < 0.60:
+    if is_real and free_margin < 0.60:
         return state
         
     btc_ok, btc_reason = check_btc_shield()
@@ -670,26 +798,36 @@ def scan(state, universe):
         try:
             sig = analyze_market_candidate(sym, btc_reason)
             if sig:
-                print(f"\n✅ [GEMINI 2.5 FLASH ONAYLADI] {sym} (%{sig['ai_conf']})! Gerçek LONG pozisyonu açılıyor...", flush=True)
+                mode_label = "🔴 GERÇEK" if is_real else "🧪 SİMÜLASYON"
+                print(f"\n✅ [{mode_label} ONAY - %{sig['ai_conf']}] {sym}! Pozisyon açılıyor...", flush=True)
                 
-                if REAL_TRADING:
+                if is_real:
                     pos = execute_real_entry(sym, free_margin=free_margin)
                 else:
+                    entry = sig["entry"]
+                    rules = get_symbol_rules(sym)
+                    qty = round_step_size(TARGET_NOTIONAL / entry, rules["stepSize"], rules["quantityPrecision"])
+                    actual_notional = qty * entry
+                    
+                    sl_price = entry - (DEFAULT_SL_USD / qty)
+                    be_trigger_price = entry + (DEFAULT_BE_TRIGGER_USD / qty)
+                    be_sl_price = entry + (0.10 / qty)
+                    
                     pos = {
-                        "sym": sym, "side": "LONG", "entry": sig["entry"],
-                        "qty": round(250.0 / sig["entry"], 2),
-                        "notional_usd": 250.0, "leverage": DEFAULT_LEVERAGE,
-                        "sl_price": sig["entry"] * 0.995,
+                        "sym": sym, "side": "LONG", "entry": entry,
+                        "qty": qty, "notional_usd": round(actual_notional, 2),
+                        "leverage": DEFAULT_LEVERAGE, "sl_price": sl_price,
                         "dyn_sl_usd": DEFAULT_SL_USD, "dyn_tp_trigger_usd": DEFAULT_TP_TRIGGER_USD,
                         "dyn_be_trigger_usd": DEFAULT_BE_TRIGGER_USD, "dyn_trailing_drop_usd": DEFAULT_TRAILING_DROP,
-                        "be_trigger_price": sig["entry"] * 1.004,
-                        "be_sl_price": sig["entry"] * 1.001, "trailing_active": False,
-                        "highest_profit_usd": 0.0, "trailing_sl_price": sig["entry"] * 0.995,
-                        "opened_iso": utc().isoformat(), "opened_ts": ts(), "be_hit": False
+                        "be_trigger_price": be_trigger_price, "be_sl_price": be_sl_price,
+                        "trailing_active": False, "highest_profit_usd": 0.0,
+                        "trailing_sl_price": sl_price, "order_id": f"sim_{str(uuid.uuid4())[:8]}",
+                        "opened_iso": utc().isoformat(), "opened_ts": ts(),
+                        "be_hit": False, "is_real": False
                     }
                     
                 state.setdefault("positions", []).append(pos)
-                tg(msg_real_open(pos, sig))
+                tg(msg_real_open(pos, sig, is_real=is_real))
                 break
         except Exception as e:
             print(f"[İŞLEM AÇILIŞ HATA] {sym}: {e}", flush=True)
@@ -705,6 +843,7 @@ def main():
     print("🧠 BİNANCE MASTER AI (GEMINI 2.5 FLASH) BİLEŞİK SCALP MOTORU", flush=True)
     print("="*65, flush=True)
     print(" 🧠 Karar Verici       : Google Gemini 2.5 Flash (%80+ Güven Şartı)", flush=True)
+    print(" 🎮 İnteraktif Mod     : Telegramdan /gercek veya /fake ile anında geçiş", flush=True)
     print(" ⚡ Kaldıraç & Boyut   : 20x Kaldıraç | Tam $250.00 Pozisyon", flush=True)
     print(" 💸 Hızlı Trailing Kâr : +$1.80 kârda devreye girer, en tepeden satar", flush=True)
     print(" 🔰 Başa Baş Koruma    : +$1.00 kârda stop maliyete çekilir (Sıfır Risk)", flush=True)
@@ -712,18 +851,23 @@ def main():
     print(" 🛡️ Koruma             : BASEDUSDT dokunulmaz | BTC Kalkanı Aktif", flush=True)
     print("="*65, flush=True)
     
-    eq, free_m = get_account_balances()
-    print(f"✅ Toplam Varlık: ${eq:.2f} USDT | Serbest Teminat: ${free_m:.2f} USDT", flush=True)
+    state = load_st()
+    is_real = state.get("real_trading", REAL_TRADING_DEFAULT)
+    mode_text = "🔴 GERÇEK İŞLEM" if is_real else "🧪 SİMÜLASYON (FAKE PARA)"
     
-    tg(f"🚀 *MASTER AI (GEMINI 2.5 FLASH) SCALP MOTORU BAŞLATILDI!*\n\n"
-       f"💰 *Toplam Varlık:* `${eq:.2f} USDT` (Serbest: `${free_m:.2f}`)\n"
-       f"🧠 *Karar Verici:* Google Gemini 2.5 Flash Master AI.\n"
-       f"⚡ *Pozisyon Boyutu:* `20x Kaldıraç` ile tam `$250.00 USDT`.\n"
-       f"💸 *Hızlı Trailing:* `+$1.80` kârda başlar, kârı kilitler.\n"
-       f"🔰 *Başa Baş:* `+$1.00` kârda stop maliyete çekilir (Sıfır Risk).\n"
-       f"🛑 *Sıkı Stop Loss:* `-$1.00` anlık çıkış.\n"
-       f"🛡️ *Korumalı:* `BASEDUSDT` dokunulmaz.\n\n"
-       f"📍 *Durum:* Canlı Yapay Zeka Taraması Aktif ({utc().strftime('%H:%M:%S UTC')})")
+    eq, free_m = get_account_balances()
+    print(f"✅ Toplam Varlık: ${eq:.2f} USDT | Serbest Teminat: ${free_m:.2f} USDT | Mod: {mode_text}", flush=True)
+    
+    tg(f"🚀 *MASTER AI (GEMINI 2.5 FLASH) BOTU YENİLENDİ!*\n\n"
+       f"⚙️ *Aktif Çalışma Modu:* `{mode_text}`\n"
+       f"💰 *Hesap Varlığı:* `${eq:.2f} USDT` (Serbest: `${free_m:.2f}`)\n"
+       f"🧠 *Karar:* Google Gemini 2.5 Flash Master AI.\n\n"
+       f"🎮 *Telegram Komutları:*\n"
+       f"• `/gercek` -> Gerçek parayla işleme geç\n"
+       f"• `/fake` -> Simülasyon (Fake Para) moduna geç\n"
+       f"• `/rapor` -> Günün kâr/zarar karnesini al\n"
+       f"• `/durum` -> Anlık pozisyon ve bakiye\n"
+       f"• `/kapat` -> Açık pozisyonu hemen kapat")
 
     last_scan_time = 0
     last_heartbeat_time = 0
@@ -733,10 +877,15 @@ def main():
             state = load_st()
             now = time.time()
             
+            # Telegram komutlarını anlık dinle
+            state = handle_telegram_commands(state)
+            
             if now - last_heartbeat_time >= 60:
                 eq, free_m = get_account_balances()
                 open_count = len(state.get("positions", []))
-                print(f"💓 [CANLI DURUM] Varlık: ${eq:.2f} USDT (Serbest: ${free_m:.2f}) | Açık Bot Pozisyonu: {open_count} | Saat: {utc().strftime('%H:%M:%S UTC')}", flush=True)
+                is_real = state.get("real_trading", REAL_TRADING_DEFAULT)
+                mode_tag = "GERÇEK" if is_real else "SİMÜLASYON"
+                print(f"💓 [CANLI DURUM] Varlık: ${eq:.2f} USDT (Serbest: ${free_m:.2f}) | Pozisyon: {open_count} | Mod: {mode_tag} | Saat: {utc().strftime('%H:%M:%S UTC')}", flush=True)
                 last_heartbeat_time = now
             
             if state.get("positions"):
