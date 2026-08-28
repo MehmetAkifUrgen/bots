@@ -108,6 +108,29 @@ def tg(txt):
     except Exception as e:
         print(f"[TG HATA] {e}", flush=True)
 
+# ── SANAL KASA (VIRTUAL WALLET) MOTORU ───────────────────────────────────────
+SIM_STARTING_BALANCE = 100.0   # Sanal Test Başlangıç Kasası: Tam $100.00 USDT
+
+def get_virtual_balance(state):
+    trades = load_db()
+    sim_trades = [t for t in trades if not t.get("is_real", False)]
+    sim_realized_pnl = sum(t.get("pnl", 0.0) for t in sim_trades)
+    
+    unrealized_pnl = 0.0
+    used_margin = 0.0
+    for p in state.get("positions", []):
+        if not p.get("is_real", False):
+            try:
+                cp = last_price(p["sym"])
+                unrealized_pnl += (cp - p["entry"]) * p["qty"]
+            except Exception:
+                pass
+            used_margin += p.get("notional_usd", TARGET_NOTIONAL) / p.get("leverage", DEFAULT_LEVERAGE)
+            
+    virtual_equity = round(SIM_STARTING_BALANCE + sim_realized_pnl + unrealized_pnl, 2)
+    virtual_free_margin = round(max(0.0, virtual_equity - used_margin), 2)
+    return virtual_equity, virtual_free_margin, sim_realized_pnl
+
 # ── TELEGRAM KOMUT DİNLEYİCİ (INTERACTIVE BOT) ───────────────────────────────
 
 LAST_UPDATE_ID = 0
@@ -142,32 +165,49 @@ def handle_telegram_commands(state):
             elif text in ["/fake", "/paper", "/simulasyon", "fake", "paper"]:
                 state["real_trading"] = False
                 save_st(state)
-                tg("🟢 *MOD DEĞİŞTİRİLDİ: SİMÜLASYON (FAKE PARA) MODU AKTİF!* 🧪\n\nİşlemler sanal bakiye ile canlı piyasa fiyatlarında test edilecektir. Hesabındaki gerçek paraya dokunulmaz.")
+                virt_eq, virt_free, _ = get_virtual_balance(state)
+                tg(f"🟢 *MOD DEĞİŞTİRİLDİ: SİMÜLASYON (FAKE PARA) MODU AKTİF!* 🧪\n\n"
+                   f"💰 *Sanal Kasa:* `${virt_eq:.2f} USDT` (Başlangıç: `$100.00 USDT`)\n"
+                   f"İşlemler $100 sanal bakiye ile canlı piyasa fiyatlarında test edilecektir. Hesabındaki gerçek paraya dokunulmaz.")
                 print("🧪 [MOD DEĞİŞTİ] SİMÜLASYON MODU AKTİF EDİLDİ.", flush=True)
                 
             # 3. /rapor veya /kar veya /gunsonu
             elif text in ["/rapor", "/kar", "/gunsonu", "/pnl", "rapor"]:
-                send_performance_report()
+                send_performance_report(state)
                 
             # 4. /durum veya /status
             elif text in ["/durum", "/status", "durum"]:
-                eq, free_m = get_account_balances()
                 is_real = state.get("real_trading", REAL_TRADING_DEFAULT)
-                mode_str = "🔴 GERÇEK İŞLEM" if is_real else "🟢 SİMÜLASYON (FAKE PARA)"
                 open_positions = state.get("positions", [])
+                
+                if is_real:
+                    eq, free_m = get_account_balances()
+                    mode_str = "🔴 GERÇEK İŞLEM"
+                    balance_txt = f"💰 *Gerçek Hesap Varlığı:* `${eq:.2f} USDT` (Serbest: `${free_m:.2f}`)"
+                else:
+                    virt_eq, virt_free, sim_pnl = get_virtual_balance(state)
+                    mode_str = "🧪 SİMÜLASYON ($100 FAKE PARA)"
+                    pnl_sign = f"+${sim_pnl:.2f}" if sim_pnl >= 0 else f"-${abs(sim_pnl):.2f}"
+                    balance_txt = (
+                        f"💰 *Sanal Kasa:* `${virt_eq:.2f} USDT` (Serbest: `${virt_free:.2f}`)\n"
+                        f"🏁 *Başlangıç:* `$100.00 USDT` | *Net PnL:* `{pnl_sign}`"
+                    )
                 
                 pos_txt = "Açık pozisyon yok."
                 if open_positions:
-                    p = open_positions[0]
-                    cur_p = last_price(p["sym"])
-                    pnl = (cur_p - p["entry"]) * p["qty"]
-                    pos_txt = f"• *{p['sym']}* | Giriş: `{fp(p['entry'])}` | Anlık: `{fp(cur_p)}` | PnL: *`${pnl:+.2f} USDT`*"
+                    p_lines = []
+                    for idx, p in enumerate(open_positions):
+                        try: cur_p = last_price(p["sym"])
+                        except: cur_p = p["entry"]
+                        pnl = (cur_p - p["entry"]) * p["qty"]
+                        p_lines.append(f"{idx+1}. *{p['sym']}* | Giriş: `{fp(p['entry'])}` | Anlık: `{fp(cur_p)}` | PnL: *`${pnl:+.2f} USDT`*")
+                    pos_txt = "\n".join(p_lines)
                 
                 tg(f"📊 *CANLI SİSTEM DURUMU*\n\n"
                    f"⚙️ *Çalışma Modu:* `{mode_str}`\n"
-                   f"💰 *Hesap Varlığı:* `${eq:.2f} USDT` (Serbest: `${free_m:.2f}`)\n"
-                   f"📌 *Aktif Pozisyon:* {pos_txt}\n\n"
-                   f"Komutlar: `/gercek`, `/fake`, `/rapor`, `/kapat`")
+                   f"{balance_txt}\n\n"
+                   f"📌 *Aktif Pozisyonlar ({len(open_positions)}/4):*\n{pos_txt}\n\n"
+                   f"_(Komutlar: `/gercek`, `/fake`, `/rapor`, `/kapat`)_")
                    
             # 5. /kapat (Mevcut işlemi hemen kapat)
             elif text in ["/kapat", "/close", "kapat"]:
@@ -175,10 +215,10 @@ def handle_telegram_commands(state):
                     for p in state["positions"]:
                         cur_p = last_price(p["sym"])
                         pnl = (cur_p - p["entry"]) * p["qty"]
-                        if state.get("real_trading", REAL_TRADING_DEFAULT):
+                        if p.get("is_real", False):
                             execute_real_close(p, "MANUEL_TELEGRAM_KAPATMA")
                         record_trade(p, cur_p, pnl, "MANUEL_TELEGRAM_KAPATMA", 60)
-                        tg(f"🔒 *{p['sym']}* Telegram komutuyla anında kapatıldı! Net PnL: *`${pnl:+.2f} USDT`*")
+                        tg(f"🔒 *{p['sym']}* Telegram komutuyla kapatıldı! Net PnL: *`${pnl:+.2f} USDT`*")
                     state["positions"] = []
                     save_st(state)
                 else:
@@ -187,23 +227,29 @@ def handle_telegram_commands(state):
             # 6. /yardim veya /help
             elif text in ["/yardim", "/help", "yardim"]:
                 tg("🤖 *TELEGRAM BOT KOMUTLARI:*\n\n"
-                   "• `/fake` -> Simülasyon (Fake Para) moduna geç\n"
+                   "• `/fake` -> Simülasyon ($100 Fake Para) moduna geç\n"
                    "• `/gercek` -> Gerçek Binance vadeli işlem moduna geç\n"
                    "• `/rapor` -> Günün/Toplamın kâr-zarar raporunu al\n"
                    "• `/durum` -> Anlık kasa ve pozisyon durumunu gör\n"
-                   "• `/kapat` -> Açık olan pozisyonu hemen kapat")
+                   "• `/kapat` -> Açık olan pozisyonları hemen kapat")
     except Exception as e:
         print(f"[TG KOMUT HATA] {e}", flush=True)
         
     return state
 
-def send_performance_report():
+def send_performance_report(state):
+    is_real = state.get("real_trading", REAL_TRADING_DEFAULT)
     trades = load_db()
-    if not trades:
-        tg("📊 *Henüz tamamlanmış bir işlem bulunmuyor.* Bot piyasayı taramaya devam ediyor!")
+    
+    # Aktif moda göre trade listesini filtrele
+    filtered_trades = [t for t in trades if t.get("is_real", False) == is_real]
+    mode_title = "🔴 GERÇEK İŞLEM RAPORU" if is_real else "🧪 SİMÜLASYON ($100 SANAL KASA) RAPORU"
+    
+    if not filtered_trades:
+        tg(f"📊 *{mode_title}*\n\nHenüz tamamlanmış bir işlem bulunmuyor. Bot 229 pariteyi taramaya devam ediyor!")
         return
         
-    df_t = pd.DataFrame(trades)
+    df_t = pd.DataFrame(filtered_trades)
     tot = len(df_t)
     wins = df_t[df_t["pnl"] > 0]
     losses = df_t[df_t["pnl"] < 0]
@@ -224,16 +270,22 @@ def send_performance_report():
         
     rec_txt = "\n".join(recent_lines)
     
-    tg(f"📊 *GÜN SONU / PERFORMANS RAPORU*\n"
+    extra_b = ""
+    if not is_real:
+        virt_eq, _, _ = get_virtual_balance(state)
+        extra_b = f"• *Başlangıç Kasası:* `$100.00 USDT`\n• *Güncel Sanal Kasa:* *`${virt_eq:.2f} USDT`*\n"
+    
+    tg(f"📊 *{mode_title}*\n"
        f"━━━━━━━━━━━━━━━━━━━━\n"
-       f"• *Toplam İşlem:* `{tot}`\n"
+       f"{extra_b}"
+       f"• *Toplam Yapılan İşlem:* `{tot}`\n"
        f"• *Kazanılan:* `{win_cnt}` (%{wr:.1f} Win Rate)\n"
        f"• *Kaybedilen:* `{loss_cnt}`\n"
        f"• *Kâr Faktörü (PF):* `{pf:.2f}`\n"
        f"━━━━━━━━━━━━━━━━━━━━\n"
        f"💰 *TOPLAM NET KÂR/ZARAR:* *`${total_net:+.2f} USDT`*\n"
        f"━━━━━━━━━━━━━━━━━━━━\n"
-       f"*Son İşlemler:*\n{rec_txt}\n\n"
+       f"*Son Kapanan İşlemler:*\n{rec_txt}\n\n"
        f"Zaman: `{ts()}`")
 
 # ── GEMINI 2.5 FLASH ANA YAPAY ZEKA BEYNİ (MASTER SCALP AI) ──────────────────
@@ -893,24 +945,37 @@ def main():
             state = handle_telegram_commands(state)
             
             if now - last_heartbeat_time >= 60:
-                eq, free_m = get_account_balances()
-                open_count = len(state.get("positions", []))
                 is_real = state.get("real_trading", REAL_TRADING_DEFAULT)
-                mode_tag = "GERÇEK" if is_real else "SİMÜLASYON"
-                print(f"💓 [CANLI DURUM] Varlık: ${eq:.2f} USDT (Serbest: ${free_m:.2f}) | Pozisyon: {open_count} | Mod: {mode_tag} | Saat: {utc().strftime('%H:%M:%S UTC')}", flush=True)
+                if is_real:
+                    eq, free_m = get_account_balances()
+                    mode_tag = "GERÇEK"
+                    bal_str = f"Varlık: ${eq:.2f} USDT (Serbest: ${free_m:.2f})"
+                else:
+                    virt_eq, virt_free, _ = get_virtual_balance(state)
+                    mode_tag = "SİMÜLASYON"
+                    bal_str = f"Sanal Kasa: ${virt_eq:.2f} USDT (Serbest: ${virt_free:.2f})"
+                    
+                open_count = len(state.get("positions", []))
+                print(f"💓 [CANLI DURUM] {bal_str} | Pozisyon: {open_count}/4 | Mod: {mode_tag} | Saat: {utc().strftime('%H:%M:%S UTC')}", flush=True)
                 last_heartbeat_time = now
             
+            # 1. Açık pozisyonları anlık izle ve kârı/stopu yönet
             if state.get("positions"):
                 state = monitor(state)
                 save_st(state)
-                time.sleep(1.5)
-            else:
+                
+            # 2. Eğer pozisyon limiti dolmamışsa piyasayı taramaya devam et (Simülasyonda 4'e kadar)
+            is_real = state.get("real_trading", REAL_TRADING_DEFAULT)
+            max_pos = 4 if not is_real else (1 if get_account_balances()[0] < 70.0 else 2)
+            
+            if len(state.get("positions", [])) < max_pos:
                 if now - last_scan_time >= 15:
                     universe = get_universe()
                     state = scan(state, universe)
                     save_st(state)
                     last_scan_time = time.time()
-                time.sleep(1.0)
+                    
+            time.sleep(1.2)
                 
         except Exception as e:
             print(f"[HATA] Ana Döngü: {e}", flush=True)
