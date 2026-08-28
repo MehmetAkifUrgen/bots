@@ -61,9 +61,9 @@ DEFAULT_SL_USD          = 1.00  # -$1.00 Stop Loss (Hızlı çıkış, minimum k
 # MANUEL POZİSYON KORUMASI VE HANTAL COİN KARA LİSTESİ
 PROTECTED_SYMBOLS = {"BASEDUSDT", "BASED", "TRXUSDT", "TRX", "FDUSDUSDT", "USDCUSDT"}
 
-# LİKİDİTE VE TEKNİK FİLTRELER
-MIN_VOL_USD      = 8_000_000.0   # Yüksek likidite
-MAX_VOL_USD      = 250_000_000.0
+# LİKİDİTE VE TEKNİK FİLTRELER (Tüm Binance Vadeli Piyasasını Kapsar)
+MIN_VOL_USD      = 3_000_000.0   # $3M üzeri tüm hareketli pariteler
+MAX_VOL_USD      = 800_000_000.0 # $800M hacme kadar tüm coinler
 MIN_VOL_MULTIPLIER = 2.2
 
 STABLE = {"USDC","BUSD","DAI","TUSD","USDP","FDUSD","USDD","FRAX","GUSD","LUSD","USTC","EURC"}
