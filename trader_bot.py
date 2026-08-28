@@ -93,11 +93,18 @@ def tg(txt):
         print(f"[TG BİLDİRİM] {txt}", flush=True)
         return
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TK}/sendMessage",
             json={"chat_id": TC, "text": txt, "parse_mode": "Markdown", "disable_web_page_preview": True},
-            timeout=15
+            timeout=12
         )
+        if r.status_code != 200:
+            # Markdown hatası olursa düz metin olarak tekrar dene
+            requests.post(
+                f"https://api.telegram.org/bot{TK}/sendMessage",
+                json={"chat_id": TC, "text": txt.replace("*", "").replace("`", "").replace("_", ""), "disable_web_page_preview": True},
+                timeout=12
+            )
     except Exception as e:
         print(f"[TG HATA] {e}", flush=True)
 
@@ -778,7 +785,12 @@ def scan(state, universe):
     eq, free_margin = get_account_balances()
     is_real = state.get("real_trading", REAL_TRADING_DEFAULT)
     
-    max_allowed_positions = 1 if eq < 70.0 else max(1, min(4, int(eq / 35.0)))
+    # Simülasyonda (Fake) 4 pozisyona kadar izin ver; Gerçekte kasa koruması
+    if not is_real:
+        max_allowed_positions = 4
+    else:
+        max_allowed_positions = 1 if eq < 70.0 else max(1, min(4, int(eq / 35.0)))
+        
     if len(state.get("positions", [])) >= max_allowed_positions:
         return state
         
