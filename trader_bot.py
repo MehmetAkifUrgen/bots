@@ -415,10 +415,10 @@ def execute_real_entry(sym, free_margin):
     rules = get_symbol_rules(sym)
     price = last_price(sym)
     
-    # $250 pozisyon büyüklüğü hedefi (Kasadan ~$12.50 bağlanır)
+    # Serbest teminata göre güvenli pozisyon büyüklüğü ($10 min, $250 max)
     target_usd = TARGET_NOTIONAL
     max_safe_notional = free_margin * actual_lev * 0.85
-    actual_notional_target = min(target_usd, max_safe_notional)
+    actual_notional_target = min(target_usd, max(10.0, max_safe_notional))
     
     raw_qty = actual_notional_target / price
     qty = round_step_size(raw_qty, rules["stepSize"], rules["quantityPrecision"])
@@ -435,14 +435,16 @@ def execute_real_entry(sym, free_margin):
     avg_price = float(order_res.get("avgPrice", 0))
     if avg_price <= 0: avg_price = price
         
-    dyn_tp_trigger_usd = DEFAULT_TP_TRIGGER_USD
-    dyn_trailing_drop_usd = DEFAULT_TRAILING_DROP
-    dyn_be_trigger_usd = DEFAULT_BE_TRIGGER_USD
-    dyn_sl_usd = DEFAULT_SL_USD
+    # Dinamik Oransal Kâr ve Stop (Pozisyon büyüklüğüne göre otomatik ölçeklenir)
+    scale_factor = min(1.0, max(0.40, actual_notional / 250.0))
+    dyn_tp_trigger_usd = round(DEFAULT_TP_TRIGGER_USD * scale_factor, 2)
+    dyn_trailing_drop_usd = round(DEFAULT_TRAILING_DROP * scale_factor, 2)
+    dyn_be_trigger_usd = round(DEFAULT_BE_TRIGGER_USD * scale_factor, 2)
+    dyn_sl_usd = round(DEFAULT_SL_USD * scale_factor, 2)
     
     sl_price = avg_price - (dyn_sl_usd / qty)
     be_trigger_price = avg_price + (dyn_be_trigger_usd / qty)
-    be_sl_price = avg_price + (0.20 / qty)
+    be_sl_price = avg_price + (0.10 / qty)
     
     return {
         "sym": sym, "side": "LONG", "entry": avg_price, "qty": qty,
@@ -652,7 +654,7 @@ def scan(state, universe):
         return state
         
     # Yetersiz serbest teminat koruması (-2019 hatasını önler)
-    if free_margin < 5.0:
+    if free_margin < 0.60:
         return state
         
     btc_ok, btc_reason = check_btc_shield()
