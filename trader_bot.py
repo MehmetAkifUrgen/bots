@@ -299,7 +299,7 @@ def gemini_master_ai_decision(sym, price, rsi_15m, rsi_5m, vol_ratio, btc_status
 Sen dünyanın en başarılı Kripto Vadeli Scalp Fon Yöneticisisin.
 Amacımız: Kasayı 20x kaldıraç ile $250 büyüklüğünde LONG scalp pozisyonları açarak adım adım büyütmek.
 
-GÖREV: Aşağıdaki pariteye ait anlık mumları, hacim patlamasını ve piyasa yapısını titizlikle incele.
+GÖREV: Aşağıdaki pariteye ait anlık mumları, hacim durumunu ve piyasa yapısını değerlendir.
 
 Parite: {sym}
 Anlık Fiyat: {price}
@@ -309,9 +309,9 @@ BTC Durumu: {btc_status}
 Son Mumlar (OHLC): {candles_summary}
 
 KURALLAR:
-1. Eğer mum yapısında güçlü alıcı baskısı, basamak yükselişi veya direnç kırılımı varsa APPROVE ver.
-2. Eğer sahte pump (fakeout), tepe iğnesi veya düşüş riski varsa kesinlikle REJECT ver.
-3. Sadece kazanma ihtimali çok yüksek (%80+) net fırsatları onayla.
+1. Eğer paritede 5m veya 15m'de kısa vadeli yukarı ivme, dip toparlanması, basamak veya alıcı hacmi varsa APPROVE ver.
+2. Sadece bariz sert çöküş veya tepe iğnesi (fakeout pump) durumlarında REJECT ver.
+3. Fırsat gördüğün kaliteli her pozisyonu onayla.
 
 SADECE aşağıdaki JSON formatında yanıt ver:
 {{
@@ -332,9 +332,9 @@ SADECE aşağıdaki JSON formatında yanıt ver:
             content_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
             parsed = json.loads(content_text)
             decision = parsed.get("decision", "APPROVE").upper()
-            confidence = int(parsed.get("confidence", 80))
+            confidence = int(parsed.get("confidence", 75))
             reason = parsed.get("reason", "Yapay zeka alıcı baskısını onayladı.")
-            is_approved = (decision == "APPROVE" and confidence >= 75)
+            is_approved = (decision == "APPROVE" and confidence >= 70)
             return is_approved, confidence, reason
     except Exception as e:
         print(f"[GEMINI EXCEPTION] {e}", flush=True)
@@ -516,15 +516,15 @@ def get_universe():
         print(f"[UNIVERSE HATA] {e}", flush=True)
         return []
 
-# ── YAPAY ZEKA GÖZLEM VE SİNYAL ADAY MOTORU ──────────────────────────────────
+# ── YAPAY ZEKA GÖZLEM VE SİNYAL ADAY MOTORU (%100 AI KARARI) ─────────────────
 
 def analyze_market_candidate(sym, btc_status):
     try:
-        df15m = klines(sym, "15m", 50)
-        if len(df15m) < 40: return None
+        df15m = klines(sym, "15m", 40)
+        if len(df15m) < 30: return None
         
-        df5m = klines(sym, "5m", 30)
-        if len(df5m) < 20: return None
+        df5m = klines(sym, "5m", 25)
+        if len(df5m) < 15: return None
         
         c15 = df15m.iloc[-1]
         c, o, h, l = c15['c'], c15['o'], c15['h'], c15['l']
@@ -533,23 +533,17 @@ def analyze_market_candidate(sym, btc_status):
         
         vol_avg = df15m['v'].iloc[-20:-2].mean()
         vol_now = c15['v'] + df15m['v'].iloc[-2]
-        vol_ratio = (vol_now / vol_avg) if vol_avg > 0 else 1.0
+        vol_ratio = round((vol_now / vol_avg), 1) if vol_avg > 0 else 1.0
         
         ema20 = df15m['c'].ewm(span=20, adjust=False).mean().iloc[-1]
-        ema50 = df15m['c'].ewm(span=50, adjust=False).mean().iloc[-1]
         
-        last_4 = [f"M{idx+1}: O={row['o']:.4f} C={row['c']:.4f} H={row['h']:.4f} L={row['l']:.4f} V={row['v']:.0f}" for idx, row in df15m.iloc[-4:].iterrows()]
-        candles_summary = " | ".join(last_4)
+        # Son 5 mumun özeti (Açılış, Yüksek, Düşük, Kapanış, Hacim)
+        last_5 = [f"M{idx+1}: O={row['o']:.4f} H={row['h']:.4f} L={row['l']:.4f} C={row['c']:.4f}" for idx, row in df15m.iloc[-5:].iterrows()]
+        candles_summary = " | ".join(last_5)
         
-        p1 = df15m["l"].iloc[-48:-36].min() if len(df15m) >= 48 else df15m["l"].iloc[-36:-24].min()
-        p2 = df15m["l"].iloc[-24:-12].min()
-        p3 = df15m["l"].iloc[-12:].min()
-        
-        is_staircase = (p1 < p2 < p3) and (ema20 >= ema50) and (45.0 <= rsi_15m <= 68.0)
-        is_breakout = (vol_ratio >= MIN_VOL_MULTIPLIER) and (52.0 <= rsi_15m <= 75.0) and (c >= o)
-        
-        if is_staircase or is_breakout:
-            strategy_name = "BASAMAK_AKÜMÜLASYONU" if is_staircase else "HACİMLİ_BREAKOUT"
+        # Ön Filtre: Sadece aşırı çöken ölü coinleri ele (RSI > 40 veya yeşil mum veya EMA20 üzeri)
+        # Geriye kalan TÜM kararı Gemini 2.5 Flash Yapay Zekası verir!
+        if rsi_15m >= 40.0 or c >= o or c >= ema20:
             entry = last_price(sym)
             
             ai_approved, ai_confidence, ai_reason = gemini_master_ai_decision(
@@ -560,20 +554,20 @@ def analyze_market_candidate(sym, btc_status):
             
             if ai_approved:
                 return {
-                    "sym": sym, "side": "LONG", "mode": strategy_name,
+                    "sym": sym, "side": "LONG", "mode": "YAPAY_ZEKA_SCALP",
                     "entry": entry, "rsi": rsi_15m,
                     "ai_conf": ai_confidence, "ai_reason": ai_reason,
                     "reasons": [
-                        f"🧠 *AI Onayı:* %{ai_confidence} Güven — _{ai_reason}_",
-                        f"📊 *Formasyon:* {strategy_name} (Hacim: `{vol_ratio:.1f}x`)",
-                        f"📈 *İndikatör:* 15m RSI `{rsi_15m:.1f}` | 5m RSI `{rsi_5m:.1f}`"
+                        f"🧠 *Gemini 2.5 AI Kararı:* %{ai_confidence} Güven — _{ai_reason}_",
+                        f"📊 *Hacim Durumu:* `{vol_ratio}x` katı alıcı hacmi",
+                        f"📈 *Momentum:* 15m RSI `{rsi_15m:.1f}` | 5m RSI `{rsi_5m:.1f}`"
                     ]
                 }
             else:
                 print(f"❌ [GEMINI RED] {sym} (%{ai_confidence}) — {ai_reason}", flush=True)
 
         return None
-    except Exception:
+    except Exception as e:
         return None
 
 # ── EMİR VE TEMİNAT YÖNETİMİ ────────────────────────────────────────────────
@@ -846,12 +840,7 @@ def scan(state, universe):
     if len(state.get("positions", [])) >= max_allowed_positions:
         return state
         
-    if is_real and free_margin < 0.60:
-        return state
-        
-    btc_ok, btc_reason = check_btc_shield()
-    if not btc_ok:
-        return state
+    _, btc_reason = check_btc_shield()
 
     open_syms = {p["sym"] for p in state.get("positions", [])}
     open_syms.update(PROTECTED_SYMBOLS)
