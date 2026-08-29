@@ -19,6 +19,7 @@ import time
 import urllib.parse
 import uuid
 from datetime import datetime, timezone
+import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
