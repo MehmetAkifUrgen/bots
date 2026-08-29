@@ -334,7 +334,7 @@ SADECE aşağıdaki JSON formatında yanıt ver:
             decision = parsed.get("decision", "APPROVE").upper()
             confidence = int(parsed.get("confidence", 80))
             reason = parsed.get("reason", "Yapay zeka alıcı baskısını onayladı.")
-            is_approved = (decision == "APPROVE" and confidence >= 80)
+            is_approved = (decision == "APPROVE" and confidence >= 75)
             return is_approved, confidence, reason
     except Exception as e:
         print(f"[GEMINI EXCEPTION] {e}", flush=True)
@@ -477,16 +477,16 @@ def check_btc_shield():
         last_c = df15m.iloc[-1]
         c, o = last_c['c'], last_c['o']
         
-        if c < o and ((o - c) / o) > 0.0035:
-            return False, "BTC Anlık Şelalede (15m Sert Kırmızı Mum)"
+        # 1. 15m mumunda sert çöküş (%0.50'den büyük kırmızı mum)
+        if c < o and ((o - c) / o) > 0.0050:
+            return False, "BTC Anlık Şelalede (15m Sert Düşüş)"
             
+        # 2. 1h aşırı panik satışı (RSI < 30)
         df1h = klines("BTCUSDT", "1h", 40)
         if len(df1h) >= 25:
-            ema20 = df1h['c'].ewm(span=20, adjust=False).mean().iloc[-1]
-            ema50 = df1h['c'].ewm(span=50, adjust=False).mean().iloc[-1]
             rsi_btc = calc_rsi(df1h['c'], 14)
-            if df1h['c'].iloc[-1] < ema20 and ema20 < ema50 and rsi_btc < 42.0:
-                return False, f"BTC 1h Düşüş Trendinde (RSI:{rsi_btc:.1f})"
+            if rsi_btc < 30.0:
+                return False, f"BTC 1h Aşırı Panik Satışında (RSI:{rsi_btc:.1f})"
                 
         return True, "BTC Uygun (Piyasa Onaylı)"
     except Exception as e:
