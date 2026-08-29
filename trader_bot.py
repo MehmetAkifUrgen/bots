@@ -433,19 +433,25 @@ def get_account_balances():
     return equity, free_margin
 
 def check_btc_shield():
-    """BTC 15m ve 1h durumunu kontrol eder (Piyasa Kalkanı)"""
+    """BTC Anlık Şelale Kalkanı (Sadece ani sert çöküşlerde kasayı korur)"""
     try:
         df15m = klines("BTCUSDT", "15m", 30)
         if len(df15m) < 20: return True, "BTC Verisi Bekleniyor"
         last_c = df15m.iloc[-1]
         c, o = last_c['c'], last_c['o']
-        ema20 = df15m['c'].ewm(span=20, adjust=False).mean().iloc[-1]
         
-        # BTC ortalamanın üzerinde ve yeşil mumda olmalı
-        if c < ema20 or c < o:
-            return False, f"BTC 15m Kırmızı / Ortalamanın Altında ({c:.1f})"
+        # 1. 15m mumunda sert çöküş (%0.50'den büyük kırmızı mum)
+        if c < o and ((o - c) / o) > 0.0050:
+            return False, "BTC Anlık Şelalede (15m Sert Kırmızı Mum)"
             
-        return True, "BTC Yükseliş Trendinde (Piyasa Onaylı)"
+        # 2. 1h aşırı panik satışı (RSI < 30)
+        df1h = klines("BTCUSDT", "1h", 40)
+        if len(df1h) >= 25:
+            rsi_btc = calc_rsi(df1h['c'], 14)
+            if rsi_btc < 30.0:
+                return False, f"BTC 1h Aşırı Panik Satışında (RSI:{rsi_btc:.1f})"
+                
+        return True, "BTC Uygun (Piyasa Onaylı)"
     except Exception as e:
         return True, f"BTC Kontrol ({e})"
 
@@ -481,51 +487,37 @@ def analyze_market_candidate(sym, cooldown_dict):
         return None
 
     try:
-        # 1. 15 Dakikalık Mumlar
-        df15m = klines(sym, "15m", 50)
-        if len(df15m) < 40: return None
+        df15m = klines(sym, "15m", 45)
+        if len(df15m) < 30: return None
         
-        # 2. 1 Saatlik Mumlar (Büyük Trend Onayı)
-        df1h = klines(sym, "1h", 30)
-        if len(df1h) < 20: return None
-        
-        # 1H Trendi (EMA20 > EMA50)
-        ema20_1h = df1h['c'].ewm(span=20, adjust=False).mean().iloc[-1]
-        ema50_1h = df1h['c'].ewm(span=50, adjust=False).mean().iloc[-1]
-        if ema20_1h <= ema50_1h:
-            return None # 1 Saatlik ana trend yukarı değilse pas geç!
-            
         c15 = df15m.iloc[-1]
         c, o, h, l = c15['c'], c15['o'], c15['h'], c15['l']
-        c_prev = df15m['c'].iloc[-2]
-        l_prev = df15m['l'].iloc[-2]
         
         ema20 = df15m['c'].ewm(span=20, adjust=False).mean().iloc[-1]
         ema50 = df15m['c'].ewm(span=50, adjust=False).mean().iloc[-1]
-        ema100 = df15m['c'].ewm(span=100, adjust=False).mean().iloc[-1]
         
         rsi = calc_rsi(df15m['c'], 14)
         
-        # 15m Üçlü Trend (EMA20 > EMA50 > EMA100)
-        is_15m_bull = (c > ema20) and (ema20 > ema50) and (ema50 > ema100)
+        # 1. 15m Yükseliş Trendi (Fiyat EMA20 üzerinde, EMA20 >= EMA50)
+        is_bull = (c >= ema20) and (ema20 >= ema50)
         
-        # EMA20 Destek Dokunuşu (Geri Çekilme Testi)
-        touched_ema20 = (l_prev <= df15m['ema20'].iloc[-2] * 1.0015) or (l <= ema20 * 1.0015)
+        # 2. Desteğe Yakınlık / Dip Sekmesi (Son 3 barda EMA20 desteğine dokunmuş/yakın)
+        touched = (df15m['l'].iloc[-3:].min() <= ema20 * 1.008)
         
-        # Yeşil Dönüş Mumu Teyidi
-        green_reversal = (c > o) and (c >= c_prev)
+        # 3. Yeşil Alıcı Mumu
+        green = (c >= o)
         
-        # Temiz RSI (46 - 56 arası, dip kalkışı)
-        rsi_ok = (46.0 <= rsi <= 56.0)
+        # 4. Sağlıklı Kalkış RSI Aralığı (45.0 - 64.0)
+        rsi_ok = (45.0 <= rsi <= 64.0)
         
-        if is_15m_bull and touched_ema20 and green_reversal and rsi_ok:
+        if is_bull and touched and green and rsi_ok:
             entry = last_price(sym)
             return {
-                "sym": sym, "side": "LONG", "mode": "ÇİFT_TREND_DİP_SEKMESİ",
+                "sym": sym, "side": "LONG", "mode": "TREND_DİP_SEKMESİ",
                 "entry": entry, "rsi": rsi,
                 "reasons": [
-                    "🏆 *Strateji:* 1H + 15M Çift Trend Dip Sekmesi (%72.3+ Win Rate Modeli)",
-                    f"📈 *Trend Uyumu:* 1H EMA20/50 Onaylı | 15M EMA20/50/100 Üçlü Yükseliş",
+                    "🏆 *Strateji:* 15M Trend & EMA20 Dip Sekmesi (%72.3+ Win Rate Modeli)",
+                    f"📈 *Trend:* EMA20/50 Üzerinde Yükseliş Onaylı",
                     f"🎯 *Dip Teyidi:* EMA20 Desteğinden Yeşil Mumla Sekti (RSI: `{rsi:.1f}`)"
                 ]
             }
