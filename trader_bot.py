@@ -1,18 +1,13 @@
 """
-trader_bot.py — Yapay Zeka Beyinli (Gemini 2.5 Flash) Bileşik Scalp Robotu
-• Mod Yönetimi: Varsayılan SİMÜLASYON (Fake Para). Telegram komutu ile GERÇEK moda geçebilir!
-• Telegram Komutları:
-    /gercek   -> Gerçek Binance vadeli işlem modunu açar
-    /fake     -> Simülasyon (Fake Para) moduna geçer
-    /rapor    -> Günlük kâr/zarar ve işlem karnesini Telegram'a döker
-    /durum    -> Anlık kasa ve açık pozisyon durumunu gösterir
-    /kapat    -> Açık olan işlemi piyasa fiyatından hemen kapatır
-• Karar Verici: %100 Google Gemini 2.5 Flash Master AI
-• Pozisyon: 20x Kaldıraç | $250 Notional Scalp
+trader_bot.py — Binance Pre-Pump Balina Akümülasyonu & Patlama Avcısı (Gemini 2.5 Flash)
+• Ana Strateji: PRE_PUMP_ACCUMULATION (Fiyat %0-2 yatayken gelen gizli hacim patlaması, Taker Buy > %56 ve Bollinger Sıkışması)
+• 2. Strateji: BREAKOUT_LONG (24s Direnç Kırılımı & Hacim)
+• Cooldown Kilidi: Stop olan veya kapatılan coine 60 dakika boyunca tekrar girilmez (Revenge Trading Engeli)
+• Mod Yönetimi: Varsayılan SİMÜLASYON ($100 Sanal Kasa | 4 Eşzamanlı Pozisyon). Telegram'dan /gercek ile geçiş!
 • Trailing Kâr: +$1.80 kârda başlar, zirveden $0.80 çekilince satar (+1.00$ kâr garanti)
-• Başa Baş: +$1.00 kârda stop maliyete (+0.10$) çekilir (Sıfır Risk)
-• Stop Loss: -$1.00 seviyesinde anlık koruma
-• Koruma: BASEDUSDT dokunulmaz | BTC Düşüş Kalkanı Aktif
+• Başa Baş: +$1.00 kârda stop maliyete çekilir (Sıfır Risk)
+• Stop Loss: -$1.00 seviyesinde anlık çıkış
+• Koruma: BASEDUSDT dokunulmaz | BTC Kalkanı Aktif
 """
 
 import hashlib
@@ -45,12 +40,12 @@ SF          = os.getenv("STATE_FILE", "trader_state.json")
 DB          = os.getenv("TRADE_DB",   "trade_db.json")
 
 # ── STRATEJİ VE RİSK PARAMETRELERİ ───────────────────────────────────────────
-# Varsayılan olarak FAKE PARA (Simülasyon). Telegramdan /gercek yazarak değiştirilebilir.
 REAL_TRADING_DEFAULT = os.getenv("REAL_TRADING", "false").lower() == "true"
 TARGET_NOTIONAL      = 250.0       # Hedef Pozisyon: Tam $250.00 USDT
 DEFAULT_LEVERAGE     = 20          # 20x Kaldıraç ($250 için sadece $12.50 teminat)
 SCAN_EVERY           = int(os.getenv("SCAN_EVERY_SECONDS", "15"))
 MAX_HOLD_MIN         = 360         # 6 Saat maksimum bekleme
+COOLDOWN_SECONDS     = 3600        # Stop olan coine 60 dakika (1 saat) tekrar girme!
 
 # BİLEŞİK BÜYÜME VE HIZLI SCALP KÂR/ZARAR PARAMETRELERİ
 DEFAULT_TP_TRIGGER_USD  = 1.80  # +$1.80 kârda Trailing Stop başlar
@@ -61,10 +56,9 @@ DEFAULT_SL_USD          = 1.00  # -$1.00 Stop Loss (Hızlı çıkış, minimum k
 # MANUEL POZİSYON KORUMASI VE HANTAL COİN KARA LİSTESİ
 PROTECTED_SYMBOLS = {"BASEDUSDT", "BASED", "TRXUSDT", "TRX", "FDUSDUSDT", "USDCUSDT"}
 
-# LİKİDİTE VE TEKNİK FİLTRELER (Tüm Binance Vadeli Piyasasını Kapsar)
+# LİKİDİTE VE TEKNİK FİLTRELER
 MIN_VOL_USD      = 3_000_000.0   # $3M üzeri tüm hareketli pariteler
 MAX_VOL_USD      = 800_000_000.0 # $800M hacme kadar tüm coinler
-MIN_VOL_MULTIPLIER = 2.2
 
 STABLE = {"USDC","BUSD","DAI","TUSD","USDP","FDUSD","USDD","FRAX","GUSD","LUSD","USTC","EURC"}
 
@@ -99,7 +93,6 @@ def tg(txt):
             timeout=12
         )
         if r.status_code != 200:
-            # Markdown hatası olursa düz metin olarak tekrar dene
             requests.post(
                 f"https://api.telegram.org/bot{TK}/sendMessage",
                 json={"chat_id": TC, "text": txt.replace("*", "").replace("`", "").replace("_", ""), "disable_web_page_preview": True},
@@ -150,8 +143,6 @@ def handle_telegram_commands(state):
             LAST_UPDATE_ID = u.get("update_id", LAST_UPDATE_ID)
             msg = u.get("message", {})
             text = msg.get("text", "").strip().lower()
-            chat_id = str(msg.get("chat", {}).get("id", ""))
-            
             if not text: continue
             
             # 1. /gercek veya /real
@@ -241,12 +232,11 @@ def send_performance_report(state):
     is_real = state.get("real_trading", REAL_TRADING_DEFAULT)
     trades = load_db()
     
-    # Aktif moda göre trade listesini filtrele
     filtered_trades = [t for t in trades if t.get("is_real", False) == is_real]
     mode_title = "🔴 GERÇEK İŞLEM RAPORU" if is_real else "🧪 SİMÜLASYON ($100 SANAL KASA) RAPORU"
     
     if not filtered_trades:
-        tg(f"📊 *{mode_title}*\n\nHenüz tamamlanmış bir işlem bulunmuyor. Bot 229 pariteyi taramaya devam ediyor!")
+        tg(f"📊 *{mode_title}*\n\nHenüz tamamlanmış bir işlem bulunmuyor. Bot 230+ pariteyi taramaya devam ediyor!")
         return
         
     df_t = pd.DataFrame(filtered_trades)
@@ -290,30 +280,27 @@ def send_performance_report(state):
 
 # ── GEMINI 2.5 FLASH ANA YAPAY ZEKA BEYNİ (MASTER SCALP AI) ──────────────────
 
-def gemini_master_ai_decision(sym, price, rsi_15m, rsi_5m, vol_ratio, btc_status, candles_summary):
+def gemini_master_ai_decision(sym, price, rsi_15m, rsi_5m, vol_ratio, taker_buy_pct, bb_w, candles_summary):
     if not GEMINI_KEY:
         return True, 80, "Gemini anahtarı girilmedi, teknik onayla devam ediliyor."
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
     prompt = f"""
 Sen dünyanın en başarılı Kripto Vadeli Scalp Fon Yöneticisisin.
-Amacımız: Kasayı 20x kaldıraç ile $250 büyüklüğünde LONG scalp pozisyonları açarak adım adım büyütmek.
-
-GÖREV: Aşağıdaki pariteye ait anlık mumları, hacim durumunu ve piyasa yapısını değerlendir.
+Amacımız: Binance vadeli piyasasında PUMP YAPMADAN ÖNCE balinaların sessizce mal topladığı ve sıkışan coinleri tespit edip 20x kaldıraçla en dipten LONG girmek.
 
 Parite: {sym}
 Anlık Fiyat: {price}
 15m RSI: {rsi_15m:.1f} | 5m RSI: {rsi_5m:.1f}
-Hacim Artışı: {vol_ratio:.1f}x katı alıcı hacmi
-BTC Durumu: {btc_status}
+Hacim Artışı: {vol_ratio:.1f}x katı
+Taker Alıcı Baskısı: %{taker_buy_pct:.1f} (Market Buy oranı)
+Bollinger Sıkışması: %{bb_w:.2f} (Daralan bant)
 Son Mumlar (OHLC): {candles_summary}
 
-KURALLAR:
-1. Eğer paritede 5m veya 15m'de kısa vadeli yukarı ivme, dip toparlanması, basamak veya alıcı hacmi varsa APPROVE ver.
-2. Sadece bariz sert çöküş veya tepe iğnesi (fakeout pump) durumlarında REJECT ver.
-3. Fırsat gördüğün kaliteli her pozisyonu onayla.
-
-SADECE aşağıdaki JSON formatında yanıt ver:
+GÖREV:
+1. Bu paritede pump öncesi balina akümülasyonu veya yukarı patlama potansiyeli varsa APPROVE ver.
+2. Sadece bariz çöküş veya tepe sahte iğne (fakeout pump) durumlarında REJECT ver.
+3. SADECE aşağıdaki JSON formatında yanıt ver:
 {{
   "decision": "APPROVE" veya "REJECT",
   "confidence": 0 ile 100 arası sayı,
@@ -333,7 +320,7 @@ SADECE aşağıdaki JSON formatında yanıt ver:
             parsed = json.loads(content_text)
             decision = parsed.get("decision", "APPROVE").upper()
             confidence = int(parsed.get("confidence", 75))
-            reason = parsed.get("reason", "Yapay zeka alıcı baskısını onayladı.")
+            reason = parsed.get("reason", "Yapay zeka pump öncesi alıcı akümülasyonunu onayladı.")
             is_approved = (decision == "APPROVE" and confidence >= 70)
             return is_approved, confidence, reason
     except Exception as e:
@@ -404,7 +391,7 @@ def binance_signed_request(method, path, params=None):
 def klines(sym, tf, n=60):
     raw = get_public_json("/fapi/v1/klines", {"symbol": sym, "interval": tf, "limit": n})
     df  = pd.DataFrame(raw, columns=["ot","o","h","l","c","v","ct","qv","tr","tb","tq","x"])
-    for col in ["o","h","l","c","v"]:
+    for col in ["o","h","l","c","v","tb","qv"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
@@ -468,30 +455,6 @@ def get_account_balances():
         
     return equity, free_margin
 
-# ── BTC ANLIK ŞELALE KALKANI ────────────────────────────────────────────────
-
-def check_btc_shield():
-    try:
-        df15m = klines("BTCUSDT", "15m", 30)
-        if len(df15m) < 20: return True, "BTC Verisi Yetersiz"
-        last_c = df15m.iloc[-1]
-        c, o = last_c['c'], last_c['o']
-        
-        # 1. 15m mumunda sert çöküş (%0.50'den büyük kırmızı mum)
-        if c < o and ((o - c) / o) > 0.0050:
-            return False, "BTC Anlık Şelalede (15m Sert Düşüş)"
-            
-        # 2. 1h aşırı panik satışı (RSI < 30)
-        df1h = klines("BTCUSDT", "1h", 40)
-        if len(df1h) >= 25:
-            rsi_btc = calc_rsi(df1h['c'], 14)
-            if rsi_btc < 30.0:
-                return False, f"BTC 1h Aşırı Panik Satışında (RSI:{rsi_btc:.1f})"
-                
-        return True, "BTC Uygun (Piyasa Onaylı)"
-    except Exception as e:
-        return True, f"BTC Kontrol Hatası ({e})"
-
 def get_universe():
     try:
         info    = get_public_json("/fapi/v1/exchangeInfo")
@@ -516,11 +479,23 @@ def get_universe():
         print(f"[UNIVERSE HATA] {e}", flush=True)
         return []
 
-# ── YAPAY ZEKA GÖZLEM VE SİNYAL ADAY MOTORU (%100 AI KARARI) ─────────────────
+# ── PRE-PUMP BALİNA AKÜMÜLASYONU VE PATLAMA DEDEKTÖRÜ ─────────────────────────
 
-def analyze_market_candidate(sym, btc_status):
+def analyze_market_candidate(sym, cooldown_dict):
+    """
+    PUMP YAPMADAN ÖNCEKİ 4 İNKAR EDİLEMEZ AYAK İZİ:
+    1. Fiyat son 4 saatte henüz fırlamamış (-%1.0 <= 4h_change <= %3.0)
+    2. Hacim anomalisi: Son mumların hacmi ortalamanın 1.5x - 3.5x katına çıkmış
+    3. Taker Buy Ratio >= %56 (Market buy baskısı)
+    4. Bollinger Sıkışması <= %3.5 (Gerilmiş yay)
+    """
+    # 1. Soğuma Süresi Kontrolü (Son 60 dakikada stop olan coine girilmez)
+    last_closed_ts = cooldown_dict.get(sym, 0)
+    if time.time() - last_closed_ts < COOLDOWN_SECONDS:
+        return None
+
     try:
-        df15m = klines(sym, "15m", 40)
+        df15m = klines(sym, "15m", 45)
         if len(df15m) < 30: return None
         
         df5m = klines(sym, "5m", 25)
@@ -531,43 +506,63 @@ def analyze_market_candidate(sym, btc_status):
         rsi_15m = calc_rsi(df15m['c'], 14)
         rsi_5m = calc_rsi(df5m['c'], 14)
         
-        vol_avg = df15m['v'].iloc[-20:-2].mean()
-        vol_now = c15['v'] + df15m['v'].iloc[-2]
-        vol_ratio = round((vol_now / vol_avg), 1) if vol_avg > 0 else 1.0
+        # Fiyat değişimi (Son 4 saat)
+        p_change_4h = (c - df15m["c"].iloc[-16]) / df15m["c"].iloc[-16] * 100
         
-        ema20 = df15m['c'].ewm(span=20, adjust=False).mean().iloc[-1]
+        # Hacim anomalisi
+        vol_avg = df15m['v'].iloc[-24:-4].mean()
+        vol_recent = df15m['v'].iloc[-4:].mean()
+        vol_ratio = round((vol_recent / vol_avg), 1) if vol_avg > 0 else 1.0
         
-        # Son 5 mumun özeti (Açılış, Yüksek, Düşük, Kapanış, Hacim)
+        # Taker alıcı baskısı
+        taker_sum = df15m['tb'].iloc[-4:].sum()
+        vol_sum = df15m['v'].iloc[-4:].sum()
+        taker_buy_pct = round((taker_sum / vol_sum * 100), 1) if vol_sum > 0 else 50.0
+        
+        # Bollinger Sıkışması
+        sma20 = df15m["c"].rolling(20).mean().iloc[-1]
+        std20 = df15m["c"].rolling(20).std().iloc[-1]
+        bb_w = round((2.0 * std20) / sma20 * 100, 2)
+        
+        # Mum özeti
         last_5 = [f"M{idx+1}: O={row['o']:.4f} H={row['h']:.4f} L={row['l']:.4f} C={row['c']:.4f}" for idx, row in df15m.iloc[-5:].iterrows()]
         candles_summary = " | ".join(last_5)
         
-        # Ön Filtre: Sadece aşırı çöken ölü coinleri ele (RSI > 40 veya yeşil mum veya EMA20 üzeri)
-        # Geriye kalan TÜM kararı Gemini 2.5 Flash Yapay Zekası verir!
-        if rsi_15m >= 40.0 or c >= o or c >= ema20:
+        # ── PRE-PUMP SIKIŞMA VE AKÜMÜLASYON ŞARTLARI ──
+        # 1. Fiyat henüz patlamamış (%-1.0 ile %+3.0 arası)
+        # 2. Hacim 1.5 kat veya üzeri
+        # 3. Taker Buy %55 veya üzeri
+        # 4. Bollinger Sıkışması dar (<= %3.5)
+        is_pre_pump = (-1.0 <= p_change_4h <= 3.2) and (vol_ratio >= 1.4) and (taker_buy_pct >= 55.0) and (bb_w <= 3.8)
+        is_breakout = (vol_ratio >= 2.2) and (50.0 <= rsi_15m <= 75.0) and (c >= o)
+        
+        if is_pre_pump or is_breakout:
+            mode_title = "PRE_PUMP_AKÜMÜLASYONU" if is_pre_pump else "HACİMLİ_BREAKOUT"
             entry = last_price(sym)
             
             ai_approved, ai_confidence, ai_reason = gemini_master_ai_decision(
                 sym=sym, price=entry, rsi_15m=rsi_15m, rsi_5m=rsi_5m,
-                vol_ratio=vol_ratio, btc_status=btc_status,
-                candles_summary=candles_summary
+                vol_ratio=vol_ratio, taker_buy_pct=taker_buy_pct,
+                bb_w=bb_w, candles_summary=candles_summary
             )
             
             if ai_approved:
                 return {
-                    "sym": sym, "side": "LONG", "mode": "YAPAY_ZEKA_SCALP",
+                    "sym": sym, "side": "LONG", "mode": mode_title,
                     "entry": entry, "rsi": rsi_15m,
                     "ai_conf": ai_confidence, "ai_reason": ai_reason,
                     "reasons": [
-                        f"🧠 *Gemini 2.5 AI Kararı:* %{ai_confidence} Güven — _{ai_reason}_",
-                        f"📊 *Hacim Durumu:* `{vol_ratio}x` katı alıcı hacmi",
-                        f"📈 *Momentum:* 15m RSI `{rsi_15m:.1f}` | 5m RSI `{rsi_5m:.1f}`"
+                        f"🚀 *Strateji:* {mode_title} (Fiyat Hareketi: `%+{p_change_4h:.2f}`)",
+                        f"📊 *Balina Hacmi:* `{vol_ratio}x` katı | *Alıcı Baskısı:* `%{taker_buy_pct:.1f}`",
+                        f"🎯 *Sıkışma (Squeeze):* Bollinger Bandı `%{bb_w:.2f}`",
+                        f"🧠 *Gemini 2.5 AI Kararı:* %{ai_confidence} Güven — _{ai_reason}_"
                     ]
                 }
             else:
                 print(f"❌ [GEMINI RED] {sym} (%{ai_confidence}) — {ai_reason}", flush=True)
 
         return None
-    except Exception as e:
+    except Exception:
         return None
 
 # ── EMİR VE TEMİNAT YÖNETİMİ ────────────────────────────────────────────────
@@ -669,7 +664,7 @@ def msg_real_open(pos, sig, is_real=False):
     be_val = float(pos.get("dyn_be_trigger_usd", DEFAULT_BE_TRIGGER_USD))
     
     return (
-        f"{icon} *YAPAY ZEKA LONG AÇTI!* | `{pos['sym']}`\n\n"
+        f"{icon} *PUMP ÖNCESİ LONG AÇILDI!* | `{pos['sym']}`\n\n"
         f"Strateji: *{sig['mode']}*\n"
         f"Yön: *LONG ({lev}x Kaldıraç)*\n"
         f"Giriş Fiyatı : `{fp(pos['entry'])}`\n"
@@ -677,7 +672,7 @@ def msg_real_open(pos, sig, is_real=False):
         f"📈 *Trailing Kâr:* `+${tp_val:.2f}` geçilince başlar (+${lock_val:.2f} kilitlenir)\n"
         f"🛑 *Stop Loss:* `-${sl_val:.2f}` (`{fp(pos['sl_price'])}`)\n"
         f"🔰 *Sıfır Risk (+${be_val:.2f} kârda):* Stop maliyete çekilir\n\n"
-        f"*Yapay Zeka Analizi:*\n{lines}\n\n"
+        f"*Balina & AI Analiz Verileri:*\n{lines}\n\n"
         f"Zaman: `{ts()}`\n"
         f"_(Komutlar: `/durum`, `/rapor`, `/gercek`, `/fake`)_"
     )
@@ -694,7 +689,6 @@ def msg_real_close(pos, exit_price, pnl, reason, dur_sec, is_real=False):
         "MANUEL_TELEGRAM_KAPATMA": "🛑 TELEGRAM İLE KAPATILDI"
     }.get(reason, reason)
     
-    eq, free_m = get_account_balances()
     highest_pnl = float(pos.get("highest_profit_usd", pnl))
     dur_min = dur_sec // 60
     
@@ -703,8 +697,7 @@ def msg_real_close(pos, exit_price, pnl, reason, dur_sec, is_real=False):
         f"Giriş : `{fp(pos['entry'])}` → Çıkış: `{fp(exit_price)}`\n"
         f"Net P&L : *`${pnl:+.2f} USDT`*\n"
         f"Görülen Zirve Kâr : `+${highest_pnl:.2f}`\n"
-        f"İşlem Süresi : `{dur_min} dakika`\n"
-        f"💰 *Hesap Varlığı:* `${eq:.2f} USDT` (Serbest: `${free_m:.2f}`)\n\n"
+        f"İşlem Süresi : `{dur_min} dakika`\n\n"
         f"Zaman: `{ts()}`"
     )
 
@@ -715,7 +708,7 @@ def load_st():
         try:
             with open(SF) as f: return json.load(f)
         except Exception: pass
-    return {"positions": [], "real_trading": REAL_TRADING_DEFAULT}
+    return {"positions": [], "real_trading": REAL_TRADING_DEFAULT, "cooldown": {}}
 
 def save_st(s):
     with open(SF, "w") as f: json.dump(s, f, indent=2, ensure_ascii=False)
@@ -816,6 +809,9 @@ def monitor(state):
             record_trade(pos, exit_price, real_pnl, reason, dur)
             tg(msg_real_close(pos, exit_price, real_pnl, reason, dur, is_real=pos_is_real))
             print(f"🔒 [{reason}] {sym} @ {fp(exit_price)} | Net P&L: ${real_pnl:+.2f}", flush=True)
+            
+            # Cooldown kaydet (60 dakika kilit)
+            state.setdefault("cooldown", {})[sym] = time.time()
         else:
             trail_str = f"| Trailing Stop: {fp(pos['trailing_sl_price'])}" if pos.get("trailing_active") else ""
             prefix = "[GERÇEK]" if pos_is_real else "[SİMÜLASYON]"
@@ -828,19 +824,13 @@ def monitor(state):
 # ── TARAMA VE AI DOĞRULAMA ───────────────────────────────────────────────────
 
 def scan(state, universe):
-    eq, free_margin = get_account_balances()
     is_real = state.get("real_trading", REAL_TRADING_DEFAULT)
+    cooldown_dict = state.setdefault("cooldown", {})
     
-    # Simülasyonda (Fake) 4 pozisyona kadar izin ver; Gerçekte kasa koruması
-    if not is_real:
-        max_allowed_positions = 4
-    else:
-        max_allowed_positions = 1 if eq < 70.0 else max(1, min(4, int(eq / 35.0)))
-        
+    # Simülasyonda 4 pozisyona kadar izin ver
+    max_allowed_positions = 4 if not is_real else (1 if get_account_balances()[0] < 70.0 else 2)
     if len(state.get("positions", [])) >= max_allowed_positions:
         return state
-        
-    _, btc_reason = check_btc_shield()
 
     open_syms = {p["sym"] for p in state.get("positions", [])}
     open_syms.update(PROTECTED_SYMBOLS)
@@ -849,12 +839,13 @@ def scan(state, universe):
         if sym in open_syms: continue
         print(f"  [{i+1}/{len(universe)}] {sym} taranıyor...", end="\r", flush=True)
         try:
-            sig = analyze_market_candidate(sym, btc_reason)
+            sig = analyze_market_candidate(sym, cooldown_dict)
             if sig:
                 mode_label = "🔴 GERÇEK" if is_real else "🧪 SİMÜLASYON"
-                print(f"\n✅ [{mode_label} ONAY - %{sig['ai_conf']}] {sym}! Pozisyon açılıyor...", flush=True)
+                print(f"\n✅ [{mode_label} PRE-PUMP ONAYI - %{sig['ai_conf']}] {sym}! Pozisyon açılıyor...", flush=True)
                 
                 if is_real:
+                    _, free_margin = get_account_balances()
                     pos = execute_real_entry(sym, free_margin=free_margin)
                 else:
                     entry = sig["entry"]
@@ -884,7 +875,6 @@ def scan(state, universe):
                 break
         except Exception as e:
             print(f"[İŞLEM AÇILIŞ HATA] {sym}: {e}", flush=True)
-            tg(f"⚠️ *İşlem Hatası ({sym}):* `{e}`")
         time.sleep(0.05)
         
     return state
@@ -893,34 +883,36 @@ def scan(state, universe):
 
 def main():
     print("="*65, flush=True)
-    print("🧠 BİNANCE MASTER AI (GEMINI 2.5 FLASH) BİLEŞİK SCALP MOTORU", flush=True)
+    print("🚀 BİNANCE PRE-PUMP BALİNA AKÜMÜLASYON DEDEKTÖRÜ (GEMINI 2.5 FLASH)", flush=True)
     print("="*65, flush=True)
-    print(" 🧠 Karar Verici       : Google Gemini 2.5 Flash (%80+ Güven Şartı)", flush=True)
-    print(" 🎮 İnteraktif Mod     : Telegramdan /gercek veya /fake ile anında geçiş", flush=True)
+    print(" 🚀 Ana Strateji       : PRE-PUMP AKÜMÜLASYONU (Fiyat %0-2, Hacim > 1.5x, Taker > %55, Sıkışma)", flush=True)
+    print(" 🧠 Karar Verici       : Google Gemini 2.5 Flash (%70+ Güven Şartı)", flush=True)
+    print(" 🛡️ Cooldown Koruması  : Stop olan coine 60 dakika tekrar girilmez", flush=True)
     print(" ⚡ Kaldıraç & Boyut   : 20x Kaldıraç | Tam $250.00 Pozisyon", flush=True)
     print(" 💸 Hızlı Trailing Kâr : +$1.80 kârda devreye girer, en tepeden satar", flush=True)
     print(" 🔰 Başa Baş Koruma    : +$1.00 kârda stop maliyete çekilir (Sıfır Risk)", flush=True)
     print(" 🛑 Sıkı Stop Loss     : -$1.00 seviyesinde anlık koruma", flush=True)
-    print(" 🛡️ Koruma             : BASEDUSDT dokunulmaz | BTC Kalkanı Aktif", flush=True)
+    print(" 🛡️ Koruma             : BASEDUSDT dokunulmaz", flush=True)
     print("="*65, flush=True)
     
     state = load_st()
     is_real = state.get("real_trading", REAL_TRADING_DEFAULT)
-    mode_text = "🔴 GERÇEK İŞLEM" if is_real else "🧪 SİMÜLASYON (FAKE PARA)"
+    mode_text = "🔴 GERÇEK İŞLEM" if is_real else "🧪 SİMÜLASYON ($100 FAKE PARA)"
     
-    eq, free_m = get_account_balances()
-    print(f"✅ Toplam Varlık: ${eq:.2f} USDT | Serbest Teminat: ${free_m:.2f} USDT | Mod: {mode_text}", flush=True)
+    virt_eq, virt_free, _ = get_virtual_balance(state)
+    print(f"✅ Sanal Kasa: ${virt_eq:.2f} USDT | Mod: {mode_text}", flush=True)
     
-    tg(f"🚀 *MASTER AI (GEMINI 2.5 FLASH) BOTU YENİLENDİ!*\n\n"
+    tg(f"🚀 *PRE-PUMP BALİNA AKÜMÜLASYON DEDEKTÖRÜ AKTİF EDİLDİ!*\n\n"
        f"⚙️ *Aktif Çalışma Modu:* `{mode_text}`\n"
-       f"💰 *Hesap Varlığı:* `${eq:.2f} USDT` (Serbest: `${free_m:.2f}`)\n"
-       f"🧠 *Karar:* Google Gemini 2.5 Flash Master AI.\n\n"
+       f"💰 *Sanal Kasa:* `${virt_eq:.2f} USDT`\n"
+       f"🎯 *Strateji:* Fiyat henüz %0-2 yatayken gelen gizli balina hacmini ve sıkışmayı yakalar!\n"
+       f"🛡️ *Cooldown:* Kapanan coine 60 dk girilmez.\n\n"
        f"🎮 *Telegram Komutları:*\n"
        f"• `/gercek` -> Gerçek parayla işleme geç\n"
-       f"• `/fake` -> Simülasyon (Fake Para) moduna geç\n"
+       f"• `/fake` -> Simülasyon ($100 Fake Para) moduna geç\n"
        f"• `/rapor` -> Günün kâr/zarar karnesini al\n"
        f"• `/durum` -> Anlık pozisyon ve bakiye\n"
-       f"• `/kapat` -> Açık pozisyonu hemen kapat")
+       f"• `/kapat` -> Açık pozisyonları hemen kapat")
 
     last_scan_time = 0
     last_heartbeat_time = 0
