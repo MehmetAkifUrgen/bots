@@ -1,13 +1,13 @@
 """
-trader_bot.py — Binance Pre-Pump Balina Akümülasyonu & Patlama Avcısı (Gemini 2.5 Flash)
-• Ana Strateji: PRE_PUMP_ACCUMULATION (Fiyat %0-2 yatayken gelen gizli hacim patlaması, Taker Buy > %56 ve Bollinger Sıkışması)
-• 2. Strateji: BREAKOUT_LONG (24s Direnç Kırılımı & Hacim)
-• Cooldown Kilidi: Stop olan veya kapatılan coine 60 dakika boyunca tekrar girilmez (Revenge Trading Engeli)
+trader_bot.py — Binance Pre-Pump & Short Squeeze Kurumsal Balina Avcısı (Gemini 2.5 Flash)
+• 1. Sinyal: PRE_PUMP_AKÜMÜLASYONU (Fiyat %0-2 yatayken gelen Hacim Artışı + OBV Tırmanışı + Taker Buy > %55 + Bollinger Sıkışması)
+• 2. Sinyal: SHORT_SQUEEZE_PATLAMASI (Negatif Funding Rate < -0.005% + Yüksek Açık Pozisyon/Hacim)
+• 3. Sinyal: MOMENTUM_BREAKOUT (24s Direnç Kırılımı & Balina Hacmi)
+• Analiz Araçları: Open Interest (OI), Funding Rate (Fonlama), OBV (On-Balance Volume), Taker Buy Ratio, Bollinger Squeeze
+• Cooldown Kilidi: Kapanan/Stop olan coine 60 dakika tekrar girilmez (Revenge Trading Engeli)
 • Mod Yönetimi: Varsayılan SİMÜLASYON ($100 Sanal Kasa | 4 Eşzamanlı Pozisyon). Telegram'dan /gercek ile geçiş!
-• Trailing Kâr: +$1.80 kârda başlar, zirveden $0.80 çekilince satar (+1.00$ kâr garanti)
-• Başa Baş: +$1.00 kârda stop maliyete çekilir (Sıfır Risk)
-• Stop Loss: -$1.00 seviyesinde anlık çıkış
-• Koruma: BASEDUSDT dokunulmaz | BTC Kalkanı Aktif
+• Kâr/Zarar: +$1.00 kârda stop maliyete (Sıfır Risk), +$1.80 Trailing Stop ile zirveyi yakalar, -$1.00 Stop Loss
+• Koruma: BASEDUSDT dokunulmaz
 """
 
 import hashlib
@@ -45,7 +45,7 @@ TARGET_NOTIONAL      = 250.0       # Hedef Pozisyon: Tam $250.00 USDT
 DEFAULT_LEVERAGE     = 20          # 20x Kaldıraç ($250 için sadece $12.50 teminat)
 SCAN_EVERY           = int(os.getenv("SCAN_EVERY_SECONDS", "15"))
 MAX_HOLD_MIN         = 360         # 6 Saat maksimum bekleme
-COOLDOWN_SECONDS     = 3600        # Stop olan coine 60 dakika (1 saat) tekrar girme!
+COOLDOWN_SECONDS     = 3600        # Stop olan veya kapanan coine 60 dakika girme!
 
 # BİLEŞİK BÜYÜME VE HIZLI SCALP KÂR/ZARAR PARAMETRELERİ
 DEFAULT_TP_TRIGGER_USD  = 1.80  # +$1.80 kârda Trailing Stop başlar
@@ -280,25 +280,30 @@ def send_performance_report(state):
 
 # ── GEMINI 2.5 FLASH ANA YAPAY ZEKA BEYNİ (MASTER SCALP AI) ──────────────────
 
-def gemini_master_ai_decision(sym, price, rsi_15m, rsi_5m, vol_ratio, taker_buy_pct, bb_w, candles_summary):
+def gemini_master_ai_decision(sym, price, rsi_15m, rsi_5m, vol_ratio, taker_buy_pct, bb_w, funding_rate, obv_trend, candles_summary):
     if not GEMINI_KEY:
         return True, 80, "Gemini anahtarı girilmedi, teknik onayla devam ediliyor."
 
+    funding_str = f"{funding_rate * 100:.4f}%"
+    funding_desc = "NEGATİF (Short Squeeze Adayı 🔥)" if funding_rate < -0.0001 else "Nötr / Pozitif"
+
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
     prompt = f"""
-Sen dünyanın en başarılı Kripto Vadeli Scalp Fon Yöneticisisin.
-Amacımız: Binance vadeli piyasasında PUMP YAPMADAN ÖNCE balinaların sessizce mal topladığı ve sıkışan coinleri tespit edip 20x kaldıraçla en dipten LONG girmek.
+Sen dünyanın en başarılı Kripto Vadeli Fon Yöneticisisin.
+Amacımız: Binance vadeli piyasasında PUMP YAPMADAN ÖNCE balinaların sessizce mal topladığı (Akümülasyon) veya Short Squeeze patlamasına hazır coinleri tespit edip 20x kaldıraçla en dipten LONG girmek.
 
 Parite: {sym}
 Anlık Fiyat: {price}
 15m RSI: {rsi_15m:.1f} | 5m RSI: {rsi_5m:.1f}
-Hacim Artışı: {vol_ratio:.1f}x katı
+Hacim Artışı (RVOL): {vol_ratio:.1f}x katı
 Taker Alıcı Baskısı: %{taker_buy_pct:.1f} (Market Buy oranı)
-Bollinger Sıkışması: %{bb_w:.2f} (Daralan bant)
+Bollinger Sıkışması (Bandwidth): %{bb_w:.2f} (Daralan bant)
+Funding Rate (Fonlama Oranı): {funding_str} ({funding_desc})
+OBV (On-Balance Volume) Durumu: {obv_trend}
 Son Mumlar (OHLC): {candles_summary}
 
 GÖREV:
-1. Bu paritede pump öncesi balina akümülasyonu veya yukarı patlama potansiyeli varsa APPROVE ver.
+1. Eğer bu paritede pump öncesi balina akümülasyonu, OBV tırmanışı veya Short Squeeze yukarı patlama potansiyeli varsa APPROVE ver.
 2. Sadece bariz çöküş veya tepe sahte iğne (fakeout pump) durumlarında REJECT ver.
 3. SADECE aşağıdaki JSON formatında yanıt ver:
 {{
@@ -395,6 +400,13 @@ def klines(sym, tf, n=60):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
+def get_funding_rate(sym):
+    try:
+        r = get_public_json("/fapi/v1/premiumIndex", {"symbol": sym})
+        return float(r.get("lastFundingRate", 0.0))
+    except Exception:
+        return 0.0001
+
 def calc_rsi(series, period=14):
     if len(series) < period + 1: return 50.0
     delta = series.diff()
@@ -404,6 +416,16 @@ def calc_rsi(series, period=14):
     rsi = 100 - (100 / (1 + rs))
     val = rsi.iloc[-1]
     return float(val) if not math.isnan(val) else 50.0
+
+def calc_obv_trend(df):
+    try:
+        direction = np.where(df["c"] > df["c"].shift(1), 1, np.where(df["c"] < df["c"].shift(1), -1, 0))
+        obv = (df["v"] * direction).cumsum()
+        # Son 10 mumdaki OBV eğilimi
+        obv_recent = obv.iloc[-1] - obv.iloc[-10]
+        return "Yükseliyor (Gizli Alım Var 🔥)" if obv_recent > 0 else "Nötr / Yatay"
+    except Exception:
+        return "Nötr"
 
 def last_price(sym):
     r = get_public_json("/fapi/v1/ticker/price", {"symbol": sym})
@@ -479,17 +501,14 @@ def get_universe():
         print(f"[UNIVERSE HATA] {e}", flush=True)
         return []
 
-# ── PRE-PUMP BALİNA AKÜMÜLASYONU VE PATLAMA DEDEKTÖRÜ ─────────────────────────
+# ── PRE-PUMP BALİNA AKÜMÜLASYONU VE SHORT SQUEEZE MOTORU ─────────────────────
 
 def analyze_market_candidate(sym, cooldown_dict):
     """
-    PUMP YAPMADAN ÖNCEKİ 4 İNKAR EDİLEMEZ AYAK İZİ:
-    1. Fiyat son 4 saatte henüz fırlamamış (-%1.0 <= 4h_change <= %3.0)
-    2. Hacim anomalisi: Son mumların hacmi ortalamanın 1.5x - 3.5x katına çıkmış
-    3. Taker Buy Ratio >= %56 (Market buy baskısı)
-    4. Bollinger Sıkışması <= %3.5 (Gerilmiş yay)
+    1. PRE_PUMP_AKÜMÜLASYONU: Fiyat %0-2 yatayken Hacim > 1.4x + OBV Tırmanışı + Taker Buy > %55 + Bollinger Sıkışması
+    2. SHORT_SQUEEZE_PATLAMASI: Negatif Funding Rate (< -0.005%) + Yüksek Alıcı Baskısı
+    3. MOMENTUM_BREAKOUT: 24s Zirve Kırılımı + Hacim Patlaması
     """
-    # 1. Soğuma Süresi Kontrolü (Son 60 dakikada stop olan coine girilmez)
     last_closed_ts = cooldown_dict.get(sym, 0)
     if time.time() - last_closed_ts < COOLDOWN_SECONDS:
         return None
@@ -506,47 +525,52 @@ def analyze_market_candidate(sym, cooldown_dict):
         rsi_15m = calc_rsi(df15m['c'], 14)
         rsi_5m = calc_rsi(df5m['c'], 14)
         
-        # Fiyat değişimi (Son 4 saat)
         p_change_4h = (c - df15m["c"].iloc[-16]) / df15m["c"].iloc[-16] * 100
         
-        # Hacim anomalisi
         vol_avg = df15m['v'].iloc[-24:-4].mean()
         vol_recent = df15m['v'].iloc[-4:].mean()
         vol_ratio = round((vol_recent / vol_avg), 1) if vol_avg > 0 else 1.0
         
-        # Taker alıcı baskısı
         taker_sum = df15m['tb'].iloc[-4:].sum()
         vol_sum = df15m['v'].iloc[-4:].sum()
         taker_buy_pct = round((taker_sum / vol_sum * 100), 1) if vol_sum > 0 else 50.0
         
-        # Bollinger Sıkışması
         sma20 = df15m["c"].rolling(20).mean().iloc[-1]
         std20 = df15m["c"].rolling(20).std().iloc[-1]
         bb_w = round((2.0 * std20) / sma20 * 100, 2)
         
-        # Mum özeti
+        funding_rate = get_funding_rate(sym)
+        obv_trend = calc_obv_trend(df15m)
+        
         last_5 = [f"M{idx+1}: O={row['o']:.4f} H={row['h']:.4f} L={row['l']:.4f} C={row['c']:.4f}" for idx, row in df15m.iloc[-5:].iterrows()]
         candles_summary = " | ".join(last_5)
         
-        # ── PRE-PUMP SIKIŞMA VE AKÜMÜLASYON ŞARTLARI ──
-        # 1. Fiyat henüz patlamamış (%-1.0 ile %+3.0 arası)
-        # 2. Hacim 1.5 kat veya üzeri
-        # 3. Taker Buy %55 veya üzeri
-        # 4. Bollinger Sıkışması dar (<= %3.5)
+        # 1. MODEL: PRE-PUMP SIKIŞMA VE AKÜMÜLASYON
         is_pre_pump = (-1.0 <= p_change_4h <= 3.2) and (vol_ratio >= 1.4) and (taker_buy_pct >= 55.0) and (bb_w <= 3.8)
+        # 2. MODEL: SHORT SQUEEZE PATLAMASI
+        is_short_squeeze = (funding_rate <= -0.0001) and (taker_buy_pct >= 54.0) and (c >= o)
+        # 3. MODEL: HACİMLİ KIRILIM
         is_breakout = (vol_ratio >= 2.2) and (50.0 <= rsi_15m <= 75.0) and (c >= o)
         
-        if is_pre_pump or is_breakout:
-            mode_title = "PRE_PUMP_AKÜMÜLASYONU" if is_pre_pump else "HACİMLİ_BREAKOUT"
+        if is_pre_pump or is_short_squeeze or is_breakout:
+            if is_short_squeeze:
+                mode_title = "SHORT_SQUEEZE_PATLAMASI"
+            elif is_pre_pump:
+                mode_title = "PRE_PUMP_AKÜMÜLASYONU"
+            else:
+                mode_title = "HACİMLİ_BREAKOUT"
+                
             entry = last_price(sym)
             
             ai_approved, ai_confidence, ai_reason = gemini_master_ai_decision(
                 sym=sym, price=entry, rsi_15m=rsi_15m, rsi_5m=rsi_5m,
                 vol_ratio=vol_ratio, taker_buy_pct=taker_buy_pct,
-                bb_w=bb_w, candles_summary=candles_summary
+                bb_w=bb_w, funding_rate=funding_rate, obv_trend=obv_trend,
+                candles_summary=candles_summary
             )
             
             if ai_approved:
+                funding_disp = f"{funding_rate*100:+.4f}%"
                 return {
                     "sym": sym, "side": "LONG", "mode": mode_title,
                     "entry": entry, "rsi": rsi_15m,
@@ -554,6 +578,7 @@ def analyze_market_candidate(sym, cooldown_dict):
                     "reasons": [
                         f"🚀 *Strateji:* {mode_title} (Fiyat Hareketi: `%+{p_change_4h:.2f}`)",
                         f"📊 *Balina Hacmi:* `{vol_ratio}x` katı | *Alıcı Baskısı:* `%{taker_buy_pct:.1f}`",
+                        f"📈 *OBV Trendi:* {obv_trend} | *Fonlama:* `{funding_disp}`",
                         f"🎯 *Sıkışma (Squeeze):* Bollinger Bandı `%{bb_w:.2f}`",
                         f"🧠 *Gemini 2.5 AI Kararı:* %{ai_confidence} Güven — _{ai_reason}_"
                     ]
@@ -672,7 +697,7 @@ def msg_real_open(pos, sig, is_real=False):
         f"📈 *Trailing Kâr:* `+${tp_val:.2f}` geçilince başlar (+${lock_val:.2f} kilitlenir)\n"
         f"🛑 *Stop Loss:* `-${sl_val:.2f}` (`{fp(pos['sl_price'])}`)\n"
         f"🔰 *Sıfır Risk (+${be_val:.2f} kârda):* Stop maliyete çekilir\n\n"
-        f"*Balina & AI Analiz Verileri:*\n{lines}\n\n"
+        f"*Balina & Kurumsal Analiz Verileri:*\n{lines}\n\n"
         f"Zaman: `{ts()}`\n"
         f"_(Komutlar: `/durum`, `/rapor`, `/gercek`, `/fake`)_"
     )
@@ -827,7 +852,6 @@ def scan(state, universe):
     is_real = state.get("real_trading", REAL_TRADING_DEFAULT)
     cooldown_dict = state.setdefault("cooldown", {})
     
-    # Simülasyonda 4 pozisyona kadar izin ver
     max_allowed_positions = 4 if not is_real else (1 if get_account_balances()[0] < 70.0 else 2)
     if len(state.get("positions", [])) >= max_allowed_positions:
         return state
@@ -842,7 +866,7 @@ def scan(state, universe):
             sig = analyze_market_candidate(sym, cooldown_dict)
             if sig:
                 mode_label = "🔴 GERÇEK" if is_real else "🧪 SİMÜLASYON"
-                print(f"\n✅ [{mode_label} PRE-PUMP ONAYI - %{sig['ai_conf']}] {sym}! Pozisyon açılıyor...", flush=True)
+                print(f"\n✅ [{mode_label} {sig['mode']} ONAYI - %{sig['ai_conf']}] {sym}! Pozisyon açılıyor...", flush=True)
                 
                 if is_real:
                     _, free_margin = get_account_balances()
@@ -883,9 +907,11 @@ def scan(state, universe):
 
 def main():
     print("="*65, flush=True)
-    print("🚀 BİNANCE PRE-PUMP BALİNA AKÜMÜLASYON DEDEKTÖRÜ (GEMINI 2.5 FLASH)", flush=True)
+    print("🚀 BİNANCE PRE-PUMP & SHORT SQUEEZE BALİNA AVCISI (GEMINI 2.5 FLASH)", flush=True)
     print("="*65, flush=True)
-    print(" 🚀 Ana Strateji       : PRE-PUMP AKÜMÜLASYONU (Fiyat %0-2, Hacim > 1.5x, Taker > %55, Sıkışma)", flush=True)
+    print(" 🚀 1. Strateji        : PRE-PUMP AKÜMÜLASYONU (Fiyat %0-2, Hacim > 1.4x, Taker > %55, Sıkışma)", flush=True)
+    print(" 🔥 2. Strateji        : SHORT SQUEEZE (Negatif Funding Rate < -0.01% + Hacim)", flush=True)
+    print(" 📈 3. Analiz Araçları : Funding Rate + OBV İndikatörü + Taker Buy Ratio + Sıkışma", flush=True)
     print(" 🧠 Karar Verici       : Google Gemini 2.5 Flash (%70+ Güven Şartı)", flush=True)
     print(" 🛡️ Cooldown Koruması  : Stop olan coine 60 dakika tekrar girilmez", flush=True)
     print(" ⚡ Kaldıraç & Boyut   : 20x Kaldıraç | Tam $250.00 Pozisyon", flush=True)
@@ -902,10 +928,12 @@ def main():
     virt_eq, virt_free, _ = get_virtual_balance(state)
     print(f"✅ Sanal Kasa: ${virt_eq:.2f} USDT | Mod: {mode_text}", flush=True)
     
-    tg(f"🚀 *PRE-PUMP BALİNA AKÜMÜLASYON DEDEKTÖRÜ AKTİF EDİLDİ!*\n\n"
+    tg(f"🚀 *PRE-PUMP & SHORT SQUEEZE BALİNA AVCISI AKTİF EDİLDİ!*\n\n"
        f"⚙️ *Aktif Çalışma Modu:* `{mode_text}`\n"
        f"💰 *Sanal Kasa:* `${virt_eq:.2f} USDT`\n"
-       f"🎯 *Strateji:* Fiyat henüz %0-2 yatayken gelen gizli balina hacmini ve sıkışmayı yakalar!\n"
+       f"🎯 *1. Strateji:* Pre-Pump Balina Akümülasyonu (Fiyat %0-2 yatayken gelen gizli alımlar).\n"
+       f"🔥 *2. Strateji:* Short Squeeze Patlaması (Negatif Funding Rate < -0.01%).\n"
+       f"📈 *3. Analiz:* OBV Tırmanışı + Taker Buy Baskısı + Bollinger Sıkışması.\n"
        f"🛡️ *Cooldown:* Kapanan coine 60 dk girilmez.\n\n"
        f"🎮 *Telegram Komutları:*\n"
        f"• `/gercek` -> Gerçek parayla işleme geç\n"
