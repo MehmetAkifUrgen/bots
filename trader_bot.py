@@ -322,8 +322,13 @@ GÖREV:
         r = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=12)
         if r.status_code == 200:
             res_json = r.json()
-            content_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
-            parsed = json.loads(content_text)
+            content_text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+            clean_text = content_text
+            if clean_text.startswith("```json"): clean_text = clean_text[7:]
+            elif clean_text.startswith("```"): clean_text = clean_text[3:]
+            if clean_text.endswith("```"): clean_text = clean_text[:-3]
+            
+            parsed = json.loads(clean_text.strip())
             decision = parsed.get("decision", "APPROVE").upper()
             confidence = int(parsed.get("confidence", 75))
             reason = parsed.get("reason", "Yapay zeka pump öncesi alıcı akümülasyonunu onayladı.")
