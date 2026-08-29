@@ -718,10 +718,22 @@ def monitor(state):
             prefix = "🔴 [GERÇEK]" if pos_is_real else "🧪 [SİMÜLASYON]"
             tg(f"🔰 {prefix} *{sym}* `+${unrealized_pnl:.2f}` kâra ulaştı! Stop maliyete (`{fp(pos['sl_price'])}`) çekildi. *İşlem artık %100 sıfır risklidir!*")
 
+        # 2. TRAILING TAKE PROFIT (+%0.40 kârda devreye girer ve zirveyi takip eder)
+        if price >= pos["tp_price"] or pos.get("trailing_active"):
+            if not pos.get("trailing_active"):
+                pos["trailing_active"] = True
+                pos["highest_price"] = price
+                locked_profit = (price * 0.9982 - entry) * qty
+                prefix = "🔴 [GERÇEK]" if pos_is_real else "🧪 [SİMÜLASYON]"
+                tg(f"🚀 {prefix} *{sym}* `+${unrealized_pnl:.2f}` kâra ulaştı! *Trailing Kâr Takibi Aktif Edildi!*\nZirve takip ediliyor (Taban kâr: `+${locked_profit:.2f}`).")
+                
+            pos["highest_price"] = max(pos.get("highest_price", price), price)
+            trailing_exit_price = pos["highest_price"] * (1.0 - 0.0018) # Zirveden %0.18 çekilirse sat
+            pos["trailing_sl_price"] = max(pos.get("trailing_sl_price", pos["sl_price"]), trailing_exit_price)
+
         reason = None
-        # 2. TAKE PROFIT (+%0.42 Kâr Alımı)
-        if price >= pos["tp_price"]:
-            reason = "TAKE_PROFIT"
+        if pos.get("trailing_active") and price <= pos.get("trailing_sl_price", pos["sl_price"]):
+            reason = "TRAILING_TP"
         elif price <= pos["sl_price"]:
             reason = "BREAKEVEN" if pos.get("be_hit") else "STOP_LOSS"
         elif dur >= MAX_HOLD_MIN * 60:
@@ -738,8 +750,9 @@ def monitor(state):
             # Cooldown kaydet (60 dakika kilit)
             state.setdefault("cooldown", {})[sym] = time.time()
         else:
+            trail_str = f"| Trailing Stop: {fp(pos['trailing_sl_price'])}" if pos.get("trailing_active") else ""
             prefix = "[GERÇEK]" if pos_is_real else "[SİMÜLASYON]"
-            print(f"  {prefix} {sym} | Fiyat: {fp(price)} | PnL: ${unrealized_pnl:+.2f} | TP: {fp(pos['tp_price'])} | SL: {fp(pos['sl_price'])}", flush=True)
+            print(f"  {prefix} {sym} | Fiyat: {fp(price)} | PnL: ${unrealized_pnl:+.2f} | TP: {fp(pos['tp_price'])} | SL: {fp(pos['sl_price'])} {trail_str}", flush=True)
             still.append(pos)
             
     state["positions"] = still
