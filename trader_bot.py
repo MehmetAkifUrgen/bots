@@ -655,6 +655,28 @@ def msg_real_close(pos, exit_price, pnl, reason, dur_sec, is_real=False):
         f"Zaman: `{ts()}`"
     )
 
+# ── DURUM YÖNETİMİ ───────────────────────────────────────────────────────────
+
+def load_st():
+    if os.path.exists(SF):
+        try:
+            with open(SF) as f: return json.load(f)
+        except Exception: pass
+    return {"positions": [], "real_trading": REAL_TRADING_DEFAULT, "cooldown": {}}
+
+def save_st(s):
+    with open(SF, "w") as f: json.dump(s, f, indent=2, ensure_ascii=False)
+
+def load_db():
+    if os.path.exists(DB):
+        try:
+            with open(DB) as f: return json.load(f)
+        except Exception: pass
+    return []
+
+def save_db(t):
+    with open(DB, "w") as f: json.dump(t, f, indent=2, ensure_ascii=False)
+
 def record_trade(pos, exit_price, pnl, reason, dur_sec):
     trades = load_db()
     est_fee = round(pos.get("notional_usd", 250.0) * 0.0010, 2)
