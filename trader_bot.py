@@ -44,15 +44,16 @@ DB          = os.getenv("TRADE_DB",   "trade_db.json")
 
 # ── STRATEJİ VE RİSK PARAMETRELERİ ───────────────────────────────────────────
 REAL_TRADING_DEFAULT = os.getenv("REAL_TRADING", "false").lower() == "true"
-DEFAULT_LEVERAGE     = 20          # 20x Kaldıraç
+DEFAULT_LEVERAGE     = 20          # 20x Kaldıraç (Asla 10x'e düşmez)
 SCAN_EVERY           = int(os.getenv("SCAN_EVERY_SECONDS", "12"))
 MAX_HOLD_MIN         = 240         # 4 Saat maksimum bekleme
 COOLDOWN_SECONDS     = 3600        # Kapanan coine 60 dakika tekrar girme!
 
-# MİKRO-HEDEF KÂR / ZARAR GEOMETRİSİ (%72.3+ WIN RATE İÇİN)
-TP_PCT               = 0.0042      # +%0.42 Fiyat Hareketi (Kâr Alımı)
-BE_TRIGGER_PCT       = 0.0020      # +%0.20 Fiyat Hareketinde Stop Maliyete Çekilir (Sıfır Risk)
-SL_PCT               = 0.0050      # -%0.50 Fiyat Hareketi (Sıkı Stop Loss)
+# A+ YÜKSEK KÂR VE KOMİSYON KALKANI PARAMETRELERİ
+TP_PCT               = 0.0125      # +%1.25 Fiyat Hareketi ($300 pozisyonda +$3.75 Kâr!)
+BE_TRIGGER_PCT       = 0.0055      # +%0.55 Fiyat Hareketinde Stop Komisyonun Üstüne Çekilir (+Net Kâr)
+SL_PCT               = 0.0075      # -%0.75 Sıkı Stop Loss ($300 pozisyonda -$2.25 Risk)
+TRAILING_DROP_PCT    = 0.0030      # Zirveden %0.30 çekilirse en tepeden kârı kilitler
 
 # KORUNAN VE HANTAL PARİTELER
 PROTECTED_SYMBOLS    = {"BASEDUSDT", "BASED", "TRXUSDT", "TRX", "FDUSDUSDT", "USDCUSDT"}
@@ -566,7 +567,7 @@ def execute_real_entry(sym, notional_target, free_margin):
         
     tp_price = avg_price * (1.0 + TP_PCT)
     be_trigger_price = avg_price * (1.0 + BE_TRIGGER_PCT)
-    be_sl_price = avg_price + (0.05 / qty)
+    be_sl_price = avg_price + (0.35 / qty)  # Komisyonu ($0.25) da aşan net kâr garantili stop
     sl_price = avg_price * (1.0 - SL_PCT)
     
     return {
@@ -609,18 +610,20 @@ def msg_real_open(pos, sig, is_real=False):
     lines = "\n".join(f"  • {r}" for r in sig.get("reasons", []))
     lev = pos.get("leverage", DEFAULT_LEVERAGE)
     
-    target_pnl = (pos["tp_price"] - pos["entry"]) * pos["qty"]
-    sl_pnl = (pos["entry"] - pos["sl_price"]) * pos["qty"]
+    target_gross = (pos["tp_price"] - pos["entry"]) * pos["qty"]
+    est_fee = round(pos.get("notional_usd", 250.0) * 0.0010, 2)
+    target_net = target_gross - est_fee
+    sl_pnl = (pos["entry"] - pos["sl_price"]) * pos["qty"] + est_fee
     
     return (
-        f"{icon} *SNIPER LONG AÇILDI!* | `{pos['sym']}`\n\n"
+        f"{icon} *A+ ALPHA LONG AÇILDI!* | `{pos['sym']}`\n\n"
         f"Strateji: *{sig['mode']}*\n"
         f"Yön: *LONG ({lev}x Kaldıraç)*\n"
         f"Giriş Fiyatı : `{fp(pos['entry'])}`\n"
         f"Pozisyon Büyüklüğü : `${pos['notional_usd']}` ({pos['qty']} adet)\n\n"
-        f"🎯 *Kâr Hedefi (+%0.42):* `+{fp(pos['tp_price'])}` (*+${target_pnl:.2f}*)\n"
-        f"🔰 *Başa Baş (+%0.20):* Stop Maliyete Çekilir (Sıfır Risk)\n"
-        f"🛑 *Stop Loss (-%0.50):* `{fp(pos['sl_price'])}` (*-${sl_pnl:.2f}*)\n\n"
+        f"🎯 *Kâr Hedefi (+%1.25):* `+{fp(pos['tp_price'])}` (*Net +${target_net:.2f}*)\n"
+        f"🔰 *Başa Baş (+%0.55):* Stop Komisyonun Üstüne Çekilir\n"
+        f"🛑 *Stop Loss (-%0.75):* `{fp(pos['sl_price'])}` (*Net -${sl_pnl:.2f}*)\n\n"
         f"*Teknik Analiz Verileri:*\n{lines}\n\n"
         f"Zaman: `{ts()}`\n"
         f"_(Komutlar: `/durum`, `/rapor`, `/gercek`, `/fake`)_"
@@ -628,11 +631,15 @@ def msg_real_open(pos, sig, is_real=False):
 
 def msg_real_close(pos, exit_price, pnl, reason, dur_sec, is_real=False):
     prefix = "🔴 [GERÇEK]" if is_real else "🧪 [SİMÜLASYON]"
-    icon = "🟢" if pnl > 0.05 else ("🔰" if abs(pnl) <= 0.05 else "🔴")
+    est_fee = round(pos.get("notional_usd", 250.0) * 0.0010, 2)
+    net_pnl = round(pnl - est_fee, 2)
+    
+    icon = "🟢" if net_pnl > 0 else ("🔰" if -0.05 <= net_pnl <= 0.05 else "🔴")
     title = {
-        "TAKE_PROFIT": f"💸 HEDEF KÂR ALINDI (+${pnl:.2f}) 🎯",
-        "STOP_LOSS": f"❌ STOP OLDU (-${abs(pnl):.2f})",
-        "BREAKEVEN": "🔰 BAŞA BAŞ KAPANDI (Sıfır Risk)",
+        "TRAILING_TP": f"💸 HEDEF KÂR ALINDI (Net +${net_pnl:.2f}) 🎯",
+        "TAKE_PROFIT": f"💸 HEDEF KÂR ALINDI (Net +${net_pnl:.2f}) 🎯",
+        "STOP_LOSS": f"❌ STOP OLDU (Net -${abs(net_pnl):.2f})",
+        "BREAKEVEN": f"🔰 KOMİSYON ÜSTÜ KAPANDI (+${net_pnl:.2f})",
         "TIMEOUT": "⏱️ SÜRE DOLDU",
         "MANUEL_TELEGRAM_KAPATMA": "🛑 TELEGRAM İLE KAPATILDI"
     }.get(reason, reason)
@@ -642,39 +649,21 @@ def msg_real_close(pos, exit_price, pnl, reason, dur_sec, is_real=False):
     return (
         f"{icon} {prefix} *{title}* | `{pos['sym']}`\n\n"
         f"Giriş : `{fp(pos['entry'])}` → Çıkış: `{fp(exit_price)}`\n"
-        f"Net P&L : *`${pnl:+.2f} USDT`*\n"
+        f"💰 *Net Kasa Değişimi:* *`${net_pnl:+.2f} USDT`*\n"
+        f"_(Ham Fiyat Farkı: `${pnl:+.2f}` | Komisyon: `-${est_fee:.2f}`)_\n"
         f"İşlem Süresi : `{dur_min} dakika`\n\n"
         f"Zaman: `{ts()}`"
     )
 
-# ── DURUM YÖNETİMİ ───────────────────────────────────────────────────────────
-
-def load_st():
-    if os.path.exists(SF):
-        try:
-            with open(SF) as f: return json.load(f)
-        except Exception: pass
-    return {"positions": [], "real_trading": REAL_TRADING_DEFAULT, "cooldown": {}}
-
-def save_st(s):
-    with open(SF, "w") as f: json.dump(s, f, indent=2, ensure_ascii=False)
-
-def load_db():
-    if os.path.exists(DB):
-        try:
-            with open(DB) as f: return json.load(f)
-        except Exception: pass
-    return []
-
-def save_db(t):
-    with open(DB, "w") as f: json.dump(t, f, indent=2, ensure_ascii=False)
-
 def record_trade(pos, exit_price, pnl, reason, dur_sec):
     trades = load_db()
+    est_fee = round(pos.get("notional_usd", 250.0) * 0.0010, 2)
+    net_pnl = round(pnl - est_fee, 2)
     trades.append({
         "id": pos.get("order_id", ""), "pair": pos["sym"], "side": "LONG",
         "entry": pos["entry"], "exit": exit_price, "qty": pos["qty"],
-        "notional": pos["notional_usd"], "pnl": round(pnl, 2),
+        "notional": pos["notional_usd"], "pnl": net_pnl,
+        "gross_pnl": round(pnl, 2), "fee": est_fee,
         "result": reason, "duration": dur_sec,
         "is_real": pos.get("is_real", False),
         "timestamp": ts()
@@ -720,17 +709,17 @@ def monitor(state):
             prefix = "🔴 [GERÇEK]" if pos_is_real else "🧪 [SİMÜLASYON]"
             tg(f"🔰 {prefix} *{sym}* `+${unrealized_pnl:.2f}` kâra ulaştı! Stop maliyete (`{fp(pos['sl_price'])}`) çekildi. *İşlem artık %100 sıfır risklidir!*")
 
-        # 2. TRAILING TAKE PROFIT (+%0.40 kârda devreye girer ve zirveyi takip eder)
+        # 2. TRAILING TAKE PROFIT (+%1.25 kârda devreye girer ve zirveyi takip eder)
         if price >= pos["tp_price"] or pos.get("trailing_active"):
             if not pos.get("trailing_active"):
                 pos["trailing_active"] = True
                 pos["highest_price"] = price
-                locked_profit = (price * 0.9982 - entry) * qty
+                locked_profit = (price * (1.0 - TRAILING_DROP_PCT) - entry) * qty
                 prefix = "🔴 [GERÇEK]" if pos_is_real else "🧪 [SİMÜLASYON]"
                 tg(f"🚀 {prefix} *{sym}* `+${unrealized_pnl:.2f}` kâra ulaştı! *Trailing Kâr Takibi Aktif Edildi!*\nZirve takip ediliyor (Taban kâr: `+${locked_profit:.2f}`).")
                 
             pos["highest_price"] = max(pos.get("highest_price", price), price)
-            trailing_exit_price = pos["highest_price"] * (1.0 - 0.0018) # Zirveden %0.18 çekilirse sat
+            trailing_exit_price = pos["highest_price"] * (1.0 - TRAILING_DROP_PCT) # Zirveden %0.30 çekilirse sat
             pos["trailing_sl_price"] = max(pos.get("trailing_sl_price", pos["sl_price"]), trailing_exit_price)
 
         reason = None
@@ -807,7 +796,7 @@ def scan(state, universe):
                     
                     tp_price = entry * (1.0 + TP_PCT)
                     be_trigger_price = entry * (1.0 + BE_TRIGGER_PCT)
-                    be_sl_price = entry + (0.05 / qty)
+                    be_sl_price = entry + (0.35 / qty)
                     sl_price = entry * (1.0 - SL_PCT)
                     
                     pos = {
