@@ -45,7 +45,7 @@ DB          = os.getenv("TRADE_DB",   "trade_db.json")
 
 # ── STRATEJİ VE RİSK PARAMETRELERİ (BÜYÜK TREND MODELİ) ──────────────────────
 REAL_TRADING_DEFAULT = os.getenv("REAL_TRADING", "true").lower() == "true"
-DEFAULT_LEVERAGE     = 18          # 18x Kaldıraç (15x-20x arası optimum güvenlik)
+DEFAULT_LEVERAGE     = 25          # 25x-30x Kaldıraç
 MAX_NOTIONAL_PER_TRADE = 400.0     # Maksimum $400 USDT Tavan Büyüklük
 SCAN_EVERY           = int(os.getenv("SCAN_EVERY_SECONDS", "10"))
 MAX_HOLD_MIN         = 360         # 6 Saat maksimum trend bekleme
@@ -531,14 +531,14 @@ def analyze_market_candidate(sym, qv, chg_24h, cooldown_dict):
 
 # ── EMİR VE TEMİNAT YÖNETİMİ ────────────────────────────────────────────────
 
-def set_optimal_leverage(sym, target_lev=18):
-    for lev in [target_lev, 20, 15]:
+def set_optimal_leverage(sym, target_lev=25):
+    for lev in [30, 25, 20]:
         try:
             binance_signed_request("POST", "/papi/v1/um/leverage", {"symbol": sym, "leverage": lev})
             return lev
         except Exception:
             continue
-    return 15
+    return 20
 
 def execute_real_entry(sym, notional_target, free_margin):
     actual_lev = set_optimal_leverage(sym, target_lev=DEFAULT_LEVERAGE)
@@ -759,8 +759,8 @@ def scan(state, universe):
     open_syms = {p["sym"] for p in state.get("positions", [])}
     open_syms.update(PROTECTED_SYMBOLS)
     
-    # Pozisyon Büyüklüğü: Kasanın %65'i teminat olarak kullanılır (Max $400)
-    allocated_margin = min(free_margin * 0.70, 15.0)
+    # Pozisyon Büyüklüğü: Kasanın %80'i teminat olarak kullanılır (Max $400)
+    allocated_margin = min(free_margin * 0.85, 18.0)
     target_notional = min(MAX_NOTIONAL_PER_TRADE, allocated_margin * DEFAULT_LEVERAGE)
     
     for i, (sym, qv, chg) in enumerate(universe):
