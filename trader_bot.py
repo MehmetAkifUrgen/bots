@@ -812,7 +812,7 @@ def main():
     print("🚀 TOP GAINER PRE-PUMP & TREND BREAKOUT SNIPER MOTORU", flush=True)
     print("="*65, flush=True)
     print(" 🎯 Ana Hedef          : Top 10 Gainers Adaylarını %1-%2 İken Yakalamak", flush=True)
-    print(" ⚡ Kaldıraç & Boyut   : 18x Kaldıraç | Tek Pozisyon Disiplini (Max $400)", flush=True)
+    print(" ⚡ Kaldıraç & Boyut   : Min 20x (25x-30x) | Tek Pozisyon Disiplini (Max $400)", flush=True)
     print(" 💸 Kâr Hedefi (TP)    : +%4.20+ (Büyük Trend Dalgaları & Trailing)", flush=True)
     print(" 🔰 Başa Baş Koruma    : +%1.20 kârda stop komisyonun üstüne kilitlenir", flush=True)
     print(" 🛑 Sıkı Stop Loss     : -%1.10 kontrollü risk kalkanı", flush=True)
