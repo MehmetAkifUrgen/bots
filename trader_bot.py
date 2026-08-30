@@ -845,15 +845,14 @@ def scan(state, universe):
 
 def main():
     print("="*65, flush=True)
-    print("🏆 %72.3+ WIN RATE ÇİFT TREND BİLEŞİK BÜYÜME (COMPOUNDING) MOTORU", flush=True)
+    print("🏆 A+ ALPHA KOMİSYON KALKANLI BİLEŞİK BÜYÜME (COMPOUNDING) MOTORU", flush=True)
     print("="*65, flush=True)
     print(" 🏁 Başlangıç Kasası   : $20.00 USDT (Kademeli Otomatik Büyüme)", flush=True)
-    print(" 🎯 Ana Strateji       : 1H + 15M Çift Trend Uyumu & EMA20 Dip Sekmesi", flush=True)
-    print(" 🛡️ BTC Kalkanı        : BTC 15m yeşil yakmadıkça işlem açılmaz", flush=True)
-    print(" ⚡ Kaldıraç & Boyut   : 20x Kaldıraç | Dinamik Kasa Büyüklüğü", flush=True)
-    print(" 💸 Net Kâr Hedefi     : +%0.42 (Dinamik Kâr Kasaya Kilitlenir)", flush=True)
-    print(" 🔰 Başa Baş Koruma    : +%0.20 kârda stop maliyete çekilir (Sıfır Risk)", flush=True)
-    print(" 🛑 Sıkı Stop Loss     : -%0.50 seviyesinde anlık koruma", flush=True)
+    print(" 🎯 Ana Strateji       : 15M Trend & EMA20 Dip Sekmesi (Hacim Teyitli)", flush=True)
+    print(" ⚡ Kaldıraç & Boyut   : Min 20x Kaldıraç | Max $400 USDT Tavan", flush=True)
+    print(" 💸 Net Kâr Hedefi     : +%1.25 (Komisyonu 10'a Katlayan Net Kâr)", flush=True)
+    print(" 🔰 Başa Baş Koruma    : +%0.55 kârda stop komisyonun üstüne çekilir", flush=True)
+    print(" 🛑 Sıkı Stop Loss     : -%0.75 seviyesinde anlık koruma", flush=True)
     print(" 🛡️ Koruma             : BASEDUSDT dokunulmaz | 60 Dk Cooldown", flush=True)
     print("="*65, flush=True)
     
