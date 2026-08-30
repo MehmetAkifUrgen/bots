@@ -528,14 +528,16 @@ def analyze_market_candidate(sym, cooldown_dict):
 
 # ── EMİR VE TEMİNAT YÖNETİMİ ────────────────────────────────────────────────
 
+MAX_NOTIONAL_PER_TRADE = 400.0   # Maksimum $400 USDT Pozisyon Büyüklüğü
+
 def set_optimal_leverage(sym, target_lev=20):
-    for lev in [target_lev, 20, 15, 12, 10]:
+    for lev in [max(20, target_lev), 25, 20]:
         try:
             binance_signed_request("POST", "/papi/v1/um/leverage", {"symbol": sym, "leverage": lev})
             return lev
         except Exception:
             continue
-    return 10
+    return 20
 
 def execute_real_entry(sym, notional_target, free_margin):
     actual_lev = set_optimal_leverage(sym, target_lev=DEFAULT_LEVERAGE)
@@ -545,7 +547,7 @@ def execute_real_entry(sym, notional_target, free_margin):
     price = last_price(sym)
     
     max_safe_notional = free_margin * actual_lev * 0.85
-    actual_notional_target = min(notional_target, max(10.0, max_safe_notional))
+    actual_notional_target = min(MAX_NOTIONAL_PER_TRADE, notional_target, max(10.0, max_safe_notional))
     
     raw_qty = actual_notional_target / price
     qty = round_step_size(raw_qty, rules["stepSize"], rules["quantityPrecision"])
@@ -782,9 +784,9 @@ def scan(state, universe):
     open_syms = {p["sym"] for p in state.get("positions", [])}
     open_syms.update(PROTECTED_SYMBOLS)
     
-    # Pozisyon Başına Ayrılan Büyüklük (Kasanın %65'i teminat, %35'i güvence tamponu)
+    # Pozisyon Başına Ayrılan Büyüklük (Kasanın %65'i teminat, %35'i güvence tamponu - Max $400)
     allocated_margin = (eq / max_slots) * 0.65
-    target_notional = allocated_margin * DEFAULT_LEVERAGE
+    target_notional = min(MAX_NOTIONAL_PER_TRADE, allocated_margin * DEFAULT_LEVERAGE)
     
     for i, (sym, _) in enumerate(universe):
         if sym in open_syms: continue
