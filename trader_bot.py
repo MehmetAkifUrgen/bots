@@ -400,7 +400,8 @@ def get_account_balances():
         acc = binance_signed_request("GET", "/papi/v1/account")
         equity = float(acc.get("accountEquity", 0))
         free_margin = float(acc.get("totalAvailableBalance", 0))
-        return equity, free_margin
+        if equity > 0:
+            return round(equity, 2), round(free_margin, 2)
     except Exception:
         pass
         
@@ -409,7 +410,8 @@ def get_account_balances():
         for b in balances:
             if b.get("asset") == "USDT":
                 eq = float(b.get("totalWalletBalance", 0))
-                return eq, max(0.0, eq * 0.50)
+                free_m = float(b.get("crossMarginFree", eq * 0.50))
+                return round(eq, 2), round(free_m, 2)
     except Exception as e:
         print(f"[BAKİYE HATA] {e}", flush=True)
         
