@@ -21,11 +21,10 @@ STRATEJİ — 15M Üst Trend + 5M Hacimli Momentum Scalp (LONG):
     - BTC Kalkanı: BTC son 5 dakikada %0.60, 15 dakikada %1.00 üzerinde düşmüyorsa giriş serbest
 
   Kâr / Zarar & Çıkış Kuralları:
-    - TP Trailing Tetik: +%1.00 (Fiyat %1 yükselince Trailing kâr takibi devreye girer)
-    - Trailing Drop: %0.25 (Zirveden %0.25 gevşeyince kâr kilitlenir)
-    - BE (Başa Baş) Tetik: +%0.45 (Fiyat %0.45 yükselince stop maliyet + %0.15 seviyesine çekilir,
-      komisyon garanti çıkarılır ve net kâr kilitlenir)
-    - SL (Stop Loss): -%0.55 (Sıkı sabit stop loss)
+    - TP Trailing Tetik: +%1.50 (Fiyat %1.50 yükselince Trailing kâr takibi devreye girer)
+    - Trailing Drop: %0.35 (Zirveden %0.35 gevşeyince kâr kilitlenir)
+    - BE (Başa Baş) Tetik: +%1.20 (Fiyat en az %1.20 yükselmeden stop yukarı çekilmez)
+    - SL (Stop Loss): -%1.50 (Sabit %1.50 stop loss; erken stop çekilmez)
     - Timeout: 30 dakika (Scalp pozisyonu uzamaz, 30 dakikada ivme bitmişse kapatılır)
 
 Telegram Komutları: /durum, /rapor, /gercek, /fake, /kapat, /reset
@@ -70,10 +69,10 @@ MAX_HOLD_SECONDS     = 1800           # 30 dakika maksimum tutma süresi
 COOLDOWN_SECONDS     = 600            # Kapanan coine 10 dakika tekrar girme
 
 # Scalp Kâr / Zarar Parametreleri
-TP_TRIGGER_PCT     = 0.0100           # +%1.00 → trailing başlar
-TRAILING_DROP_PCT  = 0.0025           # Zirveden %0.25 geri → kâr al
-BE_TRIGGER_PCT     = 0.0045           # +%0.45 → stop komisyon üstüne (maliyet + %0.15)
-SL_PCT             = 0.0055           # -%0.55 → sıkı stop loss
+TP_TRIGGER_PCT     = 0.0150           # +%1.50 → trailing başlar
+TRAILING_DROP_PCT  = 0.0035           # Zirveden %0.35 geri → kâr al
+BE_TRIGGER_PCT     = 0.0120           # +%1.20 → stop maliyetin üstüne çekilir (erken çekilmez)
+SL_PCT             = 0.0150           # -%1.50 → stop loss
 
 # Sanal Kasa
 SIM_STARTING_BALANCE = 20.0
