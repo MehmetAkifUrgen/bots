@@ -55,16 +55,15 @@ MAX_HOLD_SECONDS     = 3600           # 60 dakika maksimum tutma süresi
 COOLDOWN_SECONDS     = 600            # Kapanan coine 10 dakika tekrar girme
 
 # Kâr / Zarar Parametreleri (Dolar Bazlı Net Hedefler)
-TP_TRIGGER_USD     = 2.00             # +$2.00 kârda Trailing TP başlar
-TRAILING_DROP_USD  = 0.80             # Zirve kârdan $0.80 geri çekilince kârı kilitler
-BE_TRIGGER_USD     = 1.00             # +$1.00 kârda stop maliyetin üstüne çekilir (hemen çekilmez!)
+TP_TRIGGER_USD     = 3.00             # +$3.00 kârda Trailing TP başlar
+TRAILING_DROP_USD  = 1.00             # Zirve kârdan $1.00 geri çekilince kârı kilitler
 SL_USD             = 1.50             # -$1.50 Stop Loss (Sabit $1.50 kayıp sınırı)
 
 # Sanal Kasa
 SIM_STARTING_BALANCE = 20.0
 
 # Filtreler
-PROTECTED  = {"BASEDUSDT","TRXUSDT","FDUSDUSDT","USDCUSDT"}
+PROTECTED  = {"TRXUSDT","FDUSDUSDT","USDCUSDT"}
 STABLE     = {"USDC","BUSD","DAI","TUSD","USDP","FDUSD","USDD","FRAX","GUSD","LUSD","USTC","EURC"}
 MIN_VOL    = 8_000_000.0
 MAX_VOL    = 800_000_000.0
@@ -612,19 +611,15 @@ def execute_real_close(pos, reason):
 
 def build_pos(sym, entry, qty, notional, lev, is_real=False, order_id=""):
     sl_price = entry - (SL_USD / qty)
-    be_trigger = entry + (BE_TRIGGER_USD / qty)
-    be_sl_price = entry + (est_fee(notional) * 1.5 / qty)
     tp_price = entry + (TP_TRIGGER_USD / qty)
     return {
         "sym": sym, "entry": entry, "qty": qty,
         "notional_usd": round(notional, 2), "leverage": lev,
         "tp_price": tp_price,
-        "be_trigger": be_trigger,
-        "be_sl": be_sl_price,
         "sl_price": sl_price,
         "order_id": order_id or f"sim_{uuid.uuid4().hex[:8]}",
         "opened_iso": utc().isoformat(), "opened_ts": ts(),
-        "be_hit": False, "trailing_active": False,
+        "trailing_active": False,
         "highest_pnl_usd": 0.0,
         "highest_price": entry, "is_real": is_real,
     }
@@ -646,25 +641,16 @@ def monitor(state):
             pos["highest_pnl_usd"] = gpnl
         highest_pnl = pos.get("highest_pnl_usd", gpnl)
 
-        # BE tetik (+ $1.00 kârda stop maliyetin üstüne çekilir)
-        if not pos.get("be_hit") and (gpnl >= BE_TRIGGER_USD or price >= pos.get("be_trigger", 999999)):
-            pos["sl_price"] = pos["be_sl"]
-            pos["be_hit"] = True
-            fee = est_fee(pos["notional_usd"])
-            locked = (pos["sl_price"] - pos["entry"]) * pos["qty"] - fee
-            mode = "🔴" if pos.get("is_real") else "🧪"
-            tg(f"🔰 {mode} *{sym}* +${gpnl:.2f} kârda BE Tetiklendi! Stop → `{fp(pos['sl_price'])}` "
-               f"(Komisyon korundu, net kilitli: `${locked:+.2f}`)")
-
-        # Trailing tetik (+ $2.00 kârda trailing başlar)
+        # Trailing tetik (+ $3.00 kârda trailing başlar)
         if gpnl >= TP_TRIGGER_USD or price >= pos.get("tp_price", 999999) or pos.get("trailing_active"):
             if not pos.get("trailing_active"):
                 pos["trailing_active"] = True
+                locked_profit = max(1.50, gpnl - TRAILING_DROP_USD)
                 mode = "🔴" if pos.get("is_real") else "🧪"
                 tg(f"🚀 {mode} *{sym}* +${gpnl:.2f} kâra ulaştı! "
-                   f"Trailing Kâr Takibi aktif, zirve takip ediliyor.")
+                   f"Trailing Kâr Takibi aktif edildi (Kilitli kâr: +${locked_profit:.2f}), zirve takip ediliyor.")
 
-            # Zirveden TRAILING_DROP_USD ($0.80) gevşeyince kâr al stopu
+            # Zirveden TRAILING_DROP_USD ($1.00) gevşeyince kâr al stopu
             trail_sl_pnl = highest_pnl - TRAILING_DROP_USD
             trail_sl_price = pos["entry"] + (trail_sl_pnl / pos["qty"])
             pos["sl_price"] = max(pos["sl_price"], trail_sl_price)
@@ -674,7 +660,7 @@ def monitor(state):
         if pos.get("trailing_active") and price <= pos["sl_price"]:
             reason = "TRAILING_TP"
         elif price <= pos["sl_price"] or gpnl <= -SL_USD:
-            reason = "BREAKEVEN" if pos.get("be_hit") else "STOP_LOSS"
+            reason = "STOP_LOSS"
         elif dur >= MAX_HOLD_SECONDS:
             reason = "TIMEOUT"
 
@@ -780,7 +766,6 @@ def scan(state, universe):
                f"Giriş: `{fp(pos['entry'])}` | Büyüklük: `${pos['notional_usd']:.0f}` ({pos['leverage']}x)\n"
                f"🎯 Hedef Direnç: `{fp(sig['target_resistance'])}` (+%{sig['pot_pct']:.1f})\n"
                f"🚀 Trailing Tetik: `+${TP_TRIGGER_USD:.2f}`\n"
-               f"🔰 BE Tetik: `+${BE_TRIGGER_USD:.2f}`\n"
                f"🛑 Stop Loss: `-${SL_USD:.2f}` (Sabit)\n"
                f"💸 Tahmini Fee: `${fee:.2f}`\n"
                f"📅 Bugün İşlem: {today_cnt}\n\n"
@@ -802,7 +787,6 @@ def main():
     print(f" Strateji      : Pre-Pump Breakout + Staircase Accumulation (İlk Yeşil Mumlar)", flush=True)
     print(f" Kaldıraç      : {DEFAULT_LEVERAGE}x | Maks Pozisyon: ${MAX_NOTIONAL:.0f}", flush=True)
     print(f" TP Trailing   : +${TP_TRIGGER_USD:.2f} tetik, -${TRAILING_DROP_USD:.2f} geri çekilme", flush=True)
-    print(f" BE Koruma     : +${BE_TRIGGER_USD:.2f} kârda stop maliyet üstüne (erken çekilmez)", flush=True)
     print(f" SL            : -${SL_USD:.2f} (Sabit $1.50 kayıp limiti)", flush=True)
     print(f" Zaman Aşımı   : {MAX_HOLD_SECONDS//60} dakika", flush=True)
     print(f" Komisyon      : %{COMMISSION_RATE*100:.2f} (her zaman net hesaplanır)", flush=True)
@@ -838,7 +822,6 @@ def main():
        f"  • Motor 1: Sıkışma & Ani Patlama (Breakout)\n"
        f"  • Motor 2: Sessiz Merdiven (Staircase Trend)\n"
        f"  • Stop Loss: `-${SL_USD:.2f}` (Sabit Dolar Stop)\n"
-       f"  • BE Tetik: `+${BE_TRIGGER_USD:.2f}` (Erken stop çekilmez)\n"
        f"  • TP Trailing: `+${TP_TRIGGER_USD:.2f}` kârda devreye girer\n\n"
        f"🎮 Komutlar: /durum /rapor /gercek /fake /kapat /reset")
 
