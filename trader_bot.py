@@ -54,10 +54,11 @@ SCAN_INTERVAL        = 10             # 10 saniyede bir piyasa taraması
 MAX_HOLD_SECONDS     = 3600           # 60 dakika maksimum tutma süresi
 COOLDOWN_SECONDS     = 600            # Kapanan coine 10 dakika tekrar girme
 
-# Kâr / Zarar Parametreleri (Dolar Bazlı Net Hedefler)
-TP_TRIGGER_USD     = 3.00             # +$3.00 kârda Trailing TP başlar
-TRAILING_DROP_USD  = 1.00             # Zirve kârdan $1.00 geri çekilince kârı kilitler
-SL_USD             = 1.50             # -$1.50 Stop Loss (Sabit $1.50 kayıp sınırı)
+# Kâr / Zarar Parametreleri (Hibrit: 15M EMA9 Trend + Oransal Zirve Paraşütü)
+SL_USD             = 1.50             # -$1.50 Stop Loss (Sabit kayıp sınırı)
+TREND_TRIGGER_USD  = 3.00             # +$3.00 kârda 15M EMA9 Trend Sörfü aktif olur
+PARACHUTE_MIN_USD  = 5.00             # +$5.00 kârdan sonra %25 Zirve Paraşütü devreye girer
+PARACHUTE_DROP_PCT = 0.25             # Zirve kârdan en fazla %25 gevşemeye izin verir (%75 cepte)
 
 # Sanal Kasa
 SIM_STARTING_BALANCE = 20.0
@@ -611,15 +612,13 @@ def execute_real_close(pos, reason):
 
 def build_pos(sym, entry, qty, notional, lev, is_real=False, order_id=""):
     sl_price = entry - (SL_USD / qty)
-    tp_price = entry + (TP_TRIGGER_USD / qty)
     return {
         "sym": sym, "entry": entry, "qty": qty,
         "notional_usd": round(notional, 2), "leverage": lev,
-        "tp_price": tp_price,
         "sl_price": sl_price,
         "order_id": order_id or f"sim_{uuid.uuid4().hex[:8]}",
         "opened_iso": utc().isoformat(), "opened_ts": ts(),
-        "trailing_active": False,
+        "trend_active": False,
         "highest_pnl_usd": 0.0,
         "highest_price": entry, "is_real": is_real,
     }
@@ -641,24 +640,43 @@ def monitor(state):
             pos["highest_pnl_usd"] = gpnl
         highest_pnl = pos.get("highest_pnl_usd", gpnl)
 
-        # Trailing tetik (+ $3.00 kârda trailing başlar)
-        if gpnl >= TP_TRIGGER_USD or price >= pos.get("tp_price", 999999) or pos.get("trailing_active"):
-            if not pos.get("trailing_active"):
-                pos["trailing_active"] = True
-                locked_profit = max(1.50, gpnl - TRAILING_DROP_USD)
-                mode = "🔴" if pos.get("is_real") else "🧪"
-                tg(f"🚀 {mode} *{sym}* +${gpnl:.2f} kâra ulaştı! "
-                   f"Trailing Kâr Takibi aktif edildi (Kilitli kâr: +${locked_profit:.2f}), zirve takip ediliyor.")
+        # 1. Trend Sörfü Modu (+$3.00 kâra ulaşıldığında kâr garantilenir)
+        if highest_pnl >= TREND_TRIGGER_USD and not pos.get("trend_active"):
+            pos["trend_active"] = True
+            min_lock_price = pos["entry"] + (1.20 / pos["qty"])
+            pos["sl_price"] = max(pos["sl_price"], min_lock_price)
+            mode = "🔴" if pos.get("is_real") else "🧪"
+            tg(f"🌊 {mode} *{sym}* `+${gpnl:.2f}` kâra ulaştı!\n\n"
+               f"*15M EMA9 Trend Sörfü Aktif!*\n"
+               f"Kâr artık zarara dönemez (+$1.20 kilitlendi). Fiyat 15M EMA9 üzerinde kaldığı sürece ara silkelemelerde satılmaz!")
 
-            # Zirveden TRAILING_DROP_USD ($1.00) gevşeyince kâr al stopu
-            trail_sl_pnl = highest_pnl - TRAILING_DROP_USD
-            trail_sl_price = pos["entry"] + (trail_sl_pnl / pos["qty"])
-            pos["sl_price"] = max(pos["sl_price"], trail_sl_price)
+        # 2. Oransal Zirve Paraşütü (Kâr $5+ ise zirve kârdan %25 çekilmede anında sat)
+        if highest_pnl >= PARACHUTE_MIN_USD:
+            allowed_drop = highest_pnl * PARACHUTE_DROP_PCT
+            parachute_pnl = highest_pnl - allowed_drop
+            parachute_price = pos["entry"] + (parachute_pnl / pos["qty"])
+            pos["sl_price"] = max(pos["sl_price"], parachute_price)
+
+        # 3. 15M EMA9 Trend Kontrolü (Kâr $3+ iken her 25 saniyede bir kontrol)
+        now_ts = time.time()
+        if pos.get("trend_active") and (now_ts - pos.get("last_ema_check", 0) >= 25):
+            pos["last_ema_check"] = now_ts
+            try:
+                df15 = klines(sym, "15m", 25)
+                if len(df15) >= 15:
+                    ema9 = df15['c'].ewm(span=9, adjust=False).mean().iloc[-1]
+                    last_c = df15['c'].iloc[-1]
+                    last_o = df15['o'].iloc[-1]
+                    if last_c < ema9 and last_c < last_o:
+                        pos["ema9_broken"] = True
+            except: pass
 
         # Çıkış kararı
         reason = None
-        if pos.get("trailing_active") and price <= pos["sl_price"]:
-            reason = "TRAILING_TP"
+        if pos.get("ema9_broken") and gpnl >= 1.50:
+            reason = "TREND_EMA9_TP"
+        elif highest_pnl >= PARACHUTE_MIN_USD and price <= pos["sl_price"]:
+            reason = "PARACHUTE_TP"
         elif price <= pos["sl_price"] or gpnl <= -SL_USD:
             reason = "STOP_LOSS"
         elif dur >= MAX_HOLD_SECONDS:
@@ -676,8 +694,8 @@ def monitor(state):
 
             icon = "🟢" if net > 0.01 else ("🔰" if abs(net) <= 0.01 else "🔴")
             result_text = {
-                "TRAILING_TP": f"🎯 Trailing Kâr Alındı!",
-                "BREAKEVEN": f"🔰 Başa Baş (Kâr Koruması)",
+                "TREND_EMA9_TP": f"🌊 15M EMA9 Trend Kârı Alındı!",
+                "PARACHUTE_TP": f"🪂 Zirve Paraşütüyle Kâr Kilitlendi!",
                 "STOP_LOSS": f"🛑 Stop Loss (-$1.50)",
                 "TIMEOUT": f"⏱️ Zaman Aşımı (60 Dk)",
             }.get(reason, reason)
@@ -693,9 +711,8 @@ def monitor(state):
             print(f"🔒 [{reason}] {sym} Net: ${net:+.2f}", flush=True)
         else:
             mode = "[G]" if pos.get("is_real") else "[S]"
-            trail = f" T:{fp(pos['sl_price'])}" if pos.get("trailing_active") else ""
-            print(f"  {mode} {sym} P:{fp(price)} PnL:${gpnl:+.2f} "
-                  f"TP:{fp(pos.get('tp_price', pos['entry']*1.015))} SL:{fp(pos['sl_price'])}{trail}",
+            trail = f" [SL Koruma:{fp(pos['sl_price'])}]" if (pos.get("trend_active") or highest_pnl >= PARACHUTE_MIN_USD) else ""
+            print(f"  {mode} {sym} P:{fp(price)} PnL:${gpnl:+.2f} (Zirve:${highest_pnl:+.2f}) SL:{fp(pos['sl_price'])}{trail}",
                   flush=True)
             still.append(pos)
 
@@ -765,8 +782,9 @@ def scan(state, universe):
                f"Yön: *LONG 🟢*\n"
                f"Giriş: `{fp(pos['entry'])}` | Büyüklük: `${pos['notional_usd']:.0f}` ({pos['leverage']}x)\n"
                f"🎯 Hedef Direnç: `{fp(sig['target_resistance'])}` (+%{sig['pot_pct']:.1f})\n"
-               f"🚀 Trailing Tetik: `+${TP_TRIGGER_USD:.2f}`\n"
-               f"🛑 Stop Loss: `-${SL_USD:.2f}` (Sabit)\n"
+               f"🌊 Trend Sörfü: `+${TREND_TRIGGER_USD:.2f}` (15M EMA9)\n"
+               f"🪂 Zirve Paraşütü: `+${PARACHUTE_MIN_USD:.2f}` (%{int(PARACHUTE_DROP_PCT*100)})\n"
+               f"🛑 Stop Loss: `-${SL_USD:.2f}` (Sabit Dolar)\n"
                f"💸 Tahmini Fee: `${fee:.2f}`\n"
                f"📅 Bugün İşlem: {today_cnt}\n\n"
                f"*Setup:*\n{reasons_txt}\n\n"
@@ -786,7 +804,7 @@ def main():
     print(f" Mod           : {'SİMÜLASYON (gerçek paraya dokunulmaz)' if not REAL_TRADING_DEFAULT else 'GERÇEK'}", flush=True)
     print(f" Strateji      : Pre-Pump Breakout + Staircase Accumulation (İlk Yeşil Mumlar)", flush=True)
     print(f" Kaldıraç      : {DEFAULT_LEVERAGE}x | Maks Pozisyon: ${MAX_NOTIONAL:.0f}", flush=True)
-    print(f" TP Trailing   : +${TP_TRIGGER_USD:.2f} tetik, -${TRAILING_DROP_USD:.2f} geri çekilme", flush=True)
+    print(f" Trend Sörfü   : +${TREND_TRIGGER_USD:.2f} (15M EMA9) | Paraşüt: +${PARACHUTE_MIN_USD:.2f} (%{int(PARACHUTE_DROP_PCT*100)})", flush=True)
     print(f" SL            : -${SL_USD:.2f} (Sabit $1.50 kayıp limiti)", flush=True)
     print(f" Zaman Aşımı   : {MAX_HOLD_SECONDS//60} dakika", flush=True)
     print(f" Komisyon      : %{COMMISSION_RATE*100:.2f} (her zaman net hesaplanır)", flush=True)
@@ -822,7 +840,8 @@ def main():
        f"  • Motor 1: Sıkışma & Ani Patlama (Breakout)\n"
        f"  • Motor 2: Sessiz Merdiven (Staircase Trend)\n"
        f"  • Stop Loss: `-${SL_USD:.2f}` (Sabit Dolar Stop)\n"
-       f"  • TP Trailing: `+${TP_TRIGGER_USD:.2f}` kârda devreye girer\n\n"
+       f"  • Trend Sörfü: `+${TREND_TRIGGER_USD:.2f}` (15M EMA9 kırılana kadar tut)\n"
+       f"  • Zirve Paraşütü: `+${PARACHUTE_MIN_USD:.2f}` (%25 gevşemede kilit)\n\n"
        f"🎮 Komutlar: /durum /rapor /gercek /fake /kapat /reset")
 
     last_scan = 0
