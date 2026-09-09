@@ -1,31 +1,17 @@
 """
-trader_bot.py — 5M Momentum Scalp Sniper (Simülasyon Modu)
+trader_bot.py — Pre-Pump Breakout & Staircase Trend Sniper
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 PRENSİPLER:
-  1. Varsayılan mod SİMÜLASYON. Gerçek para ancak Telegram'dan /gercek komutuyla açılır.
-  2. Sadece A+ Kalite LONG fırsatları değerlendirilir.
-  3. Komisyon (%0.05 taker × 2 = %0.10) HER ZAMAN kuruşu kuruşuna net hesaplanır.
-  4. Sanal kasa $20 ile başlar, kâr/zarar net izlenir.
-  5. Tek pozisyon disiplini — aynı anda yalnızca 1 pozisyon.
-
-STRATEJİ — 15M Üst Trend + 5M Hacimli Momentum Scalp (LONG):
-  Giriş Şartları (TÜMÜ gerekli):
-    - 15M Trend: EMA20 >= EMA50 ve Fiyat > EMA50 (sağlam yükseliş zemini)
-    - 15M RSI: 42 - 72 arası (aşırı alım değil, sağlıklı trend)
-    - 5M Trend Uyumu: EMA9 > EMA21 ve Fiyat >= EMA9
-    - 5M Mum: Pozitif yeşil mum (Close > Open)
-    - 5M RSI: 48 - 68 arası (ivmeli, güçlü momentum)
-    - 5M Hacim Patlaması (RVOL): Son bar hacmi >= 1.6x (son 15 bar ortalamasının 1.6 katı)
-    - 5M Micro-Breakout: Son 10 barın zirvesini kırma/test etme (Close >= High10 * 0.9985)
-    - BTC Kalkanı: BTC son 5 dakikada %0.60, 15 dakikada %1.00 üzerinde düşmüyorsa giriş serbest
-
-  Kâr / Zarar & Çıkış Kuralları:
-    - TP Trailing Tetik: +%1.50 (Fiyat %1.50 yükselince Trailing kâr takibi devreye girer)
-    - Trailing Drop: %0.35 (Zirveden %0.35 gevşeyince kâr kilitlenir)
-    - BE (Başa Baş) Tetik: +%1.20 (Fiyat en az %1.20 yükselmeden stop yukarı çekilmez)
-    - SL (Stop Loss): -%1.50 (Sabit %1.50 stop loss; erken stop çekilmez)
-    - Timeout: 30 dakika (Scalp pozisyonu uzamaz, 30 dakikada ivme bitmişse kapatılır)
+  1. Varsayılan mod SİMÜLASYON (Fake Para). Gerçek para ancak Telegram'dan /gercek komutuyla açılır.
+  2. Sadece A+ Kalite LONG fırsatları değerlendirilir (İlk yeşil mumlarda giriş).
+  3. Çift Motorlu Radar:
+     - Motor 1: Sıkışma & Ani Patlama (Breakout Sniper)
+     - Motor 2: Sessiz Merdiven (Staircase Accumulation)
+  4. Komisyon (%0.05 taker × 2 = %0.10) HER ZAMAN kuruşu kuruşuna net hesaplanır.
+  5. Sanal kasa $20 ile başlar, net PnL izlenir.
+  6. Stop Loss: Sabit -$1.50 USD (kesin kayıp sınırı).
+  7. Pozisyona girer girmez stop yukarı çekilmez (BE en az +$1.00 kârda tetiklenir).
 
 Telegram Komutları: /durum, /rapor, /gercek, /fake, /kapat, /reset
 """
@@ -57,22 +43,22 @@ def get_proxies():
         return {"http": PROXY_URL, "https": PROXY_URL}
     return None
 
-# ── SABİT STRATEJİ VE SCALP PARAMETRELERİ ───────────────────────────────────
+# ── STRATEJİ VE RİSK PARAMETRELERİ ───────────────────────────────────────────
 REAL_TRADING_DEFAULT = False          # ← VARSAYILAN SİMÜLASYON (Fake Para)
 DEFAULT_LEVERAGE     = 20
 MAX_NOTIONAL         = 400.0          # Maks pozisyon büyüklüğü ($)
 COMMISSION_RATE      = 0.0010         # %0.10 (giriş + çıkış taker fee)
 MAX_TRADES_PER_DAY   = 50             # Güvenlik tavanı
 MIN_TRADE_INTERVAL   = 120            # İşlemler arası minimum 2 dakika (saniye)
-SCAN_INTERVAL        = 8              # 8 saniyede bir hızlı scalp taraması
-MAX_HOLD_SECONDS     = 1800           # 30 dakika maksimum tutma süresi
+SCAN_INTERVAL        = 10             # 10 saniyede bir piyasa taraması
+MAX_HOLD_SECONDS     = 3600           # 60 dakika maksimum tutma süresi
 COOLDOWN_SECONDS     = 600            # Kapanan coine 10 dakika tekrar girme
 
-# Scalp Kâr / Zarar Parametreleri
-TP_TRIGGER_PCT     = 0.0150           # +%1.50 → trailing başlar
-TRAILING_DROP_PCT  = 0.0035           # Zirveden %0.35 geri → kâr al
-BE_TRIGGER_PCT     = 0.0120           # +%1.20 → stop maliyetin üstüne çekilir (erken çekilmez)
-SL_PCT             = 0.0150           # -%1.50 → stop loss
+# Kâr / Zarar Parametreleri (Dolar Bazlı Net Hedefler)
+TP_TRIGGER_USD     = 2.00             # +$2.00 kârda Trailing TP başlar
+TRAILING_DROP_USD  = 0.80             # Zirve kârdan $0.80 geri çekilince kârı kilitler
+BE_TRIGGER_USD     = 1.00             # +$1.00 kârda stop maliyetin üstüne çekilir (hemen çekilmez!)
+SL_USD             = 1.50             # -$1.50 Stop Loss (Sabit $1.50 kayıp sınırı)
 
 # Sanal Kasa
 SIM_STARTING_BALANCE = 20.0
@@ -97,7 +83,7 @@ def fp(v):
     return f"{v:.6f}"
 
 def est_fee(notional):
-    """Tek taraflı komisyon. Giriş+çıkış için 2x çağır veya COMMISSION_RATE kullan."""
+    """Giriş + çıkış toplam komisyon tahmini."""
     return round(notional * COMMISSION_RATE, 4)
 
 def tg(txt):
@@ -138,7 +124,7 @@ def load_st():
         "real_trading": REAL_TRADING_DEFAULT,
         "cooldown": {},
         "sim_balance": SIM_STARTING_BALANCE,
-        "trades_today": [],        # [{date, count}]
+        "trades_today": [],
         "last_trade_ts": 0,
     }
 
@@ -159,16 +145,12 @@ def get_sim_balance(state):
     return state.get("sim_balance", SIM_STARTING_BALANCE)
 
 def trades_today_count(state):
-    """Bugün kaç işlem kapandı?"""
     today = today_str()
     return sum(1 for t in state.get("trades_today", []) if t.get("date") == today)
 
 def can_open_trade(state):
-    """Yeni işlem açılabilir mi?"""
-    # Güvenlik limiti
     if trades_today_count(state) >= MAX_TRADES_PER_DAY:
         return False, f"Günlük güvenlik limiti ({MAX_TRADES_PER_DAY}) doldu"
-    # Zaman aralığı
     elapsed = time.time() - state.get("last_trade_ts", 0)
     if elapsed < MIN_TRADE_INTERVAL:
         remaining = int(MIN_TRADE_INTERVAL - elapsed)
@@ -179,18 +161,14 @@ def record_trade(state, pos, exit_price, gross_pnl, reason, dur_sec):
     fee = est_fee(pos["notional_usd"])
     net_pnl = round(gross_pnl - fee, 4)
 
-    # Sanal kasa güncelle
     if not pos.get("is_real", False):
         state["sim_balance"] = round(get_sim_balance(state) + net_pnl, 4)
 
-    # Günlük sayaç
     today = today_str()
     state.setdefault("trades_today", []).append({"date": today})
     state["trades_today"] = [t for t in state["trades_today"] if t.get("date") == today]
-
     state["last_trade_ts"] = time.time()
 
-    # DB kaydet
     trades = load_db()
     trades.append({
         "pair": pos["sym"], "side": "LONG",
@@ -231,7 +209,7 @@ def handle_telegram(state):
                 eq, fm = get_account_balances()
                 tg(f"🔴 *GERÇEK İŞLEM MODU AKTİF!*\n"
                    f"💰 Bakiye: `${eq:.2f}` (Serbest: `${fm:.2f}`)\n"
-                   f"⚡ Scalp pozisyonları gerçek parayla açılacaktır!")
+                   f"⚡ Pozisyonlar gerçek parayla açılacaktır!")
 
             elif text in ["/fake", "/sim", "/simulasyon"]:
                 state["real_trading"] = False
@@ -258,7 +236,7 @@ def handle_telegram(state):
                 state["cooldown"] = {}
                 state["real_trading"] = False
                 save_st(state)
-                tg(f"🔄 *Simülasyon sıfırlandı!* Kasa: `${SIM_STARTING_BALANCE:.2f} USDT` (Sanal Mod)")
+                tg(f"🔄 *Simülasyon sıfırlandı!* Kasa: `${SIM_STARTING_BALANCE:.2f} USDT`")
 
     except Exception as e:
         print(f"[TG CMD HATA] {e}", flush=True)
@@ -279,7 +257,7 @@ def send_status(state):
     today_cnt = trades_today_count(state)
     pos_list = state.get("positions", [])
 
-    pos_txt = "_Açık pozisyon yok. 5M Scalp radarı tarıyor..._"
+    pos_txt = "_Açık pozisyon yok. Pre-Pump radarı tarıyor..._"
     if pos_list:
         lines = []
         for p in pos_list:
@@ -294,7 +272,7 @@ def send_status(state):
                 f"Şimdi: `{fp(cur)}` (%{pct:+.2f}) | Net: *`${npnl:+.2f}`*")
         pos_txt = "\n".join(lines)
 
-    tg(f"📊 *5M SCALP DURUM*\n\n"
+    tg(f"📊 *PRE-PUMP SNIPER DURUM*\n\n"
        f"⚙️ Mod: `{mode}`\n{bal_txt}\n"
        f"📌 Pozisyon: {len(pos_list)}/1\n"
        f"📅 Bugün İşlem: {today_cnt}\n\n"
@@ -308,7 +286,7 @@ def send_report(state):
     mode_t = "🔴 GERÇEK" if is_real else "🧪 SİMÜLASYON"
 
     if not filtered:
-        tg(f"📊 *{mode_t} RAPORU*\n\nHenüz tamamlanmış scalp işlemi yok.")
+        tg(f"📊 *{mode_t} RAPORU*\n\nHenüz tamamlanmış işlem yok.")
         return
 
     tot = len(filtered)
@@ -329,7 +307,7 @@ def send_report(state):
         icon = "🟢" if t["pnl"] > 0.01 else ("🔰" if abs(t["pnl"]) <= 0.01 else "🔴")
         last_5.append(f"{icon} `{t['pair']}` → *${t['pnl']:+.2f}* ({t['result']})")
 
-    tg(f"📊 *{mode_t} SCALP RAPORU*\n"
+    tg(f"📊 *{mode_t} RAPORU*\n"
        f"━━━━━━━━━━━━━━━━━━━━\n"
        f"İşlem: `{tot}` | 🟢 `{len(wins)}` | 🔴 `{len(losses)}` | 🔰 `{len(bes)}`\n"
        f"*Win Rate: %{wr:.0f}*\n"
@@ -360,14 +338,12 @@ def close_all(state):
 def get_public(endpoint, p=None):
     hosts = [FAPI_BASE, "https://fapi.binance.com"]
     proxies = get_proxies()
-    # 1. Önce doğrudan dene
     for host in hosts:
         url = f"{host}{endpoint}"
         try:
             r = requests.get(url, params=p, headers=HEADERS, timeout=12)
             if r.status_code == 200: return r.json()
         except: pass
-    # 2. Doğrudan başarısız olursa ve proxy tanımlıysa proxy ile dene
     if proxies:
         for host in hosts:
             url = f"{host}{endpoint}"
@@ -461,14 +437,12 @@ def get_account_balances():
 
 def btc_safe():
     try:
-        # 5 dakikalık ani şok düşüş kontrolü
         df5 = klines("BTCUSDT", "5m", 6)
         if len(df5) >= 3:
             c5 = df5.iloc[-1]
             if c5['c'] < c5['o'] and (c5['o'] - c5['c']) / c5['o'] > 0.0060:
                 return False  # BTC 5m'de %0.60'tan fazla ani düşüşte
 
-        # 15 dakikalık trend çöküşü kontrolü
         df15 = klines("BTCUSDT", "15m", 6)
         if len(df15) >= 3:
             c15 = df15.iloc[-1]
@@ -505,70 +479,95 @@ def get_universe():
         print(f"[UNIVERSE HATA] {e}", flush=True)
         return []
 
-# ── SİNYAL ANALİZİ — 15M TREND + 5M MOMENTUM SCALP (LONG) ───────────────────
+# ── SİNYAL ANALİZİ — ÇİFT MOTORLU PRE-PUMP VE SESSİZ MERDİVEN ───────────────
 
 def analyze(sym, cooldown):
     if time.time() - cooldown.get(sym, 0) < COOLDOWN_SECONDS:
         return None
 
     try:
-        # ── 15M Üst Trend Filtresi ──
-        df15 = klines(sym, "15m", 45)
-        if len(df15) < 30: return None
+        df15 = klines(sym, "15m", 50)
+        if len(df15) < 35: return None
 
-        ema20_15 = df15['c'].ewm(span=20, adjust=False).mean()
-        ema50_15 = df15['c'].ewm(span=50, adjust=False).mean()
-        rsi_15 = calc_rsi(df15['c'], 14)
-        c15 = df15['c'].iloc[-1]
+        c = df15['c'].iloc[-1]
+        o = df15['o'].iloc[-1]
+        h = df15['h'].iloc[-1]
+        l = df15['l'].iloc[-1]
 
-        # 15M Trend: EMA20 >= EMA50 ve Fiyat EMA50 üzerinde
-        if ema20_15.iloc[-1] < ema50_15.iloc[-1]: return None
-        if c15 < ema50_15.iloc[-1]: return None
-        if not (42.0 <= rsi_15 <= 72.0): return None
+        # Taban hesaplaması (son 30 bar)
+        base_low = df15['l'].iloc[-30:-1].min()
+        base_high = df15['h'].iloc[-30:-1].max()
+        gain_from_base = ((c - base_low) / base_low) * 100 if base_low > 0 else 0
 
-        # ── 5M Scalp Giriş ve Momentum Tetikleyicisi ──
-        df5 = klines(sym, "5m", 35)
-        if len(df5) < 25: return None
+        # Kural: Zaten uçmuş (%4'ten fazla fırlamış) coine ASLA girilmez!
+        if gain_from_base > 4.2:
+            return None
 
-        ema9_5 = df5['c'].ewm(span=9, adjust=False).mean()
-        ema21_5 = df5['c'].ewm(span=21, adjust=False).mean()
-        rsi_5 = calc_rsi(df5['c'], 14)
+        # Son mum yeşil olmalı
+        if c <= o:
+            return None
 
-        last5 = df5.iloc[-1]
-        c5, o5, h5, l5 = last5['c'], last5['o'], last5['h'], last5['l']
+        # Hacim ortalamaları
+        vol_avg = df15['v'].iloc[-20:-1].mean()
+        rvol = df15['v'].iloc[-1] / vol_avg if vol_avg > 0 else 1.0
 
-        # 1. 5M Trend: EMA9 > EMA21 ve Fiyat >= EMA9
-        if ema9_5.iloc[-1] <= ema21_5.iloc[-1]: return None
-        if c5 < ema9_5.iloc[-1]: return None
+        # Taker alıcı oranı
+        tb_ratio = df15['tb'].iloc[-1] / df15['v'].iloc[-1] if df15['v'].iloc[-1] > 0 else 0.5
 
-        # 2. Mum Rengi: Pozitif Yeşil Mum
-        if c5 <= o5: return None
+        # EMA ve RSI
+        ema9 = df15['c'].ewm(span=9, adjust=False).mean()
+        ema21 = df15['c'].ewm(span=21, adjust=False).mean()
+        ema50 = df15['c'].ewm(span=50, adjust=False).mean()
+        rsi = calc_rsi(df15['c'], 14)
 
-        # 3. 5M Momentum RSI: 48 - 68 arası (ivmeli, şişmemiş)
-        if not (48.0 <= rsi_5 <= 68.0): return None
+        # Hedef Direnç (Önündeki majör tepe)
+        recent_highs = df15['h'].max()
+        target_resistance = max(recent_highs, base_high * 1.08)
+        upside_pot_pct = ((target_resistance - c) / c) * 100
 
-        # 4. Hacim Patlaması (RVOL >= 1.6x)
-        vol_avg5 = df5['v'].iloc[-15:-1].mean()
-        rvol5 = df5['v'].iloc[-1] / vol_avg5 if vol_avg5 > 0 else 1.0
-        if rvol5 < 1.6: return None
+        # ── MOTOR 1: SIKIŞMA VE ANİ PATLAMA (PRE-PUMP BREAKOUT) ──
+        high20 = df15['h'].iloc[-21:-1].max()
+        is_breakout = (c >= high20 * 0.999) and (rvol >= 2.0) and (tb_ratio >= 0.54) and (48.0 <= rsi <= 72.0)
 
-        # 5. Micro-Breakout: Son 10 barın zirvesini test etme/kırma
-        high10 = df5['h'].iloc[-11:-1].max()
-        if c5 < high10 * 0.9985: return None
+        # ── MOTOR 2: SESSİZ MERDİVEN (STAIRCASE ACCUMULATION) ──
+        is_staircase = False
+        if ema9.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1] and c >= ema9.iloc[-1]:
+            lows = df15['l'].iloc[-4:].values
+            if lows[3] >= lows[2] >= lows[1] and (52.0 <= rsi <= 68.0) and (tb_ratio >= 0.52) and (rvol >= 1.3):
+                is_staircase = True
 
-        entry = last_price(sym)
-        return {
-            "sym": sym, "entry": entry,
-            "rvol5": round(rvol5, 2),
-            "rsi_15m": round(rsi_15, 1),
-            "rsi_5m": round(rsi_5, 1),
-            "reasons": [
-                f"📈 15M Trend: EMA20 > EMA50 | RSI: `{rsi_15:.0f}`",
-                f"⚡ 5M Scalp: EMA9 > EMA21 | RSI: `{rsi_5:.0f}` | RVOL: `{rvol5:.1f}x`",
-                f"🎯 Micro-Breakout: 10-bar zirve testi onaylandı",
+        sig_type = None
+        reasons = []
+
+        if is_breakout:
+            sig_type = "🚀 ANİ PATLAMA (Breakout)"
+            reasons = [
+                f"💥 Sıkışma Direnci Kırıldı | RVOL: `{rvol:.1f}x`",
+                f"🐋 Balina Taker Alımı: `%{tb_ratio*100:.1f}`",
+                f"🎯 Hedef Direnç: `{fp(target_resistance)}` (+%{upside_pot_pct:.1f} potansiyel)"
             ]
-        }
-    except: return None
+        elif is_staircase:
+            sig_type = "📈 SESSİZ MERDİVEN (Staircase)"
+            reasons = [
+                f"🪜 15M Yükselen Dipler (Higher Lows) & EMA9 Merdiveni",
+                f"🛒 Net Alıcı Baskısı: `%{tb_ratio*100:.1f}` | RSI: `{rsi:.0f}`",
+                f"🎯 Hedef Direnç: `{fp(target_resistance)}` (+%{upside_pot_pct:.1f} potansiyel)"
+            ]
+
+        if sig_type:
+            entry = last_price(sym)
+            return {
+                "sym": sym, "entry": entry, "sig_type": sig_type,
+                "rvol": round(rvol, 1), "tb_ratio": round(tb_ratio, 2),
+                "rsi": round(rsi, 1), "target_resistance": target_resistance,
+                "pot_pct": round(upside_pot_pct, 1),
+                "reasons": reasons
+            }
+
+    except Exception:
+        return None
+
+    return None
 
 # ── POZİSYON AÇMA ────────────────────────────────────────────────────────────
 
@@ -612,18 +611,21 @@ def execute_real_close(pos, reason):
     return ep, pnl
 
 def build_pos(sym, entry, qty, notional, lev, is_real=False, order_id=""):
-    # Komisyonun 1.5 katı üzerinde (+%0.15 net kârda) başa baş koruması
+    sl_price = entry - (SL_USD / qty)
+    be_trigger = entry + (BE_TRIGGER_USD / qty)
     be_sl_price = entry + (est_fee(notional) * 1.5 / qty)
+    tp_price = entry + (TP_TRIGGER_USD / qty)
     return {
         "sym": sym, "entry": entry, "qty": qty,
         "notional_usd": round(notional, 2), "leverage": lev,
-        "tp_price": entry * (1 + TP_TRIGGER_PCT),
-        "be_trigger": entry * (1 + BE_TRIGGER_PCT),
+        "tp_price": tp_price,
+        "be_trigger": be_trigger,
         "be_sl": be_sl_price,
-        "sl_price": entry * (1 - SL_PCT),
+        "sl_price": sl_price,
         "order_id": order_id or f"sim_{uuid.uuid4().hex[:8]}",
         "opened_iso": utc().isoformat(), "opened_ts": ts(),
         "be_hit": False, "trailing_active": False,
+        "highest_pnl_usd": 0.0,
         "highest_price": entry, "is_real": is_real,
     }
 
@@ -639,34 +641,39 @@ def monitor(state):
         dur = int((utc() - datetime.fromisoformat(pos["opened_iso"])).total_seconds())
         gpnl = (price - pos["entry"]) * pos["qty"]
 
-        # BE tetik (+%0.45 kârda stop maliyet + %0.15'e çekilir)
-        if not pos.get("be_hit") and price >= pos["be_trigger"]:
+        # En yüksek görülen kârı izle
+        if gpnl > pos.get("highest_pnl_usd", 0.0):
+            pos["highest_pnl_usd"] = gpnl
+        highest_pnl = pos.get("highest_pnl_usd", gpnl)
+
+        # BE tetik (+ $1.00 kârda stop maliyetin üstüne çekilir)
+        if not pos.get("be_hit") and (gpnl >= BE_TRIGGER_USD or price >= pos.get("be_trigger", 999999)):
             pos["sl_price"] = pos["be_sl"]
             pos["be_hit"] = True
             fee = est_fee(pos["notional_usd"])
             locked = (pos["sl_price"] - pos["entry"]) * pos["qty"] - fee
             mode = "🔴" if pos.get("is_real") else "🧪"
-            tg(f"🔰 {mode} *{sym}* BE Tetiklendi! Stop → `{fp(pos['sl_price'])}` "
-               f"(Komisyon korundu, net kilitli kâr: `${locked:+.2f}`)")
+            tg(f"🔰 {mode} *{sym}* +${gpnl:.2f} kârda BE Tetiklendi! Stop → `{fp(pos['sl_price'])}` "
+               f"(Komisyon korundu, net kilitli: `${locked:+.2f}`)")
 
-        # Trailing tetik (+%1.00 kârda trailing başlar)
-        if price >= pos["tp_price"] or pos.get("trailing_active"):
+        # Trailing tetik (+ $2.00 kârda trailing başlar)
+        if gpnl >= TP_TRIGGER_USD or price >= pos.get("tp_price", 999999) or pos.get("trailing_active"):
             if not pos.get("trailing_active"):
                 pos["trailing_active"] = True
-                pos["highest_price"] = price
                 mode = "🔴" if pos.get("is_real") else "🧪"
-                tg(f"🚀 {mode} *{sym}* +%{((price/pos['entry'])-1)*100:.2f} kâr! "
-                   f"Scalp Trailing aktif, zirve takip ediliyor.")
+                tg(f"🚀 {mode} *{sym}* +${gpnl:.2f} kâra ulaştı! "
+                   f"Trailing Kâr Takibi aktif, zirve takip ediliyor.")
 
-            pos["highest_price"] = max(pos.get("highest_price", price), price)
-            trail_sl = pos["highest_price"] * (1 - TRAILING_DROP_PCT)
-            pos["sl_price"] = max(pos["sl_price"], trail_sl)
+            # Zirveden TRAILING_DROP_USD ($0.80) gevşeyince kâr al stopu
+            trail_sl_pnl = highest_pnl - TRAILING_DROP_USD
+            trail_sl_price = pos["entry"] + (trail_sl_pnl / pos["qty"])
+            pos["sl_price"] = max(pos["sl_price"], trail_sl_price)
 
         # Çıkış kararı
         reason = None
         if pos.get("trailing_active") and price <= pos["sl_price"]:
             reason = "TRAILING_TP"
-        elif price <= pos["sl_price"]:
+        elif price <= pos["sl_price"] or gpnl <= -SL_USD:
             reason = "BREAKEVEN" if pos.get("be_hit") else "STOP_LOSS"
         elif dur >= MAX_HOLD_SECONDS:
             reason = "TIMEOUT"
@@ -685,8 +692,8 @@ def monitor(state):
             result_text = {
                 "TRAILING_TP": f"🎯 Trailing Kâr Alındı!",
                 "BREAKEVEN": f"🔰 Başa Baş (Kâr Koruması)",
-                "STOP_LOSS": f"🛑 Stop Loss",
-                "TIMEOUT": f"⏱️ Zaman Aşımı (30 Dk)",
+                "STOP_LOSS": f"🛑 Stop Loss (-$1.50)",
+                "TIMEOUT": f"⏱️ Zaman Aşımı (60 Dk)",
             }.get(reason, reason)
 
             tg(f"{icon} {mode} *{result_text}* | `{sym}`\n\n"
@@ -702,7 +709,7 @@ def monitor(state):
             mode = "[G]" if pos.get("is_real") else "[S]"
             trail = f" T:{fp(pos['sl_price'])}" if pos.get("trailing_active") else ""
             print(f"  {mode} {sym} P:{fp(price)} PnL:${gpnl:+.2f} "
-                  f"TP:{fp(pos['tp_price'])} SL:{fp(pos['sl_price'])}{trail}",
+                  f"TP:{fp(pos.get('tp_price', pos['entry']*1.015))} SL:{fp(pos['sl_price'])}{trail}",
                   flush=True)
             still.append(pos)
 
@@ -743,12 +750,12 @@ def scan(state, universe):
     for i, (sym, qv, chg) in enumerate(universe):
         if sym in open_syms: continue
         if i % 20 == 0:
-            print(f"  Scalp Taranıyor... [{i+1}/{len(universe)}]", end="\r", flush=True)
+            print(f"  Pre-Pump Radar Taranıyor... [{i+1}/{len(universe)}]", end="\r", flush=True)
 
         sig = analyze(sym, cooldown)
         if sig:
             mode = "🔴 GERÇEK" if is_real else "🧪 SİMÜLASYON"
-            print(f"\n✅ [{mode}] {sym} 5M Scalp sinyali bulundu!", flush=True)
+            print(f"\n✅ [{mode}] {sym} {sig['sig_type']} sinyali bulundu!", flush=True)
 
             if is_real:
                 pos = execute_real_entry(sym, target_not, fm)
@@ -766,13 +773,15 @@ def scan(state, universe):
             today_cnt = trades_today_count(state) + 1
             reasons_txt = "\n".join(f"  {r}" for r in sig["reasons"])
 
-            tg(f"{'🔴' if is_real else '🧪'} *YENİ SCALP POZİSYONU* | `{sym}`\n\n"
+            tg(f"{'🔴' if is_real else '🧪'} *YENİ POZİSYON* | `{sym}`\n\n"
+               f"Tür: *{sig['sig_type']}*\n"
                f"Mod: *{mode}*\n"
                f"Yön: *LONG 🟢*\n"
                f"Giriş: `{fp(pos['entry'])}` | Büyüklük: `${pos['notional_usd']:.0f}` ({pos['leverage']}x)\n"
-               f"🎯 TP Trailing: `{fp(pos['tp_price'])}` (+%{TP_TRIGGER_PCT*100:.1f})\n"
-               f"🔰 BE: `{fp(pos['be_trigger'])}` (+%{BE_TRIGGER_PCT*100:.2f})\n"
-               f"🛑 SL: `{fp(pos['sl_price'])}` (-%{SL_PCT*100:.2f})\n"
+               f"🎯 Hedef Direnç: `{fp(sig['target_resistance'])}` (+%{sig['pot_pct']:.1f})\n"
+               f"🚀 Trailing Tetik: `+${TP_TRIGGER_USD:.2f}`\n"
+               f"🔰 BE Tetik: `+${BE_TRIGGER_USD:.2f}`\n"
+               f"🛑 Stop Loss: `-${SL_USD:.2f}` (Sabit)\n"
                f"💸 Tahmini Fee: `${fee:.2f}`\n"
                f"📅 Bugün İşlem: {today_cnt}\n\n"
                f"*Setup:*\n{reasons_txt}\n\n"
@@ -787,21 +796,20 @@ def scan(state, universe):
 
 def main():
     print("=" * 60, flush=True)
-    print("⚡ 5M MOMENTUM SCALP SNIPER v2.0 (LONG ONLY)", flush=True)
+    print("⚡ PRE-PUMP BREAKOUT & STAIRCASE SNIPER (LONG ONLY)", flush=True)
     print("=" * 60, flush=True)
     print(f" Mod           : {'SİMÜLASYON (gerçek paraya dokunulmaz)' if not REAL_TRADING_DEFAULT else 'GERÇEK'}", flush=True)
-    print(f" Strateji      : 15M Trend + 5M Momentum Scalp (LONG)", flush=True)
+    print(f" Strateji      : Pre-Pump Breakout + Staircase Accumulation (İlk Yeşil Mumlar)", flush=True)
     print(f" Kaldıraç      : {DEFAULT_LEVERAGE}x | Maks Pozisyon: ${MAX_NOTIONAL:.0f}", flush=True)
-    print(f" TP Trailing   : +%{TP_TRIGGER_PCT*100:.1f} tetik, -%{TRAILING_DROP_PCT*100:.2f} geri çekilme", flush=True)
-    print(f" BE Koruma     : +%{BE_TRIGGER_PCT*100:.2f} kârda stop komisyon üstüne", flush=True)
-    print(f" SL            : -%{SL_PCT*100:.2f}", flush=True)
+    print(f" TP Trailing   : +${TP_TRIGGER_USD:.2f} tetik, -${TRAILING_DROP_USD:.2f} geri çekilme", flush=True)
+    print(f" BE Koruma     : +${BE_TRIGGER_USD:.2f} kârda stop maliyet üstüne (erken çekilmez)", flush=True)
+    print(f" SL            : -${SL_USD:.2f} (Sabit $1.50 kayıp limiti)", flush=True)
     print(f" Zaman Aşımı   : {MAX_HOLD_SECONDS//60} dakika", flush=True)
     print(f" Komisyon      : %{COMMISSION_RATE*100:.2f} (her zaman net hesaplanır)", flush=True)
     print("=" * 60, flush=True)
 
     state = load_st()
 
-    # Varsayılan simülasyona başla
     if "sim_balance" not in state or "real_trading" not in state:
         state["sim_balance"] = SIM_STARTING_BALANCE
         state["real_trading"] = False
@@ -822,15 +830,16 @@ def main():
     mode = "🔴 GERÇEK İŞLEM" if is_real else "🧪 SİMÜLASYON ($20 sanal kasa)"
     bal = get_sim_balance(state)
 
-    tg(f"⚡ *5M Momentum Scalp Sniper v2.0 Başlatıldı*\n\n"
+    tg(f"⚡ *Pre-Pump Breakout & Staircase Sniper Başlatıldı*\n\n"
        f"⚙️ Mod: `{mode}`\n"
-       f"🎯 Yön: `SADECE LONG (A+ Kalite)`\n"
+       f"🎯 Yön: `SADECE LONG (Dipte / İlk Yeşil Mumda Giriş)`\n"
        f"💰 Sanal Kasa: `${bal:.2f} USDT`\n"
-       f"📋 Scalp Kuralları:\n"
-       f"  • 15M Trend Filtresi + 5M Micro Breakout\n"
-       f"  • Hacim Patlaması (RVOL >= 1.6x) Şartı\n"
-       f"  • TP: +%{TP_TRIGGER_PCT*100:.1f} Trailing | BE: +%{BE_TRIGGER_PCT*100:.2f} | SL: -%{SL_PCT*100:.2f}\n"
-       f"  • Max Süre: {MAX_HOLD_SECONDS//60} dk | Komisyon garantili koruma\n\n"
+       f"📋 Strateji Kuralları:\n"
+       f"  • Motor 1: Sıkışma & Ani Patlama (Breakout)\n"
+       f"  • Motor 2: Sessiz Merdiven (Staircase Trend)\n"
+       f"  • Stop Loss: `-${SL_USD:.2f}` (Sabit Dolar Stop)\n"
+       f"  • BE Tetik: `+${BE_TRIGGER_USD:.2f}` (Erken stop çekilmez)\n"
+       f"  • TP Trailing: `+${TP_TRIGGER_USD:.2f}` kârda devreye girer\n\n"
        f"🎮 Komutlar: /durum /rapor /gercek /fake /kapat /reset")
 
     last_scan = 0
@@ -843,7 +852,6 @@ def main():
 
             state = handle_telegram(state)
 
-            # Heartbeat her 2 dakika
             if now - last_hb >= 120:
                 is_real = state.get("real_trading", False)
                 bal = get_sim_balance(state)
