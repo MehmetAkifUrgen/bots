@@ -46,29 +46,35 @@ REAL_TRADING_DEFAULT = False
 MAX_OPEN_POSITIONS   = 3
 POSITION_NOTIONAL    = 225.0
 COMMISSION_RATE      = 0.0020
-MAX_TRADES_PER_DAY   = 50
-MIN_TRADE_INTERVAL   = 30
-SCAN_INTERVAL        = 30
-COOLDOWN_SECONDS     = 600
+MAX_TRADES_PER_DAY   = 10
+MIN_TRADE_INTERVAL   = 120
+SCAN_INTERVAL        = 60
+COOLDOWN_SECONDS     = 1800
 
-SL_USD               = 4.50
-TP_USD               = 6.00
-BREAKEVEN_TRIGGER    = 3.50
-TRAILING_DISTANCE    = 1.00
+SL_USD               = 3.50
+TP_USD               = 10.00
+BREAKEVEN_TRIGGER    = 5.00
+TRAILING_DISTANCE    = 3.00
 
 SIM_STARTING_BALANCE = 500.0
 
 TIMEFRAME            = "15m"
 KLINES_NEEDED        = 40
 FIB_LOOKBACK         = 35
+HT_TIMEFRAME         = "1h"
+HT_KLINES_NEEDED     = 100
+
+MAX_DAILY_LOSS_USD   = 15.0
+MAX_DRAWDOWN_PCT     = 8.0
+MIN_ADX              = 18.0
 
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
 # ── DIŞLANACAK COİN LİSTELERİ ────────────────────────────────────────────────
+# Likit büyük coinler TARAMAYA DAHİL edilsin diye listeden çıkarıldı:
+# BTC, ETH, SOL, XRP, AVAX, LINK, ADA, MATIC, DOGE, NEAR, SUI, ARB, OP
 MAJOR_BASKIN = {
-    "BTC","ETH","BNB","SOL","XRP","ADA","DOGE","AVAX","LINK","DOT",
-    "LTC","BCH","ATOM","NEAR","SUI","APT","ARB","OP","FIL","UNI",
-    "TRX","MATIC","POL"
+    "BNB","DOT","LTC","BCH","ATOM","APT","FIL","UNI","TRX","POL"
 }
 STABLECOINS = {"USDC","DAI","TUSD","FDUSD","USDP","BUSD","EUR","USTC","USDD","PYUSD","USD"}
 COMMODITIES_ETF = {
@@ -151,8 +157,11 @@ def load_st():
         "real_trading": REAL_TRADING_DEFAULT,
         "cooldown": {},
         "sim_balance": SIM_STARTING_BALANCE,
+        "sim_peak_balance": SIM_STARTING_BALANCE,
         "trades_today": [],
+        "pnl_today_sum": 0.0,
         "last_trade_ts": 0,
+        "circuit_breaker_until": 0,
     }
 
 def save_st(s):
@@ -171,9 +180,36 @@ def save_db(t):
 def get_sim_balance(state):
     return state.get("sim_balance", SIM_STARTING_BALANCE)
 
+def get_sim_peak(state):
+    return state.get("sim_peak_balance", SIM_STARTING_BALANCE)
+
 def trades_today_count(state):
     today = today_str()
     return sum(1 for t in state.get("trades_today", []) if t.get("date") == today)
+
+def pnl_today(state):
+    return float(state.get("pnl_today_sum", 0.0))
+
+def check_circuit_breakers(state):
+    now_ts = time.time()
+    if now_ts < state.get("circuit_breaker_until", 0):
+        remain = int(state["circuit_breaker_until"] - now_ts)
+        hours = remain // 3600
+        mins = (remain % 3600) // 60
+        return False, f"DEVRE KESİCİ: {hours}s {mins}d daha duraklama"
+
+    bal = get_sim_balance(state)
+    peak = get_sim_peak(state)
+    if peak > 0:
+        dd_pct = (peak - bal) / peak * 100.0
+        if dd_pct >= MAX_DRAWDOWN_PCT:
+            return False, f"MAX DRAWDOWN aşıldı (%{dd_pct:.1f} ≥ %{MAX_DRAWDOWN_PCT:.1f})"
+
+    daily_loss = pnl_today(state)
+    if daily_loss <= (-MAX_DAILY_LOSS_USD):
+        return False, f"GÜNLÜK MAX ZARAR aşıldı (${daily_loss:+.2f} ≤ -${MAX_DAILY_LOSS_USD:.2f})"
+
+    return True, "OK"
 
 def can_open_trade(state):
     if len(state.get("positions", [])) >= MAX_OPEN_POSITIONS:
@@ -190,13 +226,39 @@ def record_trade(state, pos, exit_price, gross_pnl, reason, dur_sec):
     fee = est_fee(pos["notional_usd"])
     net_pnl = round(gross_pnl - fee, 4)
 
+    today = today_str()
     if not pos.get("is_real", False):
         state["sim_balance"] = round(get_sim_balance(state) + net_pnl, 4)
+        peak = get_sim_peak(state)
+        if state["sim_balance"] > peak:
+            state["sim_peak_balance"] = state["sim_balance"]
 
-    today = today_str()
+    current_date = state.get("pnl_today_date", "")
+    if current_date != today:
+        state["pnl_today_date"] = today
+        state["pnl_today_sum"] = 0.0
+    state["pnl_today_sum"] = round(float(state.get("pnl_today_sum", 0.0)) + net_pnl, 4)
+
     state.setdefault("trades_today", []).append({"date": today})
     state["trades_today"] = [t for t in state["trades_today"] if t.get("date") == today]
     state["last_trade_ts"] = time.time()
+
+    if net_pnl < 0:
+        bal = get_sim_balance(state)
+        peak = get_sim_peak(state)
+        dd_pct = (peak - bal) / peak * 100.0 if peak > 0 else 0.0
+        if dd_pct >= MAX_DRAWDOWN_PCT:
+            hours = 4
+            state["circuit_breaker_until"] = time.time() + (hours * 3600)
+            tg(f"⛔ *DEVRE KESİCİ (DRAWDOWN)*\n"
+               f"Drawdown: %{dd_pct:.1f} / Limit: %{MAX_DRAWDOWN_PCT:.1f}\n"
+               f"Kasanın güvenliği için {hours} saat yeni işlem YAPILMAYACAK!")
+        elif float(state.get("pnl_today_sum", 0.0)) <= (-MAX_DAILY_LOSS_USD):
+            hours = 2
+            state["circuit_breaker_until"] = time.time() + (hours * 3600)
+            tg(f"⛔ *DEVRE KESİCİ (GÜNLÜK ZARAR)*\n"
+               f"Bugün: ${float(state['pnl_today_sum']):+.2f} / Limit: -${MAX_DAILY_LOSS_USD:.2f}\n"
+               f"Kasanın güvenliği için {hours} saat yeni işlem YAPILMAYACAK!")
 
     trades = load_db()
     trades.append({
@@ -205,7 +267,8 @@ def record_trade(state, pos, exit_price, gross_pnl, reason, dur_sec):
         "qty": pos["qty"], "notional": pos["notional_usd"],
         "gross_pnl": round(gross_pnl, 4), "fee": fee,
         "pnl": net_pnl,
-        "result": reason, "duration_sec": dur_sec,
+        "result": reason,
+        "duration_sec": dur_sec,
         "is_real": pos.get("is_real", False),
         "timestamp": ts()
     })
@@ -259,13 +322,17 @@ def handle_telegram(state):
 
             elif text in ["/reset"]:
                 state["sim_balance"] = SIM_STARTING_BALANCE
+                state["sim_peak_balance"] = SIM_STARTING_BALANCE
                 state["trades_today"] = []
+                state["pnl_today_sum"] = 0.0
+                state["pnl_today_date"] = ""
                 state["last_trade_ts"] = 0
                 state["positions"] = []
                 state["cooldown"] = {}
                 state["real_trading"] = False
+                state["circuit_breaker_until"] = 0
                 save_st(state)
-                tg(f"🔄 *Simülasyon sıfırlandı!* Kasa: `${SIM_STARTING_BALANCE:.2f} USDT`")
+                tg(f"🔄 *Simülasyon sıfırlandı!*\nKasa: `${SIM_STARTING_BALANCE:.2f} USDT`\nDevre kesiciler ve günlük PnL sıfırlandı.")
 
     except Exception as e:
         print(f"[TG CMD HATA] {e}", flush=True)
@@ -302,11 +369,18 @@ def send_status(state):
                 f"Şimdi: `{fp(cur)}` (%{pct:+.2f}) | Net: *`${npnl:+.2f}`*")
         pos_txt = "\n".join(lines)
 
-    tg(f"📊 *FIBONACCI GOLDEN POCKET DURUM*\n\n"
+    dpnl = pnl_today(state)
+    cb_active = time.time() < state.get("circuit_breaker_until", 0)
+    cb_txt = ""
+    if cb_active:
+        rem = int(state["circuit_breaker_until"] - time.time())
+        cb_txt = f"\n⛔ *Devre Kesici AKTİF*: {rem//60}dk daha yeni işlem yok"
+    tg(f"📊 *FIBONACCI GOLDEN POCKET DURUM (v2)*\n\n"
        f"⚙️ Mod: `{mode}`\n{bal_txt}\n"
        f"📌 Pozisyon: {len(pos_list)}/{MAX_OPEN_POSITIONS}\n"
-       f"📅 Bugün İşlem: {today_cnt}\n\n"
-       f"{pos_txt}\n\n"
+       f"📅 Bugün: {today_cnt} işlem | PnL: *`${dpnl:+.2f}`*\n\n"
+       f"{pos_txt}\n"
+       f"{cb_txt}\n\n"
        f"_Komutlar: /durum /rapor /gercek /fake /kapat /reset_")
 
 def send_report(state):
@@ -480,6 +554,73 @@ def last_price(sym):
     r = get_public("/api/v3/ticker/price", {"symbol": sym})
     return float(r["price"])
 
+def calc_adx_wilder(df_high, df_low, df_close, period=14):
+    h = pd.to_numeric(df_high, errors="coerce").astype(float).reset_index(drop=True)
+    l = pd.to_numeric(df_low, errors="coerce").astype(float).reset_index(drop=True)
+    c = pd.to_numeric(df_close, errors="coerce").astype(float).reset_index(drop=True)
+    n = len(h)
+    if n < period + 10:
+        return 25.0
+
+    prev_c = c.shift(1)
+    tr = pd.concat([
+        h - l,
+        (h - prev_c).abs(),
+        (l - prev_c).abs()
+    ], axis=1).max(axis=1)
+
+    plus_dm = pd.Series(np.where((h - h.shift(1)) > (l.shift(1) - l),
+                                 np.maximum(h - h.shift(1), 0), 0))
+    minus_dm = pd.Series(np.where((l.shift(1) - l) > (h - h.shift(1)),
+                                  np.maximum(l.shift(1) - l, 0), 0))
+
+    def wilder_smooth(series, p):
+        s = series.copy().astype(float)
+        for i in range(p, len(s)):
+            s.iloc[i] = (s.iloc[i-1] * (p - 1) + s.iloc[i]) / p
+        return s
+
+    atr = wilder_smooth(tr.fillna(0.0), period)
+    plus_dm_s = wilder_smooth(plus_dm.fillna(0.0), period)
+    minus_dm_s = wilder_smooth(minus_dm.fillna(0.0), period)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        plus_di = 100.0 * np.where(atr > 0, plus_dm_s / atr, 0.0)
+        minus_di = 100.0 * np.where(atr > 0, minus_dm_s / atr, 0.0)
+        dx = 100.0 * np.where((plus_di + minus_di) > 0,
+                              np.abs(plus_di - minus_di) / (plus_di + minus_di), 0.0)
+
+    adx = wilder_smooth(pd.Series(dx).fillna(0.0), period)
+    val = float(adx.iloc[-1])
+    if math.isnan(val): return 25.0
+    return max(0.0, min(100.0, val))
+
+def check_higher_timeframe_trend(sym):
+    try:
+        df = klines(sym, HT_TIMEFRAME, HT_KLINES_NEEDED)
+        if len(df) < 60:
+            return False
+        closed = df[df["x"] == True].copy()
+        if len(closed) < 55:
+            closed = df.copy()
+        closes = closed["c"].astype(float)
+        if len(closes) < 55:
+            return False
+        ema20 = closes.ewm(span=20, adjust=False).mean()
+        ema50 = closes.ewm(span=50, adjust=False).mean()
+        e20 = float(ema20.iloc[-1])
+        e50 = float(ema50.iloc[-1])
+        e50_4ago = float(ema50.iloc[-5] if len(ema50) >= 5 else ema50.iloc[0])
+        last_close = float(closes.iloc[-1])
+        uptrend = (
+            e20 > e50 and
+            last_close > e50 and
+            e50 > e50_4ago
+        )
+        return uptrend
+    except Exception:
+        return False
+
 def get_symbol_rules(sym):
     try:
         info = get_public("/api/v3/exchangeInfo")
@@ -546,11 +687,24 @@ def get_universe():
                 qv = float(t.get("quoteVolume", 0))
                 chg = float(t.get("priceChangePercent", 0))
             except: continue
-            if qv < 3_000_000.0:
+            if qv < 10_000_000.0:
+                continue
+            if chg > 25.0:
+                continue
+            if chg < -5.0:
                 continue
             out.append((sym, qv, chg))
 
-        out.sort(key=lambda x: x[2], reverse=True)
+        if out:
+            max_qv = max(x[1] for x in out)
+            max_chg = max(x[2] for x in out) if max(x[2] for x in out) > 0 else 1.0
+            def hybrid_score(item):
+                s_qv = item[1] / max_qv
+                s_chg = item[2] / max_chg
+                return (0.45 * s_qv) + (0.55 * s_chg)
+            out.sort(key=hybrid_score, reverse=True)
+        else:
+            out.sort(key=lambda x: x[2], reverse=True)
         return out[:30]
     except Exception as e:
         print(f"[UNIVERSE HATA] {e}", flush=True)
@@ -560,6 +714,9 @@ def get_universe():
 
 def analyze(sym, cooldown):
     if time.time() - cooldown.get(sym, 0) < COOLDOWN_SECONDS:
+        return None
+
+    if not check_higher_timeframe_trend(sym):
         return None
 
     try:
@@ -583,18 +740,42 @@ def analyze(sym, cooldown):
         swing_high_idx = int(fib_df["h"].idxmax())
         swing_high_val = float(fib_df["h"].iloc[swing_high_idx])
         age_from_end = (n_fib - 1) - swing_high_idx
-        if not (1 <= age_from_end <= 24):
+        if not (2 <= age_from_end <= 20):
             return None
 
-        if swing_high_idx == 0:
+        if swing_high_idx < 3:
             return None
-        swing_low_val = float(fib_df["l"].iloc[:swing_high_idx].min())
+
+        left_neighbors = fib_df["h"].iloc[max(0, swing_high_idx - 3):swing_high_idx]
+        right_neighbors = fib_df["h"].iloc[swing_high_idx + 1:min(n_fib, swing_high_idx + 4)]
+        if len(left_neighbors) == 0 or len(right_neighbors) == 0:
+            return None
+        if not (swing_high_val > left_neighbors.max() and swing_high_val > right_neighbors.max()):
+            return None
+
+        left_segment = fib_df["l"].iloc[:swing_high_idx]
+        if len(left_segment) < 3:
+            return None
+        swing_low_idx = int(left_segment.idxmin())
+        swing_low_val = float(left_segment.iloc[swing_low_idx])
         if swing_low_val <= 0 or swing_high_val <= swing_low_val:
             return None
 
+        low_right = left_segment.iloc[swing_low_idx+1:] if swing_low_idx+1 < len(left_segment) else pd.Series()
+        low_left  = left_segment.iloc[:swing_low_idx]
+        if len(low_left) >= 2 and len(low_right) >= 2:
+            if not (swing_low_val < low_left.min() and swing_low_val < low_right.min()):
+                pass
+
         impulse_range = swing_high_val - swing_low_val
         impulse_percent = (impulse_range / swing_low_val) * 100
-        if impulse_percent < 3.0:
+        if impulse_percent < 8.0:
+            return None
+        if impulse_percent > 60.0:
+            return None
+
+        adx_val = calc_adx_wilder(closed["h"], closed["l"], closed["c"], 14)
+        if adx_val < MIN_ADX:
             return None
 
         fib000 = swing_high_val
@@ -631,14 +812,15 @@ def analyze(sym, cooldown):
             return None
         ema_current = float(ema50.iloc[-1])
         ema_4ago = float(ema50.iloc[-5])
-        ema_flat_or_up = ema_current >= (ema_4ago * 0.9995)
-        price_near_above_ema = c0_close >= (ema_current * 0.985)
-        if not (ema_flat_or_up and price_near_above_ema):
+        ema_trend_up = ema_current >= (ema_4ago * 1.0002)
+        price_above_ema = c0_close >= ema_current
+        price_not_too_far = c0_close <= (ema_current * 1.08)
+        if not (ema_trend_up and price_above_ema and price_not_too_far):
             return None
 
         rsi_current, rsi_prev = calc_rsi_last_two(close_series, 14)
-        rsi_in_range = 28.0 <= rsi_current <= 58.0
-        rsi_hooked = rsi_current >= (rsi_prev - 0.5)
+        rsi_in_range = 32.0 <= rsi_current <= 52.0
+        rsi_hooked = rsi_current > rsi_prev
         if not (rsi_in_range and rsi_hooked):
             return None
 
@@ -650,11 +832,15 @@ def analyze(sym, cooldown):
         else:
             volume_ratio = 1.0
 
+        if volume_ratio < 0.9:
+            return None
+
         candle_range = c0_high - c0_low
         lower_wick = min(c0_open, c0_close) - c0_low
         is_green = c0_close > c0_open
-        is_lower_wick_rebound = (candle_range > 0) and (lower_wick >= candle_range * 0.35)
-        candle_confirm = is_green or is_lower_wick_rebound
+        is_lower_wick_rebound = (candle_range > 0) and (lower_wick >= candle_range * 0.40)
+        candle_body_green = c0_close > c0_open and ((c0_close - c0_open) >= candle_range * 0.50)
+        candle_confirm = candle_body_green or (is_green and is_lower_wick_rebound)
         if not candle_confirm:
             return None
 
@@ -674,28 +860,42 @@ def analyze(sym, cooldown):
 
         current_retrace = ((swing_high_val - c0_close) / impulse_range) * 100 if impulse_range > 0 else 50.0
 
-        score = 75
+        score = 58
         if scenario_hit == "A":
-            score += 6
-        if is_green:
-            score += 5
+            score += 8
+        else:
+            score += 4
+        if candle_body_green:
+            score += 7
+        elif is_green:
+            score += 4
         if is_lower_wick_rebound:
-            score += 4
-        if volume_ratio >= 1.50:
-            score += 6
-        if volume_ratio >= 1.80:
-            score += 4
-        if rsi_current > rsi_prev:
             score += 5
-        if 32.0 <= rsi_current <= 48.0:
+        if volume_ratio >= 1.30:
+            score += 5
+        if volume_ratio >= 1.60:
             score += 4
-        if 50.0 <= current_retrace <= 68.0:
-            score += 4
-        if ema_current > (ema_4ago * 1.0006):
+        if volume_ratio >= 2.00:
             score += 3
+        if rsi_current > (rsi_prev + 0.5):
+            score += 7
+        elif rsi_current > rsi_prev:
+            score += 3
+        if 36.0 <= rsi_current <= 48.0:
+            score += 5
+        if 55.0 <= current_retrace <= 68.0:
+            score += 5
+        if ema_current > (ema_4ago * 1.0008):
+            score += 4
+        if impulse_percent >= 12.0:
+            score += 4
+        if adx_val >= 25.0:
+            score += 4
+        elif adx_val >= MIN_ADX:
+            score += 2
         confidence = min(100, score)
 
-        if confidence < 75:
+        if confidence < 90:
             return None
 
         return {
@@ -704,6 +904,7 @@ def analyze(sym, cooldown):
             "scenario": scenario_hit,
             "swing_high": swing_high_val,
             "swing_low": swing_low_val,
+            "adx": round(adx_val, 2),
             "fib000": fib000,
             "fib236": fib236,
             "fib382": fib382,
@@ -900,13 +1101,13 @@ def close_pos(state, pos, price, gpnl, reason, dur):
     icon = "🟢" if net > 0.05 else ("🔰" if abs(net) <= 0.05 else "🔴")
 
     if reason == "INITIAL_SL":
-        sebep = "İLK SL (-4.5$)"
+        sebep = f"İLK SL (-${SL_USD:.2f})"
     elif reason == "BREAKEVEN":
         sebep = "BREAKEVEN (Başabaş)"
     elif reason == "TRAILING_STOP":
-        sebep = "TRAILING STOP (Kilitli Kar)"
+        sebep = f"TRAILING STOP (Kilitli Kar - ${TRAILING_DISTANCE:.2f} mesafe)"
     elif reason == "TAKE_PROFIT":
-        sebep = "TAKE PROFİT (+6.0$)"
+        sebep = f"TAKE PROFİT (+${TP_USD:.2f})"
     else:
         sebep = reason
 
@@ -932,6 +1133,10 @@ def scan(state, universe):
     is_real = state.get("real_trading", False)
 
     if len(state.get("positions", [])) >= MAX_OPEN_POSITIONS:
+        return state
+
+    cb_ok, cb_reason = check_circuit_breakers(state)
+    if not cb_ok:
         return state
 
     ok, reason = can_open_trade(state)
@@ -967,7 +1172,7 @@ def scan(state, universe):
     if not candidates:
         return state
 
-    quality = [c for c in candidates if c["confidence"] >= 80]
+    quality = [c for c in candidates if c["confidence"] >= 92]
     if not quality:
         return state
     quality.sort(key=lambda x: (x["confidence"], x["impulse_percent"]), reverse=True)
@@ -1004,29 +1209,32 @@ def scan(state, universe):
 
     vol_tag = f"{sig['volume_ratio']:.1f}x"
     rr = (TP_USD / SL_USD)
-    rsi_ok = "✓" if (28 <= sig["rsi"] <= 58) else "—"
+    rsi_ok = "✓" if (32 <= sig["rsi"] <= 52) else "—"
+    sl_pct = (SL_USD / POSITION_NOTIONAL) * 100
+    tp_pct = (TP_USD / POSITION_NOTIONAL) * 100
 
     msg = (
-        f"🚀 LONGSİNYAL: {sym}\n"
-        f"📊 Zaman Dilimi: 15m | Güven: %{sig['confidence']}\n"
+        f"🚀 LONGSİNYAL (v2): {sym}\n"
+        f"📊 Zaman Dilimi: 15m | Güven: %{sig['confidence']} | {sc_tag}\n"
         f"-------------------------------------\n"
         f"🎯 Giriş: {fp(pos['entry'])} USDT\n"
-        f"🛑 Stop: {fp(sl_price)}  (-4.5$ / %2.00)\n"
-        f"🎯 TP Hedef: {fp(tp_price)}  (+6.0$ / %2.67)\n"
-        f"⚖️ R:R = 1 : {rr:.3f}\n"
+        f"🛑 Stop: {fp(sl_price)}  (-${SL_USD:.2f} / %{sl_pct:.2f})\n"
+        f"🎯 TP Hedef: {fp(tp_price)}  (+${TP_USD:.2f} / %{tp_pct:.2f})\n"
+        f"⚖️ R:R = 1 : *{rr:.3f}*\n"
         f"-------------------------------------\n"
         f"📈 Fib Seviyeleri:\n"
         f"  Swing High:  {fp(sig['swing_high'])}\n"
         f"  0.618:       {fp(sig['fib618'])}  (Sınanan Seviye)\n"
         f"  0.500:       {fp(sig['fib500'])}\n"
         f"  Swing Low:   {fp(sig['swing_low'])}\n"
-        f"  Impulse:     %{fpct(sig['impulse_percent'])}  ✓ (≥ %3)\n"
-        f"📊 RSI(14): {sig['rsi']:.1f}  |  EMA50 Trend: ✓\n"
+        f"  Impulse:     %{fpct(sig['impulse_percent'])}  ✓ (≥ %8)\n"
+        f"📊 RSI(14): {sig['rsi']:.1f} {rsi_ok} | ADX(14): {sig.get('adx', 0):.0f} | EMA50 Trend: ✓ (üstünde)\n"
+        f"🔝 1 Saatlik Trend: ✓ (EMA20>EMA50 yükselişte)\n"
         f"💹 Hacim: {vol_tag} ortalamanın üzerinde\n"
-        f"💸 Pozisyon Boyutu: 225 USDT\n"
+        f"💸 Pozisyon Boyutu: {POSITION_NOTIONAL:.0f} USDT\n"
         f"-------------------------------------\n"
-        f"⏰ Breakeven: +3.5$ tetik → Stop girişe çekilir\n"
-        f"🔒 Trailing: +1.0$ arkadan kilitler\n"
+        f"⏰ Breakeven: +${BREAKEVEN_TRIGGER:.2f} tetik → Stop girişe çekilir\n"
+        f"🔒 Trailing: ${TRAILING_DISTANCE:.2f} mesafeyle arkadan kilitler\n"
     )
     tg(msg)
     return state
@@ -1039,20 +1247,36 @@ def main():
     print("=" * 65, flush=True)
     print(f" Mod           : {'SİMÜLASYON (gerçek paraya dokunulmaz)' if not REAL_TRADING_DEFAULT else 'GERÇEK SPOT'}", flush=True)
     print(f" Zaman Dilimi  : {TIMEFRAME} ZORUNLU", flush=True)
-    print(f" Tarama        : Her {SCAN_INTERVAL} sn | Top Gainers 30 coin | Hacim ≥ 3M USDT", flush=True)
-    print(f" Maks Pozisyon : {MAX_OPEN_POSITIONS} adet | Nominal: ${POSITION_NOTIONAL:.0f}/pozisyon", flush=True)
+    print(f" Tarama        : Her {SCAN_INTERVAL} sn | Top Gainers 30 coin | Hacim ≥ 10M USDT | Gain %-5 / +25 filtresi", flush=True)
+    print(f" Maks Pozisyon : {MAX_OPEN_POSITIONS} adet | Nominal: ${POSITION_NOTIONAL:.0f}/pozisyon | Günlük max {MAX_TRADES_PER_DAY} işlem", flush=True)
     print(f" Giriş Modeli  : Fib 0.618 'Altından Giriş' — Senaryo A (tek mum) / B (2 mum)", flush=True)
-    print(f" Güven Eşiği   : Confidence ≥ 80 (75-79 = izle, açma)", flush=True)
-    print(f" Risk/Ödül     : SL ${SL_USD:.2f} (%2) | TP ${TP_USD:.2f} (%2.67) | R:R = {TP_USD/SL_USD:.3f}", flush=True)
+    print(f" Güven Eşiği   : Confidence ≥ 92 (90-91 = izle, açma) | Impulse ≥ %8", flush=True)
+    print(f" Risk/Ödül     : SL ${SL_USD:.2f} (%1.55) | TP ${TP_USD:.2f} (%4.44) | R:R = {TP_USD/SL_USD:.3f}", flush=True)
     print(f" BE Mekanizması: +${BREAKEVEN_TRIGGER:.2f} zirve → SL = giriş (başabaş)", flush=True)
-    print(f" Trailing Stop : BE'den sonra $1.00 mesafeyle arkadan kilit", flush=True)
+    print(f" Trailing Stop : BE'den sonra ${TRAILING_DISTANCE:.2f} mesafeyle arkadan kilit", flush=True)
     print("=" * 65, flush=True)
 
     state = load_st()
 
-    if "sim_balance" not in state or "real_trading" not in state:
-        state["sim_balance"] = SIM_STARTING_BALANCE
-        state["real_trading"] = False
+    dirty = False
+    if "sim_balance" not in state:
+        state["sim_balance"] = SIM_STARTING_BALANCE; dirty = True
+    if "sim_peak_balance" not in state:
+        state["sim_peak_balance"] = max(state["sim_balance"], SIM_STARTING_BALANCE); dirty = True
+    if "real_trading" not in state:
+        state["real_trading"] = REAL_TRADING_DEFAULT; dirty = True
+    if "circuit_breaker_until" not in state:
+        state["circuit_breaker_until"] = 0; dirty = True
+    if "pnl_today_sum" not in state:
+        state["pnl_today_sum"] = 0.0; dirty = True
+    if "pnl_today_date" not in state:
+        state["pnl_today_date"] = today_str(); dirty = True
+    today = today_str()
+    if state.get("pnl_today_date", "") != today:
+        state["pnl_today_date"] = today
+        state["pnl_today_sum"] = 0.0
+        dirty = True
+    if dirty:
         save_st(state)
 
     cleaned_positions = []
@@ -1069,19 +1293,21 @@ def main():
     mode = "🔴 GERÇEK SPOT" if is_real else "🧪 SİMÜLASYON"
     bal = get_sim_balance(state)
 
-    tg(f"⚡ *Fibonacci Golden Pocket Motoru Başlatıldı*\n\n"
+    tg(f"⚡ *Fibonacci Golden Pocket Motoru Başlatıldı (v2 - Optimize Edildi)*\n\n"
        f"⚙️ Mod: `{mode}`\n"
        f"🎯 Zaman Dilimi: `15m` | Tarama: `Top 30 Gainers`\n"
        f"💰 Sanal Kasa: `${bal:.2f} USDT`\n"
-       f"📋 Kurallar:\n"
-       f"  • Impulse Dalgası ≥ %3\n"
+       f"📋 Yeni Kurallar:\n"
+       f"  • Impulse Dalgası ≥ %8 (≤ %60)\n"
+       f"  • Hacim ≥ 10M USDT | 24h Gain %-5 / +25 arası\n"
        f"  • Fib 0.618 altından giriş (Senaryo A/B)\n"
-       f"  • EMA50 düşmüyor + fiyat EMA'ya yakın\n"
-       f"  • RSI %28-%58 arası, yukarı kancalanmış\n"
-       f"  • Mum onayı (yeşil / fitil redüksiyonu)\n"
-       f"  • Confidence ≥ %80 açılır, 75-79 izlenir\n\n"
-       f"💸 Pozisyon: `225 USDT` | SL: -$4.50 | TP: +$6.00\n"
-       f"⚖️ BE: +$3.50 → giriş | 🔒 Trailing: 1.0$ mesafe\n\n"
+       f"  • Fiyat EMA50 ÜSTÜNDE + EMA50 yükselişte\n"
+       f"  • RSI %32-%52 arası ve AÇIK yukarı kancalanmış\n"
+       f"  • Güçlü yeşil mum + hacim onayı\n"
+       f"  • Confidence ≥ %92 açılır, 90-91 izlenir\n\n"
+       f"💸 Pozisyon: `225 USDT` | SL: -$3.50 (%1.55) | TP: +$10.00 (%4.44)\n"
+       f"⚖️ *R:R = 2.85* | BE: +$5.00 → giriş | 🔒 Trailing: $3.00 mesafe\n"
+       f"🚦 Günlük Max İşlem: `{MAX_TRADES_PER_DAY}` | İşlem arası: `120sn` | Cooldown: `30dk`\n\n"
        f"🎮 Komutlar: /durum /rapor /gercek /fake /kapat /reset")
 
     last_scan = 0

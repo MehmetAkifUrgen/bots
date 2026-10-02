@@ -1,0 +1,28 @@
+API KEY: var | SECRET: var
+
+=======================================================
+  BINANCE HESAP DURUMU (CANLI - API uzerinden)
+=======================================================
+  Hesap dondu: {'code': -2015, 'msg': 'Invalid API-key, IP, or permissions for action, request ip: 88.255.43.106'}
+
+  ACIK POZISYONLAR:
+  Pozisyonlar hatali: {'code': -2015, 'msg': 'Invalid API-key, IP, or permissions for action, request ip: 88.255.43.106'}
+    (hic acik pozisyon yok - RATS dahil degil)
+  > Toplam Unrealized PnL: $+0.00
+
+  ISLEMLER (25 Agu 00:00'dan beri - userTrades):
+  userTrades hatali: {'code': -2015, 'msg': 'Invalid API-key, IP, or permissions for action, request ip: 88.255.43.106'}
+    (islem bulunamadi / filtre disi)
+
+  GERCEKLESEN PnL (brut):   $+0.00
+  TOPLAM KOMISYON:          -$0.00
+  NET GERCEKLESEN PnL:      $+0.00
+
+=======================================================
+  GENEL DURUM (Dunden beri):
+    Kapali (Realized): $+0.00
+    Acik   (Unrealized): $+0.00
+    =========================
+    TOPLAM:            $+0.00
+    DURUM:             BASA BAS
+=======================================================
