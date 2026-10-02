@@ -1,0 +1,19 @@
+[Unit]
+Description=Fibonacci Golden Pocket Long Bot (Binance SPOT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/fib-pocket-bot
+ExecStart=/usr/bin/python3 -u /home/ubuntu/fib-pocket-bot/trader_bot.py
+Restart=always
+RestartSec=7
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fib-pocket
+
+[Install]
+WantedBy=multi-user.target
