@@ -66,7 +66,7 @@ HT_KLINES_NEEDED     = 100
 
 MAX_DAILY_LOSS_USD   = 15.0
 MAX_DRAWDOWN_PCT     = 8.0
-MIN_ADX              = 18.0
+MIN_ADX              = 14.0
 
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
@@ -613,9 +613,8 @@ def check_higher_timeframe_trend(sym):
         e50_4ago = float(ema50.iloc[-5] if len(ema50) >= 5 else ema50.iloc[0])
         last_close = float(closes.iloc[-1])
         uptrend = (
-            e20 > e50 and
-            last_close > e50 and
-            e50 > e50_4ago
+            last_close >= (e50 * 0.95) and
+            e50 >= (e50_4ago * 0.995)
         )
         return uptrend
     except Exception:
@@ -687,9 +686,9 @@ def get_universe():
                 qv = float(t.get("quoteVolume", 0))
                 chg = float(t.get("priceChangePercent", 0))
             except: continue
-            if qv < 10_000_000.0:
+            if qv < 5_000_000.0:
                 continue
-            if chg > 25.0:
+            if chg > 40.0:
                 continue
             if chg < -5.0:
                 continue
@@ -740,7 +739,7 @@ def analyze(sym, cooldown):
         swing_high_idx = int(fib_df["h"].idxmax())
         swing_high_val = float(fib_df["h"].iloc[swing_high_idx])
         age_from_end = (n_fib - 1) - swing_high_idx
-        if not (2 <= age_from_end <= 20):
+        if not (1 <= age_from_end <= 25):
             return None
 
         if swing_high_idx < 3:
@@ -749,8 +748,6 @@ def analyze(sym, cooldown):
         left_neighbors = fib_df["h"].iloc[max(0, swing_high_idx - 3):swing_high_idx]
         right_neighbors = fib_df["h"].iloc[swing_high_idx + 1:min(n_fib, swing_high_idx + 4)]
         if len(left_neighbors) == 0 or len(right_neighbors) == 0:
-            return None
-        if not (swing_high_val > left_neighbors.max() and swing_high_val > right_neighbors.max()):
             return None
 
         left_segment = fib_df["l"].iloc[:swing_high_idx]
@@ -769,7 +766,7 @@ def analyze(sym, cooldown):
 
         impulse_range = swing_high_val - swing_low_val
         impulse_percent = (impulse_range / swing_low_val) * 100
-        if impulse_percent < 8.0:
+        if impulse_percent < 2.5:
             return None
         if impulse_percent > 60.0:
             return None
@@ -812,15 +809,15 @@ def analyze(sym, cooldown):
             return None
         ema_current = float(ema50.iloc[-1])
         ema_4ago = float(ema50.iloc[-5])
-        ema_trend_up = ema_current >= (ema_4ago * 1.0002)
-        price_above_ema = c0_close >= ema_current
+        ema_trend_up = ema_current >= (ema_4ago * 0.9998)
+        price_above_ema = c0_close >= (ema_current * 0.99)
         price_not_too_far = c0_close <= (ema_current * 1.08)
         if not (ema_trend_up and price_above_ema and price_not_too_far):
             return None
 
         rsi_current, rsi_prev = calc_rsi_last_two(close_series, 14)
-        rsi_in_range = 32.0 <= rsi_current <= 52.0
-        rsi_hooked = rsi_current > rsi_prev
+        rsi_in_range = 25.0 <= rsi_current <= 62.0
+        rsi_hooked = rsi_current >= (rsi_prev - 0.3)
         if not (rsi_in_range and rsi_hooked):
             return None
 
@@ -832,15 +829,15 @@ def analyze(sym, cooldown):
         else:
             volume_ratio = 1.0
 
-        if volume_ratio < 0.9:
+        if volume_ratio < 0.6:
             return None
 
         candle_range = c0_high - c0_low
         lower_wick = min(c0_open, c0_close) - c0_low
         is_green = c0_close > c0_open
-        is_lower_wick_rebound = (candle_range > 0) and (lower_wick >= candle_range * 0.40)
-        candle_body_green = c0_close > c0_open and ((c0_close - c0_open) >= candle_range * 0.50)
-        candle_confirm = candle_body_green or (is_green and is_lower_wick_rebound)
+        is_lower_wick_rebound = (candle_range > 0) and (lower_wick >= candle_range * 0.35)
+        candle_body_green = c0_close > c0_open and ((c0_close - c0_open) >= candle_range * 0.30)
+        candle_confirm = is_green or is_lower_wick_rebound
         if not candle_confirm:
             return None
 
@@ -860,7 +857,7 @@ def analyze(sym, cooldown):
 
         current_retrace = ((swing_high_val - c0_close) / impulse_range) * 100 if impulse_range > 0 else 50.0
 
-        score = 58
+        score = 72
         if scenario_hit == "A":
             score += 8
         else:
@@ -895,7 +892,7 @@ def analyze(sym, cooldown):
             score += 2
         confidence = min(100, score)
 
-        if confidence < 90:
+        if confidence < 80:
             return None
 
         return {
@@ -1172,7 +1169,7 @@ def scan(state, universe):
     if not candidates:
         return state
 
-    quality = [c for c in candidates if c["confidence"] >= 92]
+    quality = [c for c in candidates if c["confidence"] >= 82]
     if not quality:
         return state
     quality.sort(key=lambda x: (x["confidence"], x["impulse_percent"]), reverse=True)
