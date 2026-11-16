@@ -1,0 +1,196 @@
+"""Unit tests for the 4H 5-indicator Pine Script scanner and Telegram notifier."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import tempfile
+import unittest
+
+import numpy as np
+import pandas as pd
+
+from crypto_4h_scanner.binance_scanner import Coin4hResult
+from crypto_4h_scanner.indicators import (
+    SystemEvaluation,
+    compute_pivots,
+    evaluate_4h_system,
+    fisher_transform,
+    stochastic_momentum_index,
+    stochastic_rsi,
+    wavetrend,
+    wilder_rsi,
+)
+from crypto_4h_scanner.telegram_notifier import TelegramNotifier, format_entry_message
+
+
+def _make_ohlcv(closes: np.ndarray, start_ts: int = 1_700_000_000_000) -> pd.DataFrame:
+    step_ms = 4 * 3600 * 1000
+    n = len(closes)
+    opens = np.roll(closes, 1)
+    opens[0] = closes[0]
+    highs = np.maximum(opens, closes) * 1.008
+    lows = np.minimum(opens, closes) * 0.992
+    open_times = [start_ts + i * step_ms for i in range(n)]
+    close_times = [t + step_ms - 1 for t in open_times]
+    return pd.DataFrame(
+        {
+            "open_time": open_times,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": np.full(n, 1000.0),
+            "close_time": close_times,
+        }
+    )
+
+
+class TestCrypto4hIndicators(unittest.TestCase):
+    def test_five_indicators_and_state_machine_on_wave(self) -> None:
+        x = np.linspace(0, 8 * np.pi, 220)
+        closes = 100.0 + 15.0 * np.sin(x)
+        df = _make_ohlcv(closes)
+
+        rsi = wilder_rsi(df["close"], 14)
+        self.assertTrue((rsi.dropna() >= 0.0).all() and (rsi.dropna() <= 100.0).all())
+
+        k, d = stochastic_rsi(df["close"])
+        self.assertTrue((k.dropna() >= 0.0).all() and (k.dropna() <= 100.0).all())
+        self.assertTrue((d.dropna() >= 0.0).all() and (d.dropna() <= 100.0).all())
+
+        fish, trig = fisher_transform(df["high"], df["low"], 9)
+        self.assertEqual(len(fish), len(df))
+        self.assertEqual(len(trig), len(df))
+
+        wt1, wt2 = wavetrend(df["high"], df["low"], df["close"], 10, 21)
+        self.assertTrue(wt1.iloc[40:].notna().all())
+        self.assertTrue(wt2.iloc[45:].notna().all())
+
+        smi, smi_sig, smi_ema9 = stochastic_momentum_index(
+            df["high"], df["low"], df["close"]
+        )
+        self.assertTrue(smi.iloc[30:].notna().all())
+        self.assertTrue(smi_sig.iloc[30:].notna().all())
+        self.assertTrue(smi_ema9.iloc[30:].notna().all())
+
+        # Monthly candle before the 4h series
+        df_1m = pd.DataFrame(
+            {
+                "open_time": [1_695_000_000_000],
+                "high": [120.0],
+                "low": [80.0],
+                "close": [105.0],
+                "close_time": [1_699_999_999_999],
+            }
+        )
+
+        seen_green = False
+        seen_orange = False
+        seen_exit = False
+        for end in range(80, len(df) + 1):
+            ev = evaluate_4h_system(df.iloc[:end].copy(), df_1m=df_1m)
+            self.assertIsNotNone(ev)
+            assert ev is not None
+            seen_green = seen_green or ev.green_trigger
+            seen_orange = seen_orange or ev.orange_trigger
+            seen_exit = seen_exit or ev.exit_trigger
+
+        self.assertTrue(seen_green, "Expected at least one green trigger")
+        self.assertTrue(seen_orange, "Expected at least one orange trigger")
+        self.assertTrue(seen_exit, "Expected at least one exit trigger")
+
+    def test_pivots_confirm_after_right_bars(self) -> None:
+        highs = pd.Series([10.0] * 7 + [20.0] + [10.0] * 7)
+        lows = pd.Series([5.0] * 15)
+        piv_h, _ = compute_pivots(highs, lows, left=7, right=7)
+        self.assertTrue(np.isnan(piv_h[:14]).all())
+        self.assertEqual(piv_h[14], 20.0)
+
+
+class TestTelegramNotifier(unittest.TestCase):
+    def test_deduplication_and_tracked_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "alert_state.json"
+            notifier = TelegramNotifier("dummy_token", "dummy_chat", state_file)
+            sent_messages: list[str] = []
+            notifier.send_text = lambda text: sent_messages.append(text) or True  # type: ignore[method-assign]
+
+            ev_entry = SystemEvaluation(
+                bar_open_time=1_700_000_000_000,
+                price=100.0,
+                cond1_buy=True,
+                cond2_buy=True,
+                cond3_buy=True,
+                cond4_buy=True,
+                cond5_buy=True,
+                first_three_buy=True,
+                all_five_buy=True,
+                green_trigger=True,
+                orange_trigger=True,
+                exit_trigger=False,
+                exit_reason=None,
+                exit_price=None,
+                exit_trade_pct=None,
+                in_green_pos=True,
+                in_orange_pos=True,
+                be_locked=False,
+                entry_price=100.0,
+                tp_level=105.0,
+                sl_level=97.0,
+                next_res=105.0,
+                prev_sup=97.0,
+                total_trades=10,
+                win_trades=7,
+                win_rate=70.0,
+                total_profit_pct=18.5,
+            )
+            res = Coin4hResult(
+                symbol="BTCUSDT",
+                market="futures",
+                price=100.0,
+                change_24h=2.5,
+                volume_24h_usdt=1_500_000_000.0,
+                evaluation=ev_entry,
+            )
+
+            # First call sends ORANGE alert
+            stats1 = notifier.process_results([res])
+            self.assertEqual(stats1["orange"], 1)
+            self.assertEqual(len(sent_messages), 1)
+            self.assertIn("TURUNCU KESİN AL", format_entry_message(res, "ORANGE"))
+
+            # Second call on same bar_open_time is deduplicated
+            stats2 = notifier.process_results([res])
+            self.assertEqual(stats2["orange"], 0)
+            self.assertEqual(len(sent_messages), 1)
+
+            # Exit on next bar for tracked symbol sends exit alert
+            ev_exit = SystemEvaluation(
+                **{
+                    **ev_entry.__dict__,
+                    "bar_open_time": 1_700_014_400_000,
+                    "green_trigger": False,
+                    "orange_trigger": False,
+                    "exit_trigger": True,
+                    "exit_reason": "KÂR AL (Direnç)",
+                    "exit_price": 105.0,
+                    "exit_trade_pct": 5.0,
+                    "in_green_pos": False,
+                    "in_orange_pos": False,
+                }
+            )
+            res_exit = Coin4hResult(
+                symbol="BTCUSDT",
+                market="futures",
+                price=105.0,
+                change_24h=5.0,
+                volume_24h_usdt=1_500_000_000.0,
+                evaluation=ev_exit,
+            )
+            stats3 = notifier.process_results([res_exit])
+            self.assertEqual(stats3["exit"], 1)
+            self.assertEqual(len(sent_messages), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: crypto-4h-telegram-scanner
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u -m crypto_4h_scanner.bot
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

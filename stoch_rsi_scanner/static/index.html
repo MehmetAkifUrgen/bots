@@ -1,0 +1,1001 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Binance Futures — Stoch RSI (3,3,14,14) Günlük Sinyal Tarayıcı</title>
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --panel: #121826;
+      --panel-2: #182032;
+      --border: #253047;
+      --text: #e6edf7;
+      --muted: #8b9bb4;
+      --blue: #3b82f6;
+      --red: #ef4444;
+      --green: #10b981;
+      --green-bg: rgba(16, 185, 129, 0.14);
+      --red-bg: rgba(239, 68, 68, 0.14);
+      --muted-bg: rgba(139, 155, 180, 0.12);
+      --accent: #38bdf8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }
+    .container {
+      max-width: 1360px;
+      margin: 0 auto;
+      padding: 20px 18px 40px;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 18px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    .title-wrap h1 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.2px;
+    }
+    .subtitle {
+      margin-top: 4px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+    .dot-blue { width: 8px; height: 8px; border-radius: 50%; background: var(--blue); display: inline-block; }
+    .dot-red { width: 8px; height: 8px; border-radius: 50%; background: var(--red); display: inline-block; }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .stat-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+    }
+    .stat-label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    .stat-val { font-size: 24px; font-weight: 700; }
+    .stat-val.green { color: var(--green); }
+    .stat-val.red { color: var(--red); }
+
+    .controls {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: end;
+      margin-bottom: 16px;
+    }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      min-width: 145px;
+    }
+    .field label {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }
+    select, input[type="text"] {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 13px;
+      outline: none;
+    }
+    select:focus, input[type="text"]:focus {
+      border-color: var(--accent);
+    }
+    button.primary {
+      background: var(--blue);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 9px 18px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+      height: 35px;
+    }
+    button.primary:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+    .filter-tabs {
+      display: flex;
+      gap: 6px;
+      margin-left: auto;
+      flex-wrap: wrap;
+    }
+    .tab-btn {
+      background: var(--panel-2);
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 7px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .tab-btn.active {
+      background: rgba(56, 189, 248, 0.15);
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+
+    .table-wrap {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th {
+      text-align: left;
+      padding: 11px 14px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.02);
+      white-space: nowrap;
+    }
+    td {
+      padding: 10px 14px;
+      border-bottom: 1px solid rgba(37, 48, 71, 0.6);
+      white-space: nowrap;
+    }
+    tr:hover td { background: rgba(255, 255, 255, 0.025); }
+    tr.clickable { cursor: pointer; }
+
+    .badge {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .badge-AL { background: var(--green-bg); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.35); }
+    .badge-SAT { background: var(--red-bg); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.35); }
+    .badge-NÖTR { background: var(--muted-bg); color: var(--muted); }
+
+    .pos { color: var(--green); }
+    .neg { color: var(--red); }
+    .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    .empty-state {
+      padding: 40px 20px;
+      text-align: center;
+      color: var(--muted);
+    }
+
+    /* Modal for detailed StochRSI chart */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(5, 8, 15, 0.78);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      z-index: 50;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      max-width: 760px;
+      width: 100%;
+      padding: 18px 20px;
+    }
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .close-btn {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 5px 10px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .danger-btn {
+      background: rgba(239, 68, 68, 0.16);
+      color: var(--red);
+      border: 1px solid rgba(239, 68, 68, 0.35);
+      border-radius: 8px;
+      padding: 6px 12px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .positions-panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 18px;
+    }
+    .positions-header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .positions-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .sim-tag {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: rgba(56, 189, 248, 0.14);
+      color: var(--accent);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      font-weight: 600;
+    }
+    .positions-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+    }
+    .toggle-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      padding: 6px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    input[type="number"] {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 8px;
+      font-size: 13px;
+      width: 78px;
+      outline: none;
+    }
+    .pos-summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+    .pos-summary strong { color: var(--text); }
+    .sys-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .sys-card {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .sys-card-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .sys-metrics {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .sys-metrics strong { color: var(--text); }
+    .status-bar {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 10px;
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="title-wrap">
+        <h1>Binance Futures — Stoch RSI (3, 3, 14, 14, Close) Tarayıcı</h1>
+        <div class="subtitle">
+          Periyot: <strong id="headerInterval">1D (Günlük)</strong> •
+          <span class="dot-blue"></span> Mavi (%K) yukarı keserse <strong>AL</strong> •
+          <span class="dot-red"></span> Kırmızı (%D) yukarı / Mavi aşağı keserse <strong>SAT</strong>
+        </div>
+      </div>
+      <div class="pill" id="liveClock">Sürekli Tarama Hazır</div>
+    </header>
+
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">AL Sinyali (Mavi ↑ Kırmızı)</div>
+        <div class="stat-val green" id="statAl">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">SAT Sinyali (Mavi ↓ Kırmızı)</div>
+        <div class="stat-val red" id="statSat">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Taranan Vadeli Coin</div>
+        <div class="stat-val" id="statTotal">-</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Tarama Süresi</div>
+        <div class="stat-val" id="statDuration">-</div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <div class="field">
+        <label>Periyot (Timeframe)</label>
+        <select id="intervalSelect">
+          <option value="1d" selected>1D (Günlük)</option>
+          <option value="15m">15m (15 Dakikalık)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Mum Modu</label>
+        <select id="modeSelect">
+          <option value="live">Anlık Mum (Canlı)</option>
+          <option value="closed">Son Kapanan Mum</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Min 24s Hacim (USDT)</label>
+        <select id="volSelect">
+          <option value="0">Tümü (0$)</option>
+          <option value="5000000" selected>5M $</option>
+          <option value="20000000">20M $</option>
+          <option value="50000000">50M $</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Coin Limiti (Hacme Göre)</label>
+        <select id="limitSelect">
+          <option value="50">İlk 50</option>
+          <option value="150" selected>İlk 150</option>
+          <option value="0">Tümü (300+)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Sürekli Tarama</label>
+        <select id="autoRefreshSelect">
+          <option value="10">10 Saniye</option>
+          <option value="15" selected>15 Saniye (Sürekli)</option>
+          <option value="30">30 Saniye</option>
+          <option value="60">1 Dakika</option>
+          <option value="300">5 Dakika</option>
+          <option value="0">Kapalı</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Coin Ara</label>
+        <input type="text" id="searchInput" placeholder="Örn: BTC, ETH, SOL" />
+      </div>
+      <button class="primary" id="scanBtn">Şimdi Tara</button>
+
+      <div class="filter-tabs">
+        <button class="tab-btn active" data-filter="SIGNALS">AL + SAT</button>
+        <button class="tab-btn" data-filter="AL">Sadece AL</button>
+        <button class="tab-btn" data-filter="SAT">Sadece SAT</button>
+        <button class="tab-btn" data-filter="ALL">Tümü</button>
+      </div>
+    </div>
+
+    <div class="positions-panel">
+      <div class="positions-header">
+        <div class="positions-title">
+          <span>Otomatik Pozisyon Yöneticisi</span>
+          <span class="sim-tag">CANLI SİMÜLASYON / PAPER</span>
+        </div>
+        <div class="positions-actions">
+          <label class="toggle-label">
+            <input type="checkbox" id="autoTradeToggle" checked />
+            <span>Sinyalde Oto Pozisyon Aç</span>
+          </label>
+          <div style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);">
+            <span>Pozisyon ($):</span>
+            <input type="number" id="notionalInput" value="250" min="10" step="10" />
+            <span>SL (%):</span>
+            <input type="number" id="slInput" value="2.0" min="0" step="0.5" style="width:66px;" />
+            <button class="close-btn" id="saveNotionalBtn">Kaydet</button>
+          </div>
+          <button class="tab-btn active" data-postab="open">Açık Pozisyonlar (<span id="openCountTab">0</span>)</button>
+          <button class="tab-btn" data-postab="closed">Kapanan İşlemler (<span id="closedCountTab">0</span>)</button>
+          <button class="danger-btn" id="closeAllBtn">Tümünü Kapat</button>
+          <button class="close-btn" id="clearHistoryBtn">Geçmişi Temizle</button>
+        </div>
+      </div>
+
+      <div class="sys-cards">
+        <div class="sys-card">
+          <div class="sys-card-head">
+            <span>1D (Günlük) Sistemi</span>
+            <span id="wr1dBadge" class="sim-tag">Başarı: %0.0</span>
+          </div>
+          <div class="sys-metrics">
+            <span>Açık: <strong id="s1dOpen">0</strong></span>
+            <span>Kapanan: <strong id="s1dClosed">0</strong></span>
+            <span>Anlık PnL: <strong id="s1dUn">0.00 $</strong></span>
+            <span>Kapanan PnL: <strong id="s1dRe">0.00 $</strong></span>
+            <span>Açık Kâr Oranı: <strong id="s1dOpenWr">%0.0</strong></span>
+          </div>
+        </div>
+        <div class="sys-card">
+          <div class="sys-card-head">
+            <span>15m (15 Dakikalık) Sistemi</span>
+            <span id="wr15mBadge" class="sim-tag">Başarı: %0.0</span>
+          </div>
+          <div class="sys-metrics">
+            <span>Açık: <strong id="s15mOpen">0</strong></span>
+            <span>Kapanan: <strong id="s15mClosed">0</strong></span>
+            <span>Anlık PnL: <strong id="s15mUn">0.00 $</strong></span>
+            <span>Kapanan PnL: <strong id="s15mRe">0.00 $</strong></span>
+            <span>Açık Kâr Oranı: <strong id="s15mOpenWr">%0.0</strong></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="pos-summary" style="align-items:center;">
+        <span>Periyot Filtresi:</span>
+        <button class="tab-btn active" data-posinterval="1d">1D Pozisyonlar</button>
+        <button class="tab-btn" data-posinterval="15m">15m Pozisyonlar</button>
+        <button class="tab-btn" data-posinterval="all">Tümü</button>
+        <span style="margin-left:auto;">Toplam Hacim: <strong id="posExposure">0 $</strong></span>
+        <span>Toplam Anlık PnL: <strong id="posUnrealized">0.00 $</strong></span>
+        <span>Toplam Gerçekleşen PnL: <strong id="posRealized">0.00 $</strong></span>
+      </div>
+
+      <div class="table-wrap" style="max-height: 290px; overflow-y: auto;">
+        <table>
+          <thead id="posTableHead"></thead>
+          <tbody id="posTableBody">
+            <tr><td colspan="9" class="empty-state">Henüz açık pozisyon yok. AL veya SAT sinyali geldiğinde otomatik $250 pozisyon açılır.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="status-bar">
+      <span id="statusText">Tarama başlatılıyor...</span>
+      <span>Satıra tıklayarak son 30 mumluk Mavi (%K) / Kırmızı (%D) grafiğini açabilirsiniz.</span>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Sembol</th>
+            <th>Sinyal</th>
+            <th>Fiyat (USDT)</th>
+            <th>24s Değişim</th>
+            <th>24s Hacim</th>
+            <th>Önceki %K / %D</th>
+            <th>Güncel %K / %D</th>
+            <th>Son 14 Mum (%K Mavi / %D Kırmızı)</th>
+          </tr>
+        </thead>
+        <tbody id="resultsBody">
+          <tr><td colspan="8" class="empty-state">Binance Futures verileri taranıyor...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="chartModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div>
+          <strong id="modalTitle" style="font-size:17px;">BTCUSDT</strong>
+          <span id="modalBadge" class="badge" style="margin-left:8px;"></span>
+        </div>
+        <button class="close-btn" id="closeModalBtn">Kapat</button>
+      </div>
+      <div id="modalStats" style="font-size:13px;color:var(--muted);margin-bottom:10px;"></div>
+      <div id="modalChartWrap"></div>
+    </div>
+  </div>
+
+  <script>
+    let allResults = [];
+    let currentFilter = "SIGNALS";
+    let currentPosTab = "open";
+    let currentPosInterval = "1d";
+    let latestPositions = null;
+    let countdownTimer = null;
+    let remainingSec = 0;
+    let isScanning = false;
+    let lastScannedLabel = "";
+
+    const autoTradeToggle = document.getElementById("autoTradeToggle");
+    const notionalInput = document.getElementById("notionalInput");
+    const slInput = document.getElementById("slInput");
+    const saveNotionalBtn = document.getElementById("saveNotionalBtn");
+    const closeAllBtn = document.getElementById("closeAllBtn");
+    const clearHistoryBtn = document.getElementById("clearHistoryBtn");
+    const posTableHead = document.getElementById("posTableHead");
+    const posTableBody = document.getElementById("posTableBody");
+
+    const scanBtn = document.getElementById("scanBtn");
+    const intervalSelect = document.getElementById("intervalSelect");
+    const modeSelect = document.getElementById("modeSelect");
+    const volSelect = document.getElementById("volSelect");
+    const limitSelect = document.getElementById("limitSelect");
+    const autoRefreshSelect = document.getElementById("autoRefreshSelect");
+    const searchInput = document.getElementById("searchInput");
+    const resultsBody = document.getElementById("resultsBody");
+    const statusText = document.getElementById("statusText");
+    const headerInterval = document.getElementById("headerInterval");
+    const liveClock = document.getElementById("liveClock");
+
+    function formatUsd(val) {
+      if (val >= 1e9) return (val / 1e9).toFixed(2) + "B $";
+      if (val >= 1e6) return (val / 1e6).toFixed(1) + "M $";
+      if (val >= 1e3) return (val / 1e3).toFixed(0) + "K $";
+      return val.toFixed(0) + " $";
+    }
+
+    function formatPrice(p) {
+      if (p >= 1000) return p.toLocaleString("en-US", { maximumFractionDigits: 2 });
+      if (p >= 1) return p.toFixed(4);
+      return p.toFixed(6);
+    }
+
+    function buildSparkline(kSeries, dSeries, width = 140, height = 34, showAxes = false) {
+      const n = Math.min(kSeries.length, dSeries.length);
+      if (n < 2) return "";
+      const pad = showAxes ? 24 : 3;
+      const w = width - pad * 2;
+      const h = height - pad * 2;
+      const toX = (i) => pad + (i / (n - 1)) * w;
+      const toY = (v) => pad + (1 - Math.max(0, Math.min(100, v)) / 100) * h;
+
+      const kPts = kSeries.slice(-n).map((v, i) => `${toX(i).toFixed(1)},${toY(v).toFixed(1)}`).join(" ");
+      const dPts = dSeries.slice(-n).map((v, i) => `${toX(i).toFixed(1)},${toY(v).toFixed(1)}`).join(" ");
+
+      let extra = "";
+      if (showAxes) {
+        const y80 = toY(80).toFixed(1);
+        const y20 = toY(20).toFixed(1);
+        extra = `
+          <line x1="${pad}" y1="${y80}" x2="${width - pad}" y2="${y80}" stroke="#334155" stroke-dasharray="4 4" />
+          <line x1="${pad}" y1="${y20}" x2="${width - pad}" y2="${y20}" stroke="#334155" stroke-dasharray="4 4" />
+          <text x="2" y="${Number(y80) + 4}" fill="#8b9bb4" font-size="10">80</text>
+          <text x="2" y="${Number(y20) + 4}" fill="#8b9bb4" font-size="10">20</text>
+        `;
+      }
+
+      return `
+        <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+          ${extra}
+          <polyline fill="none" stroke="#ef4444" stroke-width="${showAxes ? 2 : 1.5}" points="${dPts}" />
+          <polyline fill="none" stroke="#3b82f6" stroke-width="${showAxes ? 2.2 : 1.7}" points="${kPts}" />
+        </svg>
+      `;
+    }
+
+    function formatPnl(val) {
+      const prefix = val > 0 ? "+" : "";
+      return `${prefix}${val.toFixed(2)} $`;
+    }
+
+    function updateSysCard(prefix, st) {
+      if (!st) return;
+      document.getElementById(`s${prefix}Open`).textContent = st.open_count;
+      document.getElementById(`s${prefix}Closed`).textContent = st.closed_count;
+      const unEl = document.getElementById(`s${prefix}Un`);
+      unEl.textContent = formatPnl(st.unrealized_pnl);
+      unEl.className = st.unrealized_pnl >= 0 ? "pos" : "neg";
+      const reEl = document.getElementById(`s${prefix}Re`);
+      reEl.textContent = formatPnl(st.realized_pnl);
+      reEl.className = st.realized_pnl >= 0 ? "pos" : "neg";
+      document.getElementById(`s${prefix}OpenWr`).textContent =
+        st.open_count > 0 ? `%${st.open_win_rate.toFixed(1)} (${st.open_wins}/${st.open_count})` : "%0.0";
+      document.getElementById(`wr${prefix}Badge`).textContent =
+        st.closed_count > 0
+          ? `Başarı: %${st.closed_win_rate.toFixed(1)} (${st.closed_wins}/${st.closed_count})`
+          : "Başarı: Henüz Kapanan Yok";
+    }
+
+    function renderPositions(posData) {
+      if (!posData) return;
+      latestPositions = posData;
+      autoTradeToggle.checked = Boolean(posData.auto_trade);
+      if (document.activeElement !== notionalInput) {
+        notionalInput.value = posData.notional_usdt;
+      }
+      if (document.activeElement !== slInput && posData.stop_loss_pct !== undefined) {
+        slInput.value = posData.stop_loss_pct;
+      }
+
+      if (posData.stats) {
+        updateSysCard("1d", posData.stats["1d"]);
+        updateSysCard("15m", posData.stats["15m"]);
+      }
+
+      const openFiltered = (posData.open_positions || []).filter(
+        (p) => currentPosInterval === "all" || p.interval === currentPosInterval
+      );
+      const closedFiltered = (posData.closed_trades || []).filter(
+        (t) => currentPosInterval === "all" || t.interval === currentPosInterval
+      );
+
+      document.getElementById("openCountTab").textContent = openFiltered.length;
+      document.getElementById("closedCountTab").textContent = closedFiltered.length;
+      document.getElementById("posExposure").textContent = `${posData.total_exposure_usdt.toFixed(0)} $`;
+
+      const unEl = document.getElementById("posUnrealized");
+      unEl.textContent = formatPnl(posData.unrealized_pnl);
+      unEl.className = posData.unrealized_pnl >= 0 ? "pos" : "neg";
+
+      const reEl = document.getElementById("posRealized");
+      reEl.textContent = formatPnl(posData.realized_pnl);
+      reEl.className = posData.realized_pnl >= 0 ? "pos" : "neg";
+
+      if (currentPosTab === "open") {
+        posTableHead.innerHTML = `
+          <tr>
+            <th>Sembol</th>
+            <th>Yön</th>
+            <th>Periyot</th>
+            <th>Büyüklük</th>
+            <th>Giriş Fiyatı</th>
+            <th>Güncel Fiyat</th>
+            <th>Stop Loss (SL)</th>
+            <th>Ne Zaman Kapanır?</th>
+            <th>Anlık PnL</th>
+            <th>Açılış</th>
+            <th>İşlem</th>
+          </tr>
+        `;
+        if (openFiltered.length === 0) {
+          posTableBody.innerHTML = `<tr><td colspan="11" class="empty-state">Bu periyotta açık pozisyon yok. AL/SAT sinyali geldiğinde otomatik $${posData.notional_usdt} pozisyon açılır.</td></tr>`;
+          return;
+        }
+        posTableBody.innerHTML = openFiltered.map((p) => {
+          const pnlCls = p.unrealized_pnl >= 0 ? "pos" : "neg";
+          const sideBadge = p.side === "LONG" ? "badge-AL" : "badge-SAT";
+          const dt = new Date(p.opened_at * 1000).toLocaleTimeString("tr-TR");
+          const slText = p.stop_loss_price > 0
+            ? `$${formatPrice(p.stop_loss_price)} (${posData.stop_loss_pct}%)`
+            : "Kapalı";
+          const condText = p.close_condition || (p.side === "LONG" ? "SAT sinyali (Mavi ↓ Kırmızı)" : "AL sinyali (Mavi ↑ Kırmızı)");
+          return `
+            <tr>
+              <td><strong>${p.symbol}</strong></td>
+              <td><span class="badge ${sideBadge}">${p.side}</span></td>
+              <td>${p.interval.toUpperCase()}</td>
+              <td class="mono">$${p.notional_usdt.toFixed(0)}</td>
+              <td class="mono">${formatPrice(p.entry_price)}</td>
+              <td class="mono">${formatPrice(p.current_price)}</td>
+              <td class="mono neg">${slText}</td>
+              <td style="font-size:12px;color:var(--muted);">${condText}</td>
+              <td class="mono ${pnlCls}">${formatPnl(p.unrealized_pnl)} (${p.unrealized_pnl_pct >= 0 ? "+" : ""}${p.unrealized_pnl_pct.toFixed(2)}%)</td>
+              <td class="mono">${dt}</td>
+              <td><button class="close-btn" onclick="closePosition('${p.id}')">Kapat</button></td>
+            </tr>
+          `;
+        }).join("");
+      } else {
+        posTableHead.innerHTML = `
+          <tr>
+            <th>Sembol</th>
+            <th>Yön</th>
+            <th>Periyot</th>
+            <th>Büyüklük</th>
+            <th>Giriş</th>
+            <th>Çıkış</th>
+            <th>Gerçekleşen PnL</th>
+            <th>Sebep</th>
+            <th>Kapanış</th>
+          </tr>
+        `;
+        if (closedFiltered.length === 0) {
+          posTableBody.innerHTML = `<tr><td colspan="9" class="empty-state">Bu periyotta henüz kapanan işlem yok.</td></tr>`;
+          return;
+        }
+        posTableBody.innerHTML = closedFiltered.map((t) => {
+          const pnlCls = t.realized_pnl >= 0 ? "pos" : "neg";
+          const sideBadge = t.side === "LONG" ? "badge-AL" : "badge-SAT";
+          const dt = new Date(t.closed_at * 1000).toLocaleTimeString("tr-TR");
+          return `
+            <tr>
+              <td><strong>${t.symbol}</strong></td>
+              <td><span class="badge ${sideBadge}">${t.side}</span></td>
+              <td>${t.interval.toUpperCase()}</td>
+              <td class="mono">$${t.notional_usdt.toFixed(0)}</td>
+              <td class="mono">${formatPrice(t.entry_price)}</td>
+              <td class="mono">${formatPrice(t.exit_price)}</td>
+              <td class="mono ${pnlCls}">${formatPnl(t.realized_pnl)} (${t.realized_pnl_pct >= 0 ? "+" : ""}${t.realized_pnl_pct.toFixed(2)}%)</td>
+              <td>${t.close_reason}</td>
+              <td class="mono">${dt}</td>
+            </tr>
+          `;
+        }).join("");
+      }
+    }
+
+    async function postJson(url, body = {}) {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (resp.ok) {
+        renderPositions(await resp.json());
+      }
+    }
+
+    window.closePosition = (id) => postJson("/api/positions/close", { id });
+
+    function renderTable() {
+      const q = searchInput.value.trim().toUpperCase();
+      const filtered = allResults.filter((r) => {
+        if (q && !r.symbol.includes(q)) return false;
+        if (currentFilter === "AL") return r.signal === "AL";
+        if (currentFilter === "SAT") return r.signal === "SAT";
+        if (currentFilter === "SIGNALS") return r.signal === "AL" || r.signal === "SAT";
+        return true;
+      });
+
+      if (filtered.length === 0) {
+        resultsBody.innerHTML = `<tr><td colspan="8" class="empty-state">Seçili filtrede sinyal bulunamadı. "Tümü" sekmesini seçerek tüm coinlerin güncel %K / %D değerlerini görebilirsiniz.</td></tr>`;
+        return;
+      }
+
+      resultsBody.innerHTML = filtered.map((r) => {
+        const chgClass = r.change_24h >= 0 ? "pos" : "neg";
+        const chgPrefix = r.change_24h >= 0 ? "+" : "";
+        const spark = buildSparkline(r.k_series.slice(-14), r.d_series.slice(-14), 140, 34, false);
+        return `
+          <tr class="clickable" data-symbol="${r.symbol}">
+            <td><strong>${r.symbol}</strong></td>
+            <td><span class="badge badge-${r.signal}">${r.signal}</span></td>
+            <td class="mono">${formatPrice(r.price)}</td>
+            <td class="mono ${chgClass}">${chgPrefix}${r.change_24h.toFixed(2)}%</td>
+            <td class="mono">${formatUsd(r.volume_24h_usdt)}</td>
+            <td class="mono"><span style="color:var(--blue)">${r.k_prev.toFixed(1)}</span> / <span style="color:var(--red)">${r.d_prev.toFixed(1)}</span></td>
+            <td class="mono"><span style="color:var(--blue)">${r.k_curr.toFixed(1)}</span> / <span style="color:var(--red)">${r.d_curr.toFixed(1)}</span></td>
+            <td>${spark}</td>
+          </tr>
+        `;
+      }).join("");
+
+      document.querySelectorAll("tr.clickable").forEach((tr) => {
+        tr.addEventListener("click", () => openModal(tr.dataset.symbol));
+      });
+    }
+
+    function openModal(symbol) {
+      const coin = allResults.find((r) => r.symbol === symbol);
+      if (!coin) return;
+      const tfLabel = intervalSelect.value === "15m" ? "15m" : "1D";
+      document.getElementById("modalTitle").textContent = `${coin.symbol} — ${tfLabel} Stoch RSI (3,3,14,14)`;
+      const badge = document.getElementById("modalBadge");
+      badge.textContent = coin.signal;
+      badge.className = `badge badge-${coin.signal}`;
+      document.getElementById("modalStats").innerHTML =
+        `Fiyat: <strong>$${formatPrice(coin.price)}</strong> • ` +
+        `Önceki: <span style="color:var(--blue)">%K=${coin.k_prev}</span> / <span style="color:var(--red)">%D=${coin.d_prev}</span> → ` +
+        `Güncel: <span style="color:var(--blue)">%K=${coin.k_curr}</span> / <span style="color:var(--red)">%D=${coin.d_curr}</span>`;
+      document.getElementById("modalChartWrap").innerHTML = buildSparkline(
+        coin.k_series, coin.d_series, 700, 220, true
+      );
+      document.getElementById("chartModal").classList.add("open");
+    }
+
+    document.getElementById("closeModalBtn").addEventListener("click", () => {
+      document.getElementById("chartModal").classList.remove("open");
+    });
+    document.getElementById("chartModal").addEventListener("click", (e) => {
+      if (e.target.id === "chartModal") {
+        document.getElementById("chartModal").classList.remove("open");
+      }
+    });
+
+    function updateClockBadge() {
+      const autoSec = Number(autoRefreshSelect.value);
+      if (isScanning) {
+        liveClock.textContent = `${lastScannedLabel ? lastScannedLabel + " • " : ""}Taranıyor...`;
+        return;
+      }
+      if (autoSec > 0) {
+        liveClock.textContent = `${lastScannedLabel ? lastScannedLabel + " • " : ""}Sonraki: ${remainingSec}s`;
+      } else {
+        liveClock.textContent = lastScannedLabel || "Oto Tarama Kapalı";
+      }
+    }
+
+    function resetCountdown() {
+      if (countdownTimer) clearInterval(countdownTimer);
+      const sec = Number(autoRefreshSelect.value);
+      if (sec <= 0) {
+        updateClockBadge();
+        return;
+      }
+      remainingSec = sec;
+      updateClockBadge();
+      countdownTimer = setInterval(() => {
+        if (isScanning) return;
+        remainingSec -= 1;
+        if (remainingSec <= 0) {
+          clearInterval(countdownTimer);
+          runScan();
+        } else {
+          updateClockBadge();
+        }
+      }, 1000);
+    }
+
+    async function runScan() {
+      if (isScanning) return;
+      isScanning = true;
+      if (countdownTimer) clearInterval(countdownTimer);
+      scanBtn.disabled = true;
+      scanBtn.textContent = "Taranıyor...";
+      const tf = intervalSelect.value;
+      const tfLabel = tf === "15m" ? "15m (15 Dakikalık)" : "1D (Günlük)";
+      headerInterval.textContent = tfLabel;
+      updateClockBadge();
+      statusText.textContent = `Binance Futures (fapi.binance.com) ${tf} mumları çekiliyor...`;
+      try {
+        const params = new URLSearchParams({
+          interval: tf,
+          mode: modeSelect.value,
+          min_volume: volSelect.value,
+          limit: limitSelect.value,
+        });
+        const resp = await fetch(`/api/scan?${params.toString()}`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        allResults = data.results || [];
+        document.getElementById("statAl").textContent = data.al_count;
+        document.getElementById("statSat").textContent = data.sat_count;
+        document.getElementById("statTotal").textContent = data.total_scanned;
+        document.getElementById("statDuration").textContent = `${data.duration_sec}s`;
+        const dt = new Date(data.scanned_at * 1000).toLocaleTimeString("tr-TR");
+        lastScannedLabel = `Son Tarama: ${dt}`;
+        statusText.textContent = `Tamamlandı (${tfLabel} • ${data.mode === "live" ? "Anlık Mum" : "Kapanmış Mum"}). Hata: ${data.error_count}`;
+        renderTable();
+        if (data.positions) renderPositions(data.positions);
+      } catch (err) {
+        statusText.textContent = `Hata: ${err.message}`;
+        resultsBody.innerHTML = `<tr><td colspan="8" class="empty-state">Veri alınamadı: ${err.message}</td></tr>`;
+      } finally {
+        isScanning = false;
+        scanBtn.disabled = false;
+        scanBtn.textContent = "Şimdi Tara";
+        resetCountdown();
+      }
+    }
+
+    document.querySelectorAll("[data-filter]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll("[data-filter]").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        currentFilter = btn.dataset.filter;
+        renderTable();
+      });
+    });
+
+    document.querySelectorAll("[data-postab]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll("[data-postab]").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        currentPosTab = btn.dataset.postab;
+        renderPositions(latestPositions);
+      });
+    });
+
+    document.querySelectorAll("[data-posinterval]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll("[data-posinterval]").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        currentPosInterval = btn.dataset.posinterval;
+        renderPositions(latestPositions);
+      });
+    });
+
+    intervalSelect.addEventListener("change", () => {
+      currentPosInterval = intervalSelect.value;
+      document.querySelectorAll("[data-posinterval]").forEach((b) => {
+        b.classList.toggle("active", b.dataset.posinterval === currentPosInterval);
+      });
+      runScan();
+    });
+
+    autoTradeToggle.addEventListener("change", () => {
+      postJson("/api/positions/config", { auto_trade: autoTradeToggle.checked });
+    });
+    saveNotionalBtn.addEventListener("click", () => {
+      const val = Number(notionalInput.value);
+      const sl = Number(slInput.value);
+      const payload = {};
+      if (val > 0) payload.notional_usdt = val;
+      if (!Number.isNaN(sl) && sl >= 0) payload.stop_loss_pct = sl;
+      postJson("/api/positions/config", payload);
+    });
+    closeAllBtn.addEventListener("click", () => postJson("/api/positions/close-all"));
+    clearHistoryBtn.addEventListener("click", () => postJson("/api/positions/clear-history"));
+
+    searchInput.addEventListener("input", renderTable);
+    scanBtn.addEventListener("click", runScan);
+    modeSelect.addEventListener("change", runScan);
+    volSelect.addEventListener("change", runScan);
+    limitSelect.addEventListener("change", runScan);
+    autoRefreshSelect.addEventListener("change", resetCountdown);
+
+    runScan();
+  </script>
+</body>
+</html>

@@ -1,0 +1,229 @@
+"""Telegram notification sender & alert deduplication state for 4H scanner."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import time
+import requests
+
+from .binance_scanner import Coin4hResult
+
+
+def fmt_price(price: float | None) -> str:
+    if price is None:
+        return "-"
+    if price >= 1000:
+        return f"{price:,.2f}"
+    if price >= 1:
+        return f"{price:.4f}".rstrip("0").rstrip(".")
+    if price >= 0.01:
+        return f"{price:.5f}".rstrip("0").rstrip(".")
+    return f"{price:.8f}".rstrip("0").rstrip(".")
+
+
+def fmt_vol(vol: float) -> str:
+    if vol >= 1_000_000_000:
+        return f"${vol / 1_000_000_000:.2f}B"
+    if vol >= 1_000_000:
+        return f"${vol / 1_000_000:.1f}M"
+    return f"${vol:,.0f}"
+
+
+def _ind_row(ev) -> str:
+    def mark(ok: bool) -> str:
+        return "✅" if ok else "❌"
+
+    return (
+        f"• StochRSI: {mark(ev.cond1_buy)} | RSI+MA: {mark(ev.cond2_buy)} | Fisher: {mark(ev.cond3_buy)}\n"
+        f"• WaveTrend: {mark(ev.cond4_buy)} | SMI>EMA9: {mark(ev.cond5_buy)}"
+    )
+
+
+def format_entry_message(res: Coin4hResult, kind: str) -> str:
+    ev = res.evaluation
+    market_label = "FUTURES (USDT-M)" if res.market == "futures" else "SPOT (USDT)"
+    if kind == "ORANGE":
+        header = "🟠 <b>TURUNCU KESİN AL (5/5)</b>"
+    else:
+        header = "🟢 <b>YEŞİL AL (İlk 3/5)</b>"
+
+    entry = ev.entry_price or res.price
+    tp = ev.tp_level or ev.next_res
+    sl = ev.sl_level or ev.prev_sup
+    tp_pct = ((tp - entry) / entry * 100.0) if entry > 0 else 0.0
+    sl_pct = ((sl - entry) / entry * 100.0) if entry > 0 else 0.0
+
+    bar_dt = datetime.fromtimestamp(ev.bar_open_time / 1000, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
+
+    return (
+        f"{header}\n"
+        f"🪙 <b>{res.symbol}</b> | <code>4S (4H)</code> | {market_label}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
+        f"🎯 <b>Kâr Al (TP):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
+        f"🛑 <b>Stop (SL):</b> <code>{fmt_price(sl)}</code> (<b>{sl_pct:.2f}%</b>)\n"
+        f"🔒 <b>Kâr Kilidi:</b> +%2.50 görünce SL → +%0.30\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>5'li İndikatör Durumu:</b>\n"
+        f"{_ind_row(ev)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 <b>4S Backtest:</b> %{ev.win_rate:.1f} Başarı ({ev.win_trades}/{ev.total_trades} işlem) | Getiri: %{ev.total_profit_pct:+.1f}\n"
+        f"💧 <b>24s Hacim:</b> {fmt_vol(res.volume_24h_usdt)} | 24s: {res.change_24h:+.2f}%\n"
+        f"🕒 <i>Mum: {bar_dt}</i>"
+    )
+
+
+def format_exit_message(res: Coin4hResult) -> str:
+    ev = res.evaluation
+    market_label = "FUTURES (USDT-M)" if res.market == "futures" else "SPOT (USDT)"
+    pct = ev.exit_trade_pct or 0.0
+    icon = "💰" if pct > 0 else "🔴"
+    reason = ev.exit_reason or "ÇIKIŞ"
+
+    return (
+        f"{icon} <b>POZİSYON KAPANDI — {reason}</b>\n"
+        f"🪙 <b>{res.symbol}</b> | <code>4S (4H)</code> | {market_label}\n"
+        f"💵 <b>Çıkış Fiyatı:</b> <code>{fmt_price(ev.exit_price or res.price)}</code>\n"
+        f"📊 <b>İşlem Sonucu:</b> <b>{pct:+.2f}%</b>\n"
+        f"📈 <b>4S Başarı Oranı:</b> %{ev.win_rate:.1f} ({ev.win_trades}/{ev.total_trades})"
+    )
+
+
+class TelegramNotifier:
+    def __init__(
+        self,
+        bot_token: str,
+        chat_id: str,
+        state_file: Path,
+        timeout: float = 10.0,
+    ) -> None:
+        self.bot_token = bot_token.strip()
+        self.chat_id = chat_id.strip()
+        self.state_file = state_file
+        self.timeout = timeout
+        self._state = self._load_state()
+
+    def _load_state(self) -> dict:
+        if self.state_file.exists():
+            try:
+                data = json.loads(self.state_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    data.setdefault("sent_alerts", {})
+                    data.setdefault("tracked_positions", {})
+                    return data
+            except Exception:
+                pass
+        return {"sent_alerts": {}, "tracked_positions": {}}
+
+    def _save_state(self) -> None:
+        sent = self._state["sent_alerts"]
+        if len(sent) > 2000:
+            # Keep the most recent 1500 keys
+            items = sorted(sent.items(), key=lambda kv: kv[1], reverse=True)[:1500]
+            self._state["sent_alerts"] = dict(items)
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(
+            json.dumps(self._state, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def send_text(self, text: str) -> bool:
+        if not self.bot_token or not self.chat_id:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN veya TELEGRAM_CHAT_ID eksik.")
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        resp = requests.post(
+            url,
+            json={
+                "chat_id": self.chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        return bool(payload.get("ok"))
+
+    def process_results(
+        self,
+        results: list[Coin4hResult],
+        notify_all_exits: bool = False,
+        dry_run: bool = False,
+    ) -> dict:
+        """
+        Inspect scan results and send Telegram notifications for new entries
+        (and exits of tracked positions).
+        """
+        sent_alerts: dict[str, int] = self._state["sent_alerts"]
+        tracked: dict[str, dict] = self._state["tracked_positions"]
+
+        stats = {"green": 0, "orange": 0, "exit": 0, "errors": []}
+
+        for res in results:
+            ev = res.evaluation
+            track_key = f"{res.market}:{res.symbol}"
+
+            # 1. TURUNCU KESİN AL (5/5)
+            if ev.orange_trigger:
+                alert_key = f"{track_key}:4h:ORANGE:{ev.bar_open_time}"
+                if alert_key not in sent_alerts:
+                    msg = format_entry_message(res, kind="ORANGE")
+                    try:
+                        if dry_run:
+                            print(f"[DRY-RUN ORANGE] {res.symbol} @ {res.price}")
+                        else:
+                            self.send_text(msg)
+                        sent_alerts[alert_key] = int(time.time())
+                        tracked[track_key] = {
+                            "kind": "ORANGE",
+                            "bar_open_time": ev.bar_open_time,
+                            "entry_price": ev.entry_price or res.price,
+                        }
+                        stats["orange"] += 1
+                    except Exception as exc:
+                        stats["errors"].append(f"{res.symbol} ORANGE: {exc}")
+
+            # 2. YEŞİL AL (İlk 3/5) - only when not also orange on the same bar
+            elif ev.green_trigger:
+                alert_key = f"{track_key}:4h:GREEN:{ev.bar_open_time}"
+                if alert_key not in sent_alerts:
+                    msg = format_entry_message(res, kind="GREEN")
+                    try:
+                        if dry_run:
+                            print(f"[DRY-RUN GREEN] {res.symbol} @ {res.price}")
+                        else:
+                            self.send_text(msg)
+                        sent_alerts[alert_key] = int(time.time())
+                        tracked[track_key] = {
+                            "kind": "GREEN",
+                            "bar_open_time": ev.bar_open_time,
+                            "entry_price": ev.entry_price or res.price,
+                        }
+                        stats["green"] += 1
+                    except Exception as exc:
+                        stats["errors"].append(f"{res.symbol} GREEN: {exc}")
+
+            # 3. ÇIKIŞ (for tracked positions or all if requested)
+            elif ev.exit_trigger and (notify_all_exits or track_key in tracked):
+                alert_key = f"{track_key}:4h:EXIT:{ev.bar_open_time}"
+                if alert_key not in sent_alerts:
+                    msg = format_exit_message(res)
+                    try:
+                        if dry_run:
+                            print(f"[DRY-RUN EXIT] {res.symbol} ({ev.exit_reason})")
+                        else:
+                            self.send_text(msg)
+                        sent_alerts[alert_key] = int(time.time())
+                        tracked.pop(track_key, None)
+                        stats["exit"] += 1
+                    except Exception as exc:
+                        stats["errors"].append(f"{res.symbol} EXIT: {exc}")
+
+        if not dry_run:
+            self._save_state()
+
+        return stats
