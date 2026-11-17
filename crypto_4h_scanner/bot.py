@@ -29,9 +29,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--market",
-        choices=["futures", "spot"],
-        default=os.getenv("BINANCE_MARKET", "futures"),
-        help="Taranacak ve işlem açılacak Binance piyasası (varsayılan: futures)",
+        choices=["futures", "papi", "spot"],
+        default=os.getenv("BINANCE_MARKET", "papi"),
+        help="Taranacak ve işlem açılacak Binance piyasası (varsayılan: papi)",
     )
     p.add_argument(
         "--min-usd",

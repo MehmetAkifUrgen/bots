@@ -16,7 +16,7 @@ from .indicators import SystemEvaluation, evaluate_4h_system
 FAPI_BASE = "https://fapi.binance.com"
 SPOT_BASE = "https://api.binance.com"
 
-MarketType = Literal["futures", "spot"]
+MarketType = Literal["futures", "papi", "spot"]
 
 
 @dataclass
@@ -68,7 +68,7 @@ class Binance4hScanner:
     ) -> list[dict]:
         """Fetch active USDT pairs sorted by 24h quote volume descending."""
         sess = self._get_session()
-        if self.market == "futures":
+        if self.market in ("futures", "papi"):
             info_url = f"{FAPI_BASE}/fapi/v1/exchangeInfo"
             ticker_url = f"{FAPI_BASE}/fapi/v1/ticker/24hr"
         else:
@@ -79,7 +79,7 @@ class Binance4hScanner:
         info_resp.raise_for_status()
         info_data = info_resp.json()
 
-        if self.market == "futures":
+        if self.market in ("futures", "papi"):
             active_symbols = {
                 s["symbol"]
                 for s in info_data.get("symbols", [])
@@ -127,7 +127,7 @@ class Binance4hScanner:
         self, symbol: str, interval: str, limit: int
     ) -> pd.DataFrame:
         sess = self._get_session()
-        if self.market == "futures":
+        if self.market in ("futures", "papi"):
             url = f"{FAPI_BASE}/fapi/v1/klines"
         else:
             url = f"{SPOT_BASE}/api/v3/klines"

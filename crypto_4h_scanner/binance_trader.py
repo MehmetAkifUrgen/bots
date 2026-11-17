@@ -15,9 +15,10 @@ from urllib.parse import urlencode
 import requests
 
 FAPI_BASE = "https://fapi.binance.com"
+PAPI_BASE = "https://papi.binance.com"
 SPOT_BASE = "https://api.binance.com"
 
-MarketType = Literal["futures", "spot"]
+MarketType = Literal["futures", "spot", "papi"]
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,8 @@ class BinanceTrader:
         return bool(self.api_key and self.api_secret)
 
     def _base_url(self) -> str:
+        if self.market == "papi":
+            return PAPI_BASE
         return FAPI_BASE if self.market == "futures" else SPOT_BASE
 
     def _load_state(self) -> dict:
@@ -112,11 +115,17 @@ class BinanceTrader:
             raise RuntimeError(f"Binance API {resp.status_code}: {resp.text}")
         return resp.json()
 
+    def _is_um_futures(self) -> bool:
+        return self.market in ("futures", "papi")
+
     def _ensure_filters(self) -> None:
         if self._filters_cache:
             return
-        path = "/fapi/v1/exchangeInfo" if self.market == "futures" else "/api/v3/exchangeInfo"
-        resp = requests.get(f"{self._base_url()}{path}", timeout=self.timeout)
+        if self._is_um_futures():
+            url = f"{FAPI_BASE}/fapi/v1/exchangeInfo"
+        else:
+            url = f"{SPOT_BASE}/api/v3/exchangeInfo"
+        resp = requests.get(url, timeout=self.timeout)
         resp.raise_for_status()
         for sym_info in resp.json().get("symbols", []):
             sym = sym_info.get("symbol")
@@ -141,6 +150,9 @@ class BinanceTrader:
             }
 
     def get_free_usdt(self) -> float:
+        if self.market == "papi":
+            acct = self._signed_request("GET", "/papi/v1/account")
+            return float(acct.get("virtualMaxWithdrawAmount") or acct.get("accountEquity") or 0.0)
         if self.market == "futures":
             balances = self._signed_request("GET", "/fapi/v2/balance")
             for b in balances:
@@ -154,9 +166,10 @@ class BinanceTrader:
         return 0.0
 
     def get_live_open_positions(self) -> dict[str, dict]:
-        """Return currently open positions (from Binance on futures, or state on spot)."""
-        if self.market == "futures":
-            rows = self._signed_request("GET", "/fapi/v2/positionRisk")
+        """Return currently open positions (from Binance on futures/papi, or state on spot)."""
+        if self._is_um_futures():
+            path = "/papi/v1/um/positionRisk" if self.market == "papi" else "/fapi/v2/positionRisk"
+            rows = self._signed_request("GET", path)
             live: dict[str, dict] = {}
             for r in rows:
                 amt = float(r.get("positionAmt", 0.0))
@@ -188,13 +201,13 @@ class BinanceTrader:
         notional = max(self.min_usd, min(self.max_usd, target_usd))
         free_usdt = self.get_free_usdt()
         required_margin = (
-            notional / self.leverage if self.market == "futures" else notional
+            notional / self.leverage if self._is_um_futures() else notional
         )
         if free_usdt < required_margin:
             # Clamp down if still >= min_usd
             max_affordable_notional = (
                 free_usdt * self.leverage * 0.98
-                if self.market == "futures"
+                if self._is_um_futures()
                 else free_usdt * 0.98
             )
             if max_affordable_notional < self.min_usd:
@@ -212,18 +225,20 @@ class BinanceTrader:
         if actual_notional < self.min_usd * 0.95 or actual_notional < rules["minNotional"]:
             return None
 
-        if self.market == "futures":
+        if self._is_um_futures():
+            lev_path = "/papi/v1/um/leverage" if self.market == "papi" else "/fapi/v1/leverage"
+            ord_path = "/papi/v1/um/order" if self.market == "papi" else "/fapi/v1/order"
             try:
                 self._signed_request(
                     "POST",
-                    "/fapi/v1/leverage",
+                    lev_path,
                     {"symbol": symbol, "leverage": self.leverage},
                 )
             except Exception:
                 pass
             res = self._signed_request(
                 "POST",
-                "/fapi/v1/order",
+                ord_path,
                 {
                     "symbol": symbol,
                     "side": "BUY",
@@ -291,10 +306,11 @@ class BinanceTrader:
         if qty < rules["minQty"]:
             qty = float(pos["qty"])
 
-        if self.market == "futures":
+        if self._is_um_futures():
+            ord_path = "/papi/v1/um/order" if self.market == "papi" else "/fapi/v1/order"
             res = self._signed_request(
                 "POST",
-                "/fapi/v1/order",
+                ord_path,
                 {
                     "symbol": symbol,
                     "side": "SELL",
