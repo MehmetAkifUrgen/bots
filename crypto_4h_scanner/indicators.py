@@ -310,7 +310,7 @@ def evaluate_4h_system(
     df_1m: pd.DataFrame | None = None,
     pivot_len: int = 7,
     be_trigger_pct: float = 2.5,
-    ema200_filter: bool = True,
+    ema200_filter: bool = False,
 ) -> SystemEvaluation | None:
     """
     Run the Pine Script 'Gün İçi Anlık Sistem' state machine on 4H OHLCV DataFrame.

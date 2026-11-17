@@ -65,8 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--trade-on-green",
         action="store_true",
-        default=os.getenv("TRADE_ON_GREEN", "false").strip().lower() in ("1", "true", "yes"),
-        help="Yeşil AL (3/5) sinyalinde de emir aç (varsayılan: sadece Turuncu 5/5)",
+        default=os.getenv("TRADE_ON_GREEN", "true").strip().lower() in ("1", "true", "yes"),
+        help="Yeşil AL (3/5) sinyalinde de emir aç (varsayılan: açık)",
     )
     p.add_argument(
         "--min-volume",
