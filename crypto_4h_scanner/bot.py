@@ -172,6 +172,12 @@ def main() -> None:
     auto_trade_env = os.getenv("AUTO_TRADE", "true").strip().lower() not in ("0", "false", "no")
     api_key = os.getenv("BINANCE_API_KEY", "")
     api_secret = os.getenv("BINANCE_API_SECRET", "")
+    proxy_url = (
+        os.getenv("BINANCE_PROXY_URL")
+        or os.getenv("FIXIE_URL")
+        or os.getenv("HTTPS_PROXY")
+        or ""
+    )
     trader: BinanceTrader | None = None
     if auto_trade_env and not args.no_auto_trade and api_key and api_secret:
         trader = BinanceTrader(
@@ -183,6 +189,7 @@ def main() -> None:
             max_positions=args.max_positions,
             leverage=args.leverage,
             state_file=DEFAULT_TRADE_STATE_FILE,
+            proxy_url=proxy_url,
         )
 
     scanner = Binance4hScanner(market=args.market, max_workers=args.workers)

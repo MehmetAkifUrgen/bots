@@ -51,6 +51,7 @@ class BinanceTrader:
         leverage: int = 1,
         state_file: Path | None = None,
         timeout: float = 10.0,
+        proxy_url: str = "",
     ) -> None:
         self.api_key = api_key.strip()
         self.api_secret = api_secret.strip()
@@ -63,6 +64,7 @@ class BinanceTrader:
             Path(__file__).resolve().parent / "trade_state.json"
         )
         self.timeout = timeout
+        self.proxy_url = proxy_url.strip()
         self._filters_cache: dict[str, dict] = {}
         self._state = self._load_state()
 
@@ -110,7 +112,14 @@ class BinanceTrader:
         url = f"{self._base_url()}{path}?{query}&signature={sig}"
         headers = {"X-MBX-APIKEY": self.api_key}
 
-        resp = requests.request(method, url, headers=headers, timeout=self.timeout)
+        proxies = (
+            {"http": self.proxy_url, "https": self.proxy_url}
+            if self.proxy_url
+            else None
+        )
+        resp = requests.request(
+            method, url, headers=headers, proxies=proxies, timeout=self.timeout
+        )
         if resp.status_code >= 400:
             raise RuntimeError(f"Binance API {resp.status_code}: {resp.text}")
         return resp.json()
