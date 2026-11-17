@@ -8,3 +8,4 @@ trader_state.json
 trade_db.json
 .DS_Store
 crypto_4h_scanner/alert_state.json
+crypto_4h_scanner/trade_state.json

@@ -9,6 +9,7 @@ import time
 import requests
 
 from .binance_scanner import Coin4hResult
+from .binance_trader import BinanceTrader, TradeExecution
 
 
 def fmt_price(price: float | None) -> str:
@@ -41,7 +42,12 @@ def _ind_row(ev) -> str:
     )
 
 
-def format_entry_message(res: Coin4hResult, kind: str) -> str:
+def format_entry_message(
+    res: Coin4hResult,
+    kind: str,
+    trade_exec: TradeExecution | None = None,
+    trade_note: str | None = None,
+) -> str:
     ev = res.evaluation
     market_label = "FUTURES (USDT-M)" if res.market == "futures" else "SPOT (USDT)"
     if kind == "ORANGE":
@@ -49,7 +55,7 @@ def format_entry_message(res: Coin4hResult, kind: str) -> str:
     else:
         header = "🟢 <b>YEŞİL AL (İlk 3/5)</b>"
 
-    entry = ev.entry_price or res.price
+    entry = trade_exec.price if trade_exec else (ev.entry_price or res.price)
     tp = ev.tp_level or ev.next_res
     sl = ev.sl_level or ev.prev_sup
     tp_pct = ((tp - entry) / entry * 100.0) if entry > 0 else 0.0
@@ -59,6 +65,16 @@ def format_entry_message(res: Coin4hResult, kind: str) -> str:
         "%Y-%m-%d %H:%M UTC"
     )
 
+    trade_block = ""
+    if trade_exec:
+        trade_block = (
+            f"\n⚡ <b>OTOMATİK EMİR AÇILDI</b>\n"
+            f"• Büyüklük: <b>${trade_exec.notional_usd:.2f}</b> | Miktar: <code>{trade_exec.qty:g}</code>\n"
+            f"• Emir ID: <code>{trade_exec.order_id}</code>\n"
+        )
+    elif trade_note:
+        trade_block = f"\nℹ️ <i>{trade_note}</i>\n"
+
     return (
         f"{header}\n"
         f"🪙 <b>{res.symbol}</b> | <code>4S (4H)</code> | {market_label}\n"
@@ -67,6 +83,7 @@ def format_entry_message(res: Coin4hResult, kind: str) -> str:
         f"🎯 <b>Kâr Al (TP):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
         f"🛑 <b>Stop (SL):</b> <code>{fmt_price(sl)}</code> (<b>{sl_pct:.2f}%</b>)\n"
         f"🔒 <b>Kâr Kilidi:</b> +%2.50 görünce SL → +%0.30\n"
+        f"{trade_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>5'li İndikatör Durumu:</b>\n"
         f"{_ind_row(ev)}\n"
@@ -77,18 +94,27 @@ def format_entry_message(res: Coin4hResult, kind: str) -> str:
     )
 
 
-def format_exit_message(res: Coin4hResult) -> str:
+def format_exit_message(
+    res: Coin4hResult,
+    trade_exec: TradeExecution | None = None,
+) -> str:
     ev = res.evaluation
     market_label = "FUTURES (USDT-M)" if res.market == "futures" else "SPOT (USDT)"
     pct = ev.exit_trade_pct or 0.0
     icon = "💰" if pct > 0 else "🔴"
     reason = ev.exit_reason or "ÇIKIŞ"
+    exit_px = trade_exec.price if trade_exec else (ev.exit_price or res.price)
+    exec_line = (
+        f"\n⚡ <b>Binance Pozisyonu Kapatıldı</b> | Emir ID: <code>{trade_exec.order_id}</code>"
+        if trade_exec
+        else ""
+    )
 
     return (
         f"{icon} <b>POZİSYON KAPANDI — {reason}</b>\n"
         f"🪙 <b>{res.symbol}</b> | <code>4S (4H)</code> | {market_label}\n"
-        f"💵 <b>Çıkış Fiyatı:</b> <code>{fmt_price(ev.exit_price or res.price)}</code>\n"
-        f"📊 <b>İşlem Sonucu:</b> <b>{pct:+.2f}%</b>\n"
+        f"💵 <b>Çıkış Fiyatı:</b> <code>{fmt_price(exit_px)}</code>\n"
+        f"📊 <b>İşlem Sonucu:</b> <b>{pct:+.2f}%</b>{exec_line}\n"
         f"📈 <b>4S Başarı Oranı:</b> %{ev.win_rate:.1f} ({ev.win_trades}/{ev.total_trades})"
     )
 
@@ -148,30 +174,66 @@ class TelegramNotifier:
         payload = resp.json()
         return bool(payload.get("ok"))
 
+    def _try_open_trade(
+        self,
+        trader: BinanceTrader | None,
+        res: Coin4hResult,
+        target_usd: float,
+        dry_run: bool,
+    ) -> tuple[TradeExecution | None, str | None]:
+        if trader is None or not trader.is_configured or dry_run:
+            return None, None
+        try:
+            exec_res = trader.open_position(res.symbol, res.price, target_usd)
+            if exec_res is None:
+                return (
+                    None,
+                    f"Otomatik emir açılmadı (Max {trader.max_positions} pozisyon limiti veya yetersiz bakiye).",
+                )
+            return exec_res, None
+        except Exception as exc:
+            return None, f"Otomatik emir hatası: {exc}"
+
     def process_results(
         self,
         results: list[Coin4hResult],
         notify_all_exits: bool = False,
         dry_run: bool = False,
+        trader: BinanceTrader | None = None,
     ) -> dict:
         """
-        Inspect scan results and send Telegram notifications for new entries
-        (and exits of tracked positions).
+        Inspect scan results, optionally execute Binance orders, and send
+        Telegram notifications for new entries and exits of tracked positions.
         """
         sent_alerts: dict[str, int] = self._state["sent_alerts"]
         tracked: dict[str, dict] = self._state["tracked_positions"]
 
-        stats = {"green": 0, "orange": 0, "exit": 0, "errors": []}
+        stats = {
+            "green": 0,
+            "orange": 0,
+            "exit": 0,
+            "orders_opened": 0,
+            "orders_closed": 0,
+            "errors": [],
+        }
 
         for res in results:
             ev = res.evaluation
             track_key = f"{res.market}:{res.symbol}"
 
-            # 1. TURUNCU KESİN AL (5/5)
+            # 1. TURUNCU KESİN AL (5/5) -> Max USD ($350)
             if ev.orange_trigger:
                 alert_key = f"{track_key}:4h:ORANGE:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
-                    msg = format_entry_message(res, kind="ORANGE")
+                    target_usd = trader.max_usd if trader else 350.0
+                    trade_exec, trade_note = self._try_open_trade(
+                        trader, res, target_usd, dry_run
+                    )
+                    if trade_exec:
+                        stats["orders_opened"] += 1
+                    msg = format_entry_message(
+                        res, kind="ORANGE", trade_exec=trade_exec, trade_note=trade_note
+                    )
                     try:
                         if dry_run:
                             print(f"[DRY-RUN ORANGE] {res.symbol} @ {res.price}")
@@ -181,17 +243,25 @@ class TelegramNotifier:
                         tracked[track_key] = {
                             "kind": "ORANGE",
                             "bar_open_time": ev.bar_open_time,
-                            "entry_price": ev.entry_price or res.price,
+                            "entry_price": trade_exec.price if trade_exec else (ev.entry_price or res.price),
                         }
                         stats["orange"] += 1
                     except Exception as exc:
                         stats["errors"].append(f"{res.symbol} ORANGE: {exc}")
 
-            # 2. YEŞİL AL (İlk 3/5) - only when not also orange on the same bar
+            # 2. YEŞİL AL (İlk 3/5) -> Min USD ($250)
             elif ev.green_trigger:
                 alert_key = f"{track_key}:4h:GREEN:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
-                    msg = format_entry_message(res, kind="GREEN")
+                    target_usd = trader.min_usd if trader else 250.0
+                    trade_exec, trade_note = self._try_open_trade(
+                        trader, res, target_usd, dry_run
+                    )
+                    if trade_exec:
+                        stats["orders_opened"] += 1
+                    msg = format_entry_message(
+                        res, kind="GREEN", trade_exec=trade_exec, trade_note=trade_note
+                    )
                     try:
                         if dry_run:
                             print(f"[DRY-RUN GREEN] {res.symbol} @ {res.price}")
@@ -201,7 +271,7 @@ class TelegramNotifier:
                         tracked[track_key] = {
                             "kind": "GREEN",
                             "bar_open_time": ev.bar_open_time,
-                            "entry_price": ev.entry_price or res.price,
+                            "entry_price": trade_exec.price if trade_exec else (ev.entry_price or res.price),
                         }
                         stats["green"] += 1
                     except Exception as exc:
@@ -211,7 +281,15 @@ class TelegramNotifier:
             elif ev.exit_trigger and (notify_all_exits or track_key in tracked):
                 alert_key = f"{track_key}:4h:EXIT:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
-                    msg = format_exit_message(res)
+                    close_exec: TradeExecution | None = None
+                    if trader and trader.is_configured and not dry_run:
+                        try:
+                            close_exec = trader.close_position(res.symbol, res.price)
+                            if close_exec:
+                                stats["orders_closed"] += 1
+                        except Exception as exc:
+                            stats["errors"].append(f"{res.symbol} CLOSE: {exc}")
+                    msg = format_exit_message(res, trade_exec=close_exec)
                     try:
                         if dry_run:
                             print(f"[DRY-RUN EXIT] {res.symbol} ({ev.exit_reason})")

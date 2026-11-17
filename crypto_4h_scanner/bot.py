@@ -15,10 +15,12 @@ import time
 from dotenv import load_dotenv
 
 from .binance_scanner import Binance4hScanner
+from .binance_trader import BinanceTrader
 from .telegram_notifier import TelegramNotifier
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_STATE_FILE = Path(__file__).resolve().parent / "alert_state.json"
+DEFAULT_TRADE_STATE_FILE = Path(__file__).resolve().parent / "trade_state.json"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,8 +30,37 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--market",
         choices=["futures", "spot"],
-        default="futures",
-        help="Taranacak Binance piyasası (varsayılan: futures)",
+        default=os.getenv("BINANCE_MARKET", "futures"),
+        help="Taranacak ve işlem açılacak Binance piyasası (varsayılan: futures)",
+    )
+    p.add_argument(
+        "--min-usd",
+        type=float,
+        default=float(os.getenv("MIN_POSITION_USD", "250")),
+        help="Minimum pozisyon büyüklüğü USD (varsayılan: 250)",
+    )
+    p.add_argument(
+        "--max-usd",
+        type=float,
+        default=float(os.getenv("MAX_POSITION_USD", "350")),
+        help="Maksimum pozisyon büyüklüğü USD (varsayılan: 350)",
+    )
+    p.add_argument(
+        "--max-positions",
+        type=int,
+        default=int(os.getenv("MAX_OPEN_POSITIONS", "3")),
+        help="Aynı anda açık olabilecek maksimum pozisyon sayısı (varsayılan: 3)",
+    )
+    p.add_argument(
+        "--leverage",
+        type=int,
+        default=int(os.getenv("LEVERAGE", "1")),
+        help="Futures kaldıraç oranı (varsayılan: 1)",
+    )
+    p.add_argument(
+        "--no-auto-trade",
+        action="store_true",
+        help="Binance API bağlı olsa bile otomatik emir açma (sadece Telegram bildirimi)",
     )
     p.add_argument(
         "--min-volume",
@@ -132,15 +163,36 @@ def main() -> None:
         print("Telegram test:", "OK" if ok else "FAILED")
         return
 
+    auto_trade_env = os.getenv("AUTO_TRADE", "true").strip().lower() not in ("0", "false", "no")
+    api_key = os.getenv("BINANCE_API_KEY", "")
+    api_secret = os.getenv("BINANCE_API_SECRET", "")
+    trader: BinanceTrader | None = None
+    if auto_trade_env and not args.no_auto_trade and api_key and api_secret:
+        trader = BinanceTrader(
+            api_key=api_key,
+            api_secret=api_secret,
+            market=args.market,
+            min_usd=args.min_usd,
+            max_usd=args.max_usd,
+            max_positions=args.max_positions,
+            leverage=args.leverage,
+            state_file=DEFAULT_TRADE_STATE_FILE,
+        )
+
     scanner = Binance4hScanner(market=args.market, max_workers=args.workers)
 
     if args.port > 0 and not args.once:
         _start_health_server(args.port)
 
+    trade_mode_str = (
+        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz)"
+        if trader
+        else "KAPALI (Sadece Bildirim)"
+    )
     print(
         f"[{datetime.now().strftime('%H:%M:%S')}] 4S Tarayıcı başlatıldı | "
-        f"Piyasa={args.market.upper()} | MinHacim=${args.min_volume:,.0f} | "
-        f"Limit={args.limit or 'TÜMÜ'} | Periyot={args.poll_seconds}sn"
+        f"Piyasa={args.market.upper()} | OtoAlım={trade_mode_str} | "
+        f"MinHacim=${args.min_volume:,.0f} | Limit={args.limit or 'TÜMÜ'} | Periyot={args.poll_seconds}sn"
     )
 
     while True:
@@ -153,6 +205,7 @@ def main() -> None:
                 results,
                 notify_all_exits=args.notify_all_exits,
                 dry_run=args.dry_run,
+                trader=trader,
             )
 
             green_now = sum(1 for r in results if r.evaluation.green_trigger)

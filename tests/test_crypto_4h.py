@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from crypto_4h_scanner.binance_scanner import Coin4hResult
+from crypto_4h_scanner.binance_trader import BinanceTrader
 from crypto_4h_scanner.indicators import (
     SystemEvaluation,
     compute_pivots,
@@ -190,6 +191,66 @@ class TestTelegramNotifier(unittest.TestCase):
             stats3 = notifier.process_results([res_exit])
             self.assertEqual(stats3["exit"], 1)
             self.assertEqual(len(sent_messages), 2)
+
+
+class TestBinanceTrader(unittest.TestCase):
+    def test_min_max_notional_and_max_three_positions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trader = BinanceTrader(
+                api_key="k",
+                api_secret="s",
+                market="futures",
+                min_usd=250.0,
+                max_usd=350.0,
+                max_positions=3,
+                leverage=1,
+                state_file=Path(tmp) / "trade_state.json",
+            )
+            trader._filters_cache = {
+                "BTCUSDT": {"stepSize": 0.001, "minQty": 0.001, "minNotional": 5.0},
+                "ETHUSDT": {"stepSize": 0.001, "minQty": 0.001, "minNotional": 5.0},
+                "SOLUSDT": {"stepSize": 0.1, "minQty": 0.1, "minNotional": 5.0},
+                "XRPUSDT": {"stepSize": 1.0, "minQty": 1.0, "minNotional": 5.0},
+            }
+            trader.get_free_usdt = lambda: 2000.0  # type: ignore[method-assign]
+            trader.get_live_open_positions = lambda: {}  # type: ignore[method-assign]
+
+            def fake_signed(method: str, path: str, params=None):
+                if path == "/fapi/v1/order":
+                    return {
+                        "orderId": 12345,
+                        "avgPrice": "100.0",
+                        "executedQty": params["quantity"],
+                    }
+                return {}
+
+            trader._signed_request = fake_signed  # type: ignore[method-assign]
+
+            # 1) Green signal ($250)
+            t1 = trader.open_position("BTCUSDT", price=100.0, target_usd=250.0)
+            self.assertIsNotNone(t1)
+            assert t1 is not None
+            self.assertGreaterEqual(t1.notional_usd, 250.0)
+
+            # 2) Orange signal ($350)
+            t2 = trader.open_position("ETHUSDT", price=100.0, target_usd=350.0)
+            self.assertIsNotNone(t2)
+            assert t2 is not None
+            self.assertLessEqual(t2.notional_usd, 350.0)
+
+            # 3) Third position allowed
+            t3 = trader.open_position("SOLUSDT", price=100.0, target_usd=350.0)
+            self.assertIsNotNone(t3)
+
+            # 4) Fourth position blocked by max_positions=3
+            t4 = trader.open_position("XRPUSDT", price=100.0, target_usd=350.0)
+            self.assertIsNone(t4)
+
+            # 5) Closing one frees a slot
+            closed = trader.close_position("BTCUSDT", fallback_price=105.0)
+            self.assertIsNotNone(closed)
+            t4_retry = trader.open_position("XRPUSDT", price=100.0, target_usd=300.0)
+            self.assertIsNotNone(t4_retry)
 
 
 if __name__ == "__main__":
