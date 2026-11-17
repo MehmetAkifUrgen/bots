@@ -1,1 +1,1 @@
-worker: python -u trader_bot.py
+worker: python -u -m crypto_4h_scanner.bot

@@ -7,3 +7,4 @@ paper_trades.csv
 trader_state.json
 trade_db.json
 .DS_Store
+crypto_4h_scanner/alert_state.json
