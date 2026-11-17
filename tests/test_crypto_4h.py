@@ -89,7 +89,7 @@ class TestCrypto4hIndicators(unittest.TestCase):
         seen_orange = False
         seen_exit = False
         for end in range(80, len(df) + 1):
-            ev = evaluate_4h_system(df.iloc[:end].copy(), df_1m=df_1m)
+            ev = evaluate_4h_system(df.iloc[:end].copy(), df_1m=df_1m, ema200_filter=False)
             self.assertIsNotNone(ev)
             assert ev is not None
             seen_green = seen_green or ev.green_trigger
@@ -124,6 +124,7 @@ class TestTelegramNotifier(unittest.TestCase):
                 cond3_buy=True,
                 cond4_buy=True,
                 cond5_buy=True,
+                trend_ok=True,
                 first_three_buy=True,
                 all_five_buy=True,
                 green_trigger=True,

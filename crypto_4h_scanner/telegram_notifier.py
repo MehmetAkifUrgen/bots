@@ -38,7 +38,7 @@ def _ind_row(ev) -> str:
 
     return (
         f"• StochRSI: {mark(ev.cond1_buy)} | RSI+MA: {mark(ev.cond2_buy)} | Fisher: {mark(ev.cond3_buy)}\n"
-        f"• WaveTrend: {mark(ev.cond4_buy)} | SMI>EMA9: {mark(ev.cond5_buy)}"
+        f"• WaveTrend: {mark(ev.cond4_buy)} | SMI>EMA9: {mark(ev.cond5_buy)} | EMA200: {mark(ev.trend_ok)}"
     )
 
 
@@ -200,6 +200,7 @@ class TelegramNotifier:
         notify_all_exits: bool = False,
         dry_run: bool = False,
         trader: BinanceTrader | None = None,
+        trade_on_green: bool = False,
     ) -> dict:
         """
         Inspect scan results, optionally execute Binance orders, and send
@@ -249,16 +250,24 @@ class TelegramNotifier:
                     except Exception as exc:
                         stats["errors"].append(f"{res.symbol} ORANGE: {exc}")
 
-            # 2. YEŞİL AL (İlk 3/5) -> Min USD ($250)
+            # 2. YEŞİL AL (İlk 3/5) -> Min USD ($250) only if trade_on_green=True
             elif ev.green_trigger:
                 alert_key = f"{track_key}:4h:GREEN:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
-                    target_usd = trader.min_usd if trader else 250.0
-                    trade_exec, trade_note = self._try_open_trade(
-                        trader, res, target_usd, dry_run
-                    )
-                    if trade_exec:
-                        stats["orders_opened"] += 1
+                    if trade_on_green:
+                        target_usd = trader.min_usd if trader else 250.0
+                        trade_exec, trade_note = self._try_open_trade(
+                            trader, res, target_usd, dry_run
+                        )
+                        if trade_exec:
+                            stats["orders_opened"] += 1
+                    else:
+                        trade_exec = None
+                        trade_note = (
+                            "Ön uyarı (3/5) — Gerçek emir sadece TURUNCU KESİN AL (5/5) onayında açılır."
+                            if (trader and trader.is_configured)
+                            else None
+                        )
                     msg = format_entry_message(
                         res, kind="GREEN", trade_exec=trade_exec, trade_note=trade_note
                     )

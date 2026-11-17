@@ -17,6 +17,7 @@ class SystemEvaluation:
     cond3_buy: bool  # 3. Fisher (9) > Fisher[1]
     cond4_buy: bool  # 4. WaveTrend (wt1 > wt2)
     cond5_buy: bool  # 5. SMI > SMI Signal & EMA9
+    trend_ok: bool   # close > EMA(200)
     first_three_buy: bool
     all_five_buy: bool
     green_trigger: bool
@@ -309,6 +310,7 @@ def evaluate_4h_system(
     df_1m: pd.DataFrame | None = None,
     pivot_len: int = 7,
     be_trigger_pct: float = 2.5,
+    ema200_filter: bool = True,
 ) -> SystemEvaluation | None:
     """
     Run the Pine Script 'Gün İçi Anlık Sistem' state machine on 4H OHLCV DataFrame.
@@ -337,6 +339,8 @@ def evaluate_4h_system(
     smi, smi_sig, smi_ema9 = stochastic_momentum_index(
         highs, lows, closes, k_len=10, d_len=3, ema_len=3, ema9_len=9
     )
+    # 6. Crypto Trend Filter (EMA 200)
+    ema200 = pine_ema(closes, 200)
 
     piv_h, piv_l = compute_pivots(highs, lows, left=pivot_len, right=pivot_len)
     h20_s = highs.rolling(window=20, min_periods=1).max()
@@ -364,6 +368,7 @@ def evaluate_4h_system(
     last_exit_pct: float | None = None
 
     last_c1 = last_c2 = last_c3 = last_c4 = last_c5 = False
+    last_trend_ok = True
     last_first3 = last_all5 = False
     last_fib_p = last_fib_r1 = last_fib_r2 = last_fib_s1 = last_fib_s2 = None
 
@@ -411,6 +416,8 @@ def evaluate_4h_system(
         bar_h = float(highs.iloc[i])
         bar_c = float(closes.iloc[i])
         bar_ts = int(open_times.iloc[i])
+        ema200_val = float(ema200.iloc[i])
+        trend_ok = True if (not ema200_filter or np.isnan(ema200_val)) else (bar_c > ema200_val)
 
         # Last bar acts as realtime (close), historical bars use avg(open, high)
         exec_price = bar_c if i == n - 1 else (bar_o + bar_h) / 2.0
@@ -427,7 +434,7 @@ def evaluate_4h_system(
         exit_pct: float | None = None
 
         # 1. YEŞİL AL
-        if first3 and not in_green_pos:
+        if first3 and trend_ok and not in_green_pos:
             green_trig = True
             in_green_pos = True
             be_locked = False
@@ -437,7 +444,7 @@ def evaluate_4h_system(
                 sl_level = _get_prev_sup(entry_price, last_sup, fib_p, fib_s1, fib_s2, l15)
 
         # 2. TURUNCU KESİN AL
-        if all5 and not in_orange_pos:
+        if all5 and trend_ok and not in_orange_pos:
             orange_trig = True
             in_orange_pos = True
             in_green_pos = True
@@ -517,6 +524,7 @@ def evaluate_4h_system(
             last_exit_price = exit_price
             last_exit_pct = exit_pct
             last_c1, last_c2, last_c3, last_c4, last_c5 = c1, c2, c3, c4, c5
+            last_trend_ok = trend_ok
             last_first3, last_all5 = first3, all5
             last_fib_p, last_fib_r1, last_fib_r2, last_fib_s1, last_fib_s2 = (
                 fib_p,
@@ -561,6 +569,7 @@ def evaluate_4h_system(
         cond3_buy=last_c3,
         cond4_buy=last_c4,
         cond5_buy=last_c5,
+        trend_ok=last_trend_ok,
         first_three_buy=last_first3,
         all_five_buy=last_all5,
         green_trigger=last_green_trig,

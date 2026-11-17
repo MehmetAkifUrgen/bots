@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -61,6 +61,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-auto-trade",
         action="store_true",
         help="Binance API bağlı olsa bile otomatik emir açma (sadece Telegram bildirimi)",
+    )
+    p.add_argument(
+        "--trade-on-green",
+        action="store_true",
+        default=os.getenv("TRADE_ON_GREEN", "false").strip().lower() in ("1", "true", "yes"),
+        help="Yeşil AL (3/5) sinyalinde de emir aç (varsayılan: sadece Turuncu 5/5)",
     )
     p.add_argument(
         "--min-volume",
@@ -206,6 +212,7 @@ def main() -> None:
                 notify_all_exits=args.notify_all_exits,
                 dry_run=args.dry_run,
                 trader=trader,
+                trade_on_green=args.trade_on_green,
             )
 
             green_now = sum(1 for r in results if r.evaluation.green_trigger)
@@ -218,7 +225,7 @@ def main() -> None:
             _HEALTH_STATE.update(
                 {
                     "status": "ok",
-                    "last_scan_at": datetime.utcnow().isoformat() + "Z",
+                    "last_scan_at": datetime.now(timezone.utc).isoformat(),
                     "total_scanned": len(results),
                     "in_positions": in_pos,
                     "last_error": None,
