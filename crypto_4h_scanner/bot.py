@@ -54,14 +54,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--leverage",
         type=int,
-        default=int(os.getenv("LEVERAGE", "10")),
-        help="Futures kaldıraç oranı (varsayılan: 10)",
+        default=int(os.getenv("LEVERAGE", "20")),
+        help="Varsayılan Futures kaldıraç oranı (gerekirse otomatik artırılır, varsayılan: 20)",
     )
     p.add_argument(
-        "--stop-loss-usd",
+        "--stop-loss-pct",
         type=float,
-        default=float(os.getenv("STOP_LOSS_USD", "3.0")),
-        help="Sabit zarar kes USD (varsayılan: 3.0)",
+        default=float(os.getenv("STOP_LOSS_PCT", "1.0")),
+        help="Pozisyon büyüklüğünün yüzde zarar kes oranı (varsayılan: 1.0)",
     )
     p.add_argument(
         "--trailing-trigger-pct",
@@ -212,7 +212,7 @@ def main() -> None:
             max_usd=args.max_usd,
             max_positions=args.max_positions,
             leverage=args.leverage,
-            stop_loss_usd=args.stop_loss_usd,
+            stop_loss_pct=args.stop_loss_pct,
             trailing_trigger_pct=args.trailing_trigger_pct,
             trailing_callback_pct=args.trailing_callback_pct,
             cooldown_minutes=args.cooldown_minutes,
@@ -226,7 +226,7 @@ def main() -> None:
         _start_health_server(args.port)
 
     trade_mode_str = (
-        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, -${args.stop_loss_usd:g} SL, +{args.trailing_trigger_pct:g}% Trail)"
+        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, -%{args.stop_loss_pct:g} SL, +{args.trailing_trigger_pct:g}% Trail)"
         if trader
         else "KAPALI (Sadece Bildirim)"
     )

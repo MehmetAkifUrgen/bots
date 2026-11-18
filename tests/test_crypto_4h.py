@@ -231,7 +231,7 @@ class TestBinanceTrader(unittest.TestCase):
                 max_usd=300.0,
                 max_positions=3,
                 leverage=10,
-                stop_loss_usd=3.0,
+                stop_loss_pct=1.0,
                 trailing_trigger_pct=1.0,
                 trailing_callback_pct=0.4,
                 trailing_floor_pct=0.3,
@@ -295,7 +295,7 @@ class TestBinanceTrader(unittest.TestCase):
                 max_usd=300.0,
                 max_positions=3,
                 leverage=10,
-                stop_loss_usd=3.0,
+                stop_loss_pct=1.0,
                 trailing_trigger_pct=1.0,
                 trailing_callback_pct=0.4,
                 trailing_floor_pct=0.3,
@@ -337,11 +337,13 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertGreater(evs[0]["pnl_usd"], 0)
             self.assertEqual(trader._state["consecutive_stops"], 0)
 
-            # 3 consecutive -$3 stops trigger cooldown
+            # 3 consecutive -1% stops trigger cooldown (even with $22 balance via auto-leverage)
+            trader.get_free_usdt = lambda: 22.0  # type: ignore[method-assign]
             for idx, sym in enumerate(("AUSDT", "BUSDT", "CUSDT"), start=1):
                 last_price["p"] = 100.0
-                trader.open_position(sym, price=100.0, target_usd=300.0)
-                last_price["p"] = 98.9  # -$3.3 on $300 notional
+                opened = trader.open_position(sym, price=100.0, target_usd=300.0)
+                self.assertIsNotNone(opened)
+                last_price["p"] = 98.9  # -1.1% <= -1.0% SL
                 stop_evs = trader.manage_open_positions({sym: 98.9})
                 self.assertEqual(len(stop_evs), 1)
                 self.assertIn("STOP", stop_evs[0]["reason"])

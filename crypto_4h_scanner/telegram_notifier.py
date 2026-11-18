@@ -84,7 +84,7 @@ def format_entry_message(
         f"🪙 <b>{res.symbol}</b> | <code>45dk (45m)</code> | {market_label}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
-        f"🛑 <b>Stop-Loss:</b> <b>-$3.00 USD</b> (Sabit Zarar Kes)\n"
+        f"🛑 <b>Stop-Loss:</b> <b>-%1.00</b> (Pozisyon büyüklüğünün %1'i)\n"
         f"📈 <b>Trailing Stop:</b> +%1.00 kârda başlar (0.4% takip, +%0.30 taban)\n"
         f"🎯 <b>45m Pivot TP/SL:</b> <code>{fmt_price(tp)}</code> (+{tp_pct:.2f}%) / <code>{fmt_price(sl)}</code> ({sl_pct:.2f}%)\n"
         f"{trade_block}"

@@ -48,8 +48,8 @@ class BinanceTrader:
         min_usd: float = 200.0,
         max_usd: float = 300.0,
         max_positions: int = 3,
-        leverage: int = 10,
-        stop_loss_usd: float = 3.0,
+        leverage: int = 20,
+        stop_loss_pct: float = 1.0,
         trailing_trigger_pct: float = 1.0,
         trailing_callback_pct: float = 0.4,
         trailing_floor_pct: float = 0.3,
@@ -66,7 +66,7 @@ class BinanceTrader:
         self.max_usd = max_usd
         self.max_positions = max_positions
         self.leverage = max(1, leverage)
-        self.stop_loss_usd = stop_loss_usd
+        self.stop_loss_pct = stop_loss_pct
         self.trailing_trigger_pct = trailing_trigger_pct
         self.trailing_callback_pct = trailing_callback_pct
         self.trailing_floor_pct = trailing_floor_pct
@@ -242,13 +242,19 @@ class BinanceTrader:
 
         notional = max(self.min_usd, min(self.max_usd, target_usd))
         free_usdt = self.get_free_usdt()
+        effective_lev = self.leverage
+        if self._is_um_futures() and free_usdt > 0:
+            # Auto-pick leverage if configured leverage is too low for $200-$300 notional
+            if free_usdt * effective_lev * 0.96 < self.min_usd:
+                needed_lev = int(math.ceil(notional / (free_usdt * 0.95)))
+                effective_lev = min(50, max(effective_lev, needed_lev))
+
         required_margin = (
-            notional / self.leverage if self._is_um_futures() else notional
+            notional / effective_lev if self._is_um_futures() else notional
         )
         if free_usdt < required_margin:
-            # Clamp down if still >= min_usd
             max_affordable_notional = (
-                free_usdt * self.leverage * 0.98
+                free_usdt * effective_lev * 0.96
                 if self._is_um_futures()
                 else free_usdt * 0.98
             )
@@ -270,14 +276,16 @@ class BinanceTrader:
         if self._is_um_futures():
             lev_path = "/papi/v1/um/leverage" if self.market == "papi" else "/fapi/v1/leverage"
             ord_path = "/papi/v1/um/order" if self.market == "papi" else "/fapi/v1/order"
-            try:
-                self._signed_request(
-                    "POST",
-                    lev_path,
-                    {"symbol": symbol, "leverage": self.leverage},
-                )
-            except Exception:
-                pass
+            for try_lev in dict.fromkeys([effective_lev, 40, 25, 20, self.leverage]):
+                try:
+                    self._signed_request(
+                        "POST",
+                        lev_path,
+                        {"symbol": symbol, "leverage": try_lev},
+                    )
+                    break
+                except Exception:
+                    continue
             res = self._signed_request(
                 "POST",
                 ord_path,
@@ -317,7 +325,7 @@ class BinanceTrader:
 
         order_id = str(res.get("orderId", ""))
         actual_not = round(exec_qty * exec_price, 2)
-        sl_price = exec_price * (1.0 - self.stop_loss_usd / max(1.0, actual_not))
+        sl_price = exec_price * (1.0 - self.stop_loss_pct / 100.0)
         self._state["open_positions"][symbol] = {
             "symbol": symbol,
             "order_id": order_id,
@@ -464,9 +472,9 @@ class BinanceTrader:
                 if curr_price <= effective_sl:
                     reason = "TRAILING STOP"
             else:
-                sl_px = float(pos.get("sl_price") or (entry_px * (1.0 - self.stop_loss_usd / max(1.0, notional))))
-                if pnl_usd <= -self.stop_loss_usd or curr_price <= sl_px:
-                    reason = f"STOP (-${self.stop_loss_usd:g})"
+                sl_px = float(pos.get("sl_price") or (entry_px * (1.0 - self.stop_loss_pct / 100.0)))
+                if pnl_pct <= -self.stop_loss_pct or curr_price <= sl_px:
+                    reason = f"STOP (-%{self.stop_loss_pct:g})"
 
             if reason:
                 closed = self.close_position(sym, fallback_price=curr_price)
