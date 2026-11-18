@@ -14,8 +14,10 @@ from crypto_4h_scanner.binance_trader import BinanceTrader
 from crypto_4h_scanner.indicators import (
     SystemEvaluation,
     compute_pivots,
+    evaluate_45m_scalp_system,
     evaluate_4h_system,
     fisher_transform,
+    resample_15m_to_45m,
     stochastic_momentum_index,
     stochastic_rsi,
     wavetrend,
@@ -106,6 +108,30 @@ class TestCrypto4hIndicators(unittest.TestCase):
         piv_h, _ = compute_pivots(highs, lows, left=7, right=7)
         self.assertTrue(np.isnan(piv_h[:14]).all())
         self.assertEqual(piv_h[14], 20.0)
+
+    def test_45m_resample_and_scalp_system(self) -> None:
+        step_ms = 15 * 60 * 1000
+        start_ts = (1_700_000_000_000 // (45 * 60 * 1000)) * (45 * 60 * 1000)
+        n = 300
+        x = np.linspace(0, 10 * np.pi, n)
+        closes = 100.0 + 5.0 * np.sin(x) + np.linspace(0, 4.0, n)
+        opens = np.roll(closes, 1)
+        opens[0] = closes[0]
+        df_15m = pd.DataFrame(
+            {
+                "open_time": [start_ts + i * step_ms for i in range(n)],
+                "open": opens,
+                "high": np.maximum(opens, closes) * 1.003,
+                "low": np.minimum(opens, closes) * 0.997,
+                "close": closes,
+                "volume": np.full(n, 100.0),
+                "close_time": [start_ts + (i + 1) * step_ms - 1 for i in range(n)],
+            }
+        )
+        df_45m = resample_15m_to_45m(df_15m)
+        self.assertEqual(len(df_45m), 100)
+        ev = evaluate_45m_scalp_system(df_45m, df_15m)
+        self.assertIsNotNone(ev)
 
 
 class TestTelegramNotifier(unittest.TestCase):
@@ -201,10 +227,16 @@ class TestBinanceTrader(unittest.TestCase):
                 api_key="k",
                 api_secret="s",
                 market="futures",
-                min_usd=250.0,
-                max_usd=350.0,
+                min_usd=200.0,
+                max_usd=300.0,
                 max_positions=3,
-                leverage=1,
+                leverage=10,
+                stop_loss_usd=3.0,
+                trailing_trigger_pct=1.0,
+                trailing_callback_pct=0.4,
+                trailing_floor_pct=0.3,
+                max_consecutive_stops=3,
+                cooldown_minutes=240,
                 state_file=Path(tmp) / "trade_state.json",
             )
             trader._filters_cache = {
@@ -227,31 +259,96 @@ class TestBinanceTrader(unittest.TestCase):
 
             trader._signed_request = fake_signed  # type: ignore[method-assign]
 
-            # 1) Green signal ($250)
+            # 1) Entry ($250)
             t1 = trader.open_position("BTCUSDT", price=100.0, target_usd=250.0)
             self.assertIsNotNone(t1)
             assert t1 is not None
-            self.assertGreaterEqual(t1.notional_usd, 250.0)
+            self.assertGreaterEqual(t1.notional_usd, 200.0)
 
-            # 2) Orange signal ($350)
-            t2 = trader.open_position("ETHUSDT", price=100.0, target_usd=350.0)
+            # 2) Entry ($300)
+            t2 = trader.open_position("ETHUSDT", price=100.0, target_usd=300.0)
             self.assertIsNotNone(t2)
             assert t2 is not None
-            self.assertLessEqual(t2.notional_usd, 350.0)
+            self.assertLessEqual(t2.notional_usd, 300.0)
 
             # 3) Third position allowed
-            t3 = trader.open_position("SOLUSDT", price=100.0, target_usd=350.0)
+            t3 = trader.open_position("SOLUSDT", price=100.0, target_usd=300.0)
             self.assertIsNotNone(t3)
 
             # 4) Fourth position blocked by max_positions=3
-            t4 = trader.open_position("XRPUSDT", price=100.0, target_usd=350.0)
+            t4 = trader.open_position("XRPUSDT", price=100.0, target_usd=300.0)
             self.assertIsNone(t4)
 
             # 5) Closing one frees a slot
             closed = trader.close_position("BTCUSDT", fallback_price=105.0)
             self.assertIsNotNone(closed)
-            t4_retry = trader.open_position("XRPUSDT", price=100.0, target_usd=300.0)
+            t4_retry = trader.open_position("XRPUSDT", price=100.0, target_usd=250.0)
             self.assertIsNotNone(t4_retry)
+
+    def test_three_dollar_sl_trailing_and_three_stop_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trader = BinanceTrader(
+                api_key="k",
+                api_secret="s",
+                market="papi",
+                min_usd=200.0,
+                max_usd=300.0,
+                max_positions=3,
+                leverage=10,
+                stop_loss_usd=3.0,
+                trailing_trigger_pct=1.0,
+                trailing_callback_pct=0.4,
+                trailing_floor_pct=0.3,
+                max_consecutive_stops=3,
+                cooldown_minutes=240,
+                state_file=Path(tmp) / "trade_state.json",
+            )
+            trader._filters_cache = {
+                "AUSDT": {"stepSize": 0.1, "minQty": 0.1, "minNotional": 5.0},
+                "BUSDT": {"stepSize": 0.1, "minQty": 0.1, "minNotional": 5.0},
+                "CUSDT": {"stepSize": 0.1, "minQty": 0.1, "minNotional": 5.0},
+                "DUSDT": {"stepSize": 0.1, "minQty": 0.1, "minNotional": 5.0},
+            }
+            trader.get_free_usdt = lambda: 500.0  # type: ignore[method-assign]
+            trader.get_live_open_positions = lambda: {}  # type: ignore[method-assign]
+
+            last_price = {"p": 100.0}
+
+            def fake_signed(method: str, path: str, params=None):
+                if path == "/papi/v1/um/order":
+                    return {
+                        "orderId": 999,
+                        "avgPrice": str(last_price["p"]),
+                        "executedQty": params["quantity"],
+                    }
+                return {}
+
+            trader._signed_request = fake_signed  # type: ignore[method-assign]
+
+            # Trailing stop test: open at 100, peak at 102 (+2%), pullback to 101.5 (< 102*0.996=101.592) -> closes in profit
+            last_price["p"] = 100.0
+            trader.open_position("AUSDT", price=100.0, target_usd=300.0)
+            self.assertEqual(len(trader.manage_open_positions({"AUSDT": 102.0})), 0)
+            self.assertTrue(trader._state["open_positions"]["AUSDT"]["trailing_active"])
+            last_price["p"] = 101.5
+            evs = trader.manage_open_positions({"AUSDT": 101.5})
+            self.assertEqual(len(evs), 1)
+            self.assertEqual(evs[0]["reason"], "TRAILING STOP")
+            self.assertGreater(evs[0]["pnl_usd"], 0)
+            self.assertEqual(trader._state["consecutive_stops"], 0)
+
+            # 3 consecutive -$3 stops trigger cooldown
+            for idx, sym in enumerate(("AUSDT", "BUSDT", "CUSDT"), start=1):
+                last_price["p"] = 100.0
+                trader.open_position(sym, price=100.0, target_usd=300.0)
+                last_price["p"] = 98.9  # -$3.3 on $300 notional
+                stop_evs = trader.manage_open_positions({sym: 98.9})
+                self.assertEqual(len(stop_evs), 1)
+                self.assertIn("STOP", stop_evs[0]["reason"])
+                self.assertEqual(trader._state["consecutive_stops"], idx)
+
+            self.assertTrue(trader.is_in_cooldown())
+            self.assertIsNone(trader.open_position("DUSDT", price=100.0, target_usd=250.0))
 
 
 if __name__ == "__main__":

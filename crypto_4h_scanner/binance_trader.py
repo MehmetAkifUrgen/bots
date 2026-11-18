@@ -45,10 +45,16 @@ class BinanceTrader:
         api_key: str,
         api_secret: str,
         market: MarketType = "futures",
-        min_usd: float = 250.0,
-        max_usd: float = 350.0,
+        min_usd: float = 200.0,
+        max_usd: float = 300.0,
         max_positions: int = 3,
-        leverage: int = 1,
+        leverage: int = 10,
+        stop_loss_usd: float = 3.0,
+        trailing_trigger_pct: float = 1.0,
+        trailing_callback_pct: float = 0.4,
+        trailing_floor_pct: float = 0.3,
+        max_consecutive_stops: int = 3,
+        cooldown_minutes: int = 240,
         state_file: Path | None = None,
         timeout: float = 10.0,
         proxy_url: str = "",
@@ -60,6 +66,12 @@ class BinanceTrader:
         self.max_usd = max_usd
         self.max_positions = max_positions
         self.leverage = max(1, leverage)
+        self.stop_loss_usd = stop_loss_usd
+        self.trailing_trigger_pct = trailing_trigger_pct
+        self.trailing_callback_pct = trailing_callback_pct
+        self.trailing_floor_pct = trailing_floor_pct
+        self.max_consecutive_stops = max_consecutive_stops
+        self.cooldown_minutes = cooldown_minutes
         self.state_file = state_file or (
             Path(__file__).resolve().parent / "trade_state.json"
         )
@@ -83,10 +95,29 @@ class BinanceTrader:
                 data = json.loads(self.state_file.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
                     data.setdefault("open_positions", {})
+                    data.setdefault("consecutive_stops", 0)
+                    data.setdefault("cooldown_until", 0)
                     return data
             except Exception:
                 pass
-        return {"open_positions": {}}
+        return {"open_positions": {}, "consecutive_stops": 0, "cooldown_until": 0}
+
+    def is_in_cooldown(self) -> bool:
+        until = int(self._state.get("cooldown_until", 0))
+        if until <= 0:
+            return False
+        if time.time() < until:
+            return True
+        # Cooldown expired -> reset counter
+        self._state["cooldown_until"] = 0
+        self._state["consecutive_stops"] = 0
+        self._save_state()
+        return False
+
+    def cooldown_remaining_min(self) -> int:
+        until = int(self._state.get("cooldown_until", 0))
+        rem = int(max(0, (until - time.time()) / 60))
+        return rem
 
     def _save_state(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -196,7 +227,9 @@ class BinanceTrader:
     def open_position(
         self, symbol: str, price: float, target_usd: float
     ) -> TradeExecution | None:
-        """Open a BUY/LONG position if under max_positions and balance allows."""
+        """Open a BUY/LONG position if under max_positions, not in cooldown, and balance allows."""
+        if self.is_in_cooldown():
+            return None
         live_open = self.get_live_open_positions()
         tracked = self._state["open_positions"]
 
@@ -283,12 +316,17 @@ class BinanceTrader:
                 exec_price = price
 
         order_id = str(res.get("orderId", ""))
+        actual_not = round(exec_qty * exec_price, 2)
+        sl_price = exec_price * (1.0 - self.stop_loss_usd / max(1.0, actual_not))
         self._state["open_positions"][symbol] = {
             "symbol": symbol,
             "order_id": order_id,
             "entry_price": exec_price,
             "qty": exec_qty,
-            "notional_usd": round(exec_qty * exec_price, 2),
+            "notional_usd": actual_not,
+            "sl_price": sl_price,
+            "peak_price": exec_price,
+            "trailing_active": False,
             "opened_at": int(time.time()),
         }
         self._save_state()
@@ -299,7 +337,7 @@ class BinanceTrader:
             order_id=order_id,
             price=exec_price,
             qty=exec_qty,
-            notional_usd=round(exec_qty * exec_price, 2),
+            notional_usd=actual_not,
         )
 
     def close_position(self, symbol: str, fallback_price: float) -> TradeExecution | None:
@@ -355,7 +393,18 @@ class BinanceTrader:
                 exec_qty = float(res.get("executedQty") or qty)
                 exec_price = fallback_price
 
-        self._state["open_positions"].pop(symbol, None)
+        prev_pos = self._state["open_positions"].pop(symbol, None)
+        entry_px = float((prev_pos or pos).get("entry_price") or exec_price)
+        pnl_usd = (exec_price - entry_px) * exec_qty
+
+        if pnl_usd < 0:
+            self._state["consecutive_stops"] = int(self._state.get("consecutive_stops", 0)) + 1
+            if self._state["consecutive_stops"] >= self.max_consecutive_stops:
+                self._state["cooldown_until"] = int(time.time() + self.cooldown_minutes * 60)
+        else:
+            self._state["consecutive_stops"] = 0
+            self._state["cooldown_until"] = 0
+
         self._save_state()
 
         return TradeExecution(
@@ -366,3 +415,80 @@ class BinanceTrader:
             qty=exec_qty,
             notional_usd=round(exec_qty * exec_price, 2),
         )
+
+    def manage_open_positions(self, price_map: dict[str, float]) -> list[dict]:
+        """
+        Monitor open positions in state against live prices:
+        - Close at -$3 USD Stop-Loss
+        - Activate Trailing Stop at +1.0% profit, trail by trailing_callback_pct (floor +0.3%)
+        Returns list of closed trade event dicts.
+        """
+        events: list[dict] = []
+        open_syms = list(self._state["open_positions"].keys())
+        state_dirty = False
+
+        for sym in open_syms:
+            pos = self._state["open_positions"].get(sym)
+            if not pos:
+                continue
+            curr_price = price_map.get(sym)
+            if curr_price is None or curr_price <= 0:
+                continue
+
+            entry_px = float(pos["entry_price"])
+            qty = float(pos["qty"])
+            notional = float(pos.get("notional_usd") or (entry_px * qty))
+            pnl_usd = (curr_price - entry_px) * qty
+            pnl_pct = ((curr_price - entry_px) / entry_px) * 100.0 if entry_px > 0 else 0.0
+
+            # Update peak & trailing state
+            peak_px = max(float(pos.get("peak_price") or entry_px), curr_price)
+            if peak_px > float(pos.get("peak_price") or 0.0):
+                pos["peak_price"] = peak_px
+                state_dirty = True
+
+            trailing_active = bool(pos.get("trailing_active", False))
+            if not trailing_active and pnl_pct >= self.trailing_trigger_pct:
+                trailing_active = True
+                pos["trailing_active"] = True
+                state_dirty = True
+
+            reason: str | None = None
+            if trailing_active:
+                floor_sl = entry_px * (1.0 + self.trailing_floor_pct / 100.0)
+                trail_sl = peak_px * (1.0 - self.trailing_callback_pct / 100.0)
+                effective_sl = max(floor_sl, trail_sl)
+                if effective_sl > float(pos.get("sl_price") or 0.0):
+                    pos["sl_price"] = effective_sl
+                    state_dirty = True
+                if curr_price <= effective_sl:
+                    reason = "TRAILING STOP"
+            else:
+                sl_px = float(pos.get("sl_price") or (entry_px * (1.0 - self.stop_loss_usd / max(1.0, notional))))
+                if pnl_usd <= -self.stop_loss_usd or curr_price <= sl_px:
+                    reason = f"STOP (-${self.stop_loss_usd:g})"
+
+            if reason:
+                closed = self.close_position(sym, fallback_price=curr_price)
+                if closed:
+                    realized_usd = (closed.price - entry_px) * closed.qty
+                    realized_pct = ((closed.price - entry_px) / entry_px) * 100.0 if entry_px > 0 else 0.0
+                    events.append(
+                        {
+                            "symbol": sym,
+                            "reason": reason,
+                            "entry_price": entry_px,
+                            "exit_price": closed.price,
+                            "pnl_usd": round(realized_usd, 2),
+                            "pnl_pct": round(realized_pct, 2),
+                            "order_id": closed.order_id,
+                            "cooldown_triggered": self.is_in_cooldown(),
+                            "cooldown_minutes": self.cooldown_minutes,
+                            "consecutive_stops": int(self._state.get("consecutive_stops", 0)),
+                        }
+                    )
+
+        if state_dirty:
+            self._save_state()
+
+        return events

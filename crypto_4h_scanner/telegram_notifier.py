@@ -38,7 +38,7 @@ def _ind_row(ev) -> str:
 
     return (
         f"• StochRSI: {mark(ev.cond1_buy)} | RSI+MA: {mark(ev.cond2_buy)} | Fisher: {mark(ev.cond3_buy)}\n"
-        f"• WaveTrend: {mark(ev.cond4_buy)} | SMI>EMA9: {mark(ev.cond5_buy)} | EMA200: {mark(ev.trend_ok)}"
+        f"• WaveTrend: {mark(ev.cond4_buy)} | SMI>EMA9: {mark(ev.cond5_buy)} | 15m EMA50: {mark(ev.trend_ok)}"
     )
 
 
@@ -49,7 +49,11 @@ def format_entry_message(
     trade_note: str | None = None,
 ) -> str:
     ev = res.evaluation
-    market_label = "FUTURES (USDT-M)" if res.market == "futures" else "SPOT (USDT)"
+    market_label = (
+        "PORTFOLIO MARGIN"
+        if res.market == "papi"
+        else "FUTURES (USDT-M)" if res.market == "futures" else "SPOT (USDT)"
+    )
     if kind == "ORANGE":
         header = "🟠 <b>TURUNCU KESİN AL (5/5)</b>"
     else:
@@ -77,20 +81,40 @@ def format_entry_message(
 
     return (
         f"{header}\n"
-        f"🪙 <b>{res.symbol}</b> | <code>4S (4H)</code> | {market_label}\n"
+        f"🪙 <b>{res.symbol}</b> | <code>45dk (45m)</code> | {market_label}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
-        f"🎯 <b>Kâr Al (TP):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
-        f"🛑 <b>Stop (SL):</b> <code>{fmt_price(sl)}</code> (<b>{sl_pct:.2f}%</b>)\n"
-        f"🔒 <b>Kâr Kilidi:</b> +%2.50 görünce SL → +%0.30\n"
+        f"🛑 <b>Stop-Loss:</b> <b>-$3.00 USD</b> (Sabit Zarar Kes)\n"
+        f"📈 <b>Trailing Stop:</b> +%1.00 kârda başlar (0.4% takip, +%0.30 taban)\n"
+        f"🎯 <b>45m Pivot TP/SL:</b> <code>{fmt_price(tp)}</code> (+{tp_pct:.2f}%) / <code>{fmt_price(sl)}</code> ({sl_pct:.2f}%)\n"
         f"{trade_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>5'li İndikatör Durumu:</b>\n"
+        f"📊 <b>5'li İndikatör + 15dk Trend:</b>\n"
         f"{_ind_row(ev)}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 <b>4S Backtest:</b> %{ev.win_rate:.1f} Başarı ({ev.win_trades}/{ev.total_trades} işlem) | Getiri: %{ev.total_profit_pct:+.1f}\n"
+        f"📈 <b>45dk Backtest:</b> %{ev.win_rate:.1f} Başarı ({ev.win_trades}/{ev.total_trades} işlem) | Getiri: %{ev.total_profit_pct:+.1f}\n"
         f"💧 <b>24s Hacim:</b> {fmt_vol(res.volume_24h_usdt)} | 24s: {res.change_24h:+.2f}%\n"
         f"🕒 <i>Mum: {bar_dt}</i>"
+    )
+
+
+def format_managed_close_message(ev_dict: dict) -> str:
+    pnl_usd = float(ev_dict["pnl_usd"])
+    pnl_pct = float(ev_dict["pnl_pct"])
+    icon = "💰" if pnl_usd >= 0 else "🛑"
+    cooldown_line = ""
+    if ev_dict.get("cooldown_triggered"):
+        cooldown_line = (
+            f"\n⏸️ <b>MOLA:</b> Art arda 3 işlem stop oldu, "
+            f"<b>{ev_dict.get('cooldown_minutes', 240)} dk</b> yeni işlem açılmayacak."
+        )
+    return (
+        f"{icon} <b>POZİSYON KAPATILDI — {ev_dict['reason']}</b>\n"
+        f"🪙 <b>{ev_dict['symbol']}</b> | <code>45dk</code>\n"
+        f"💵 <b>Giriş:</b> <code>{fmt_price(ev_dict['entry_price'])}</code> → <b>Çıkış:</b> <code>{fmt_price(ev_dict['exit_price'])}</code>\n"
+        f"📊 <b>Net Kâr/Zarar:</b> <b>${pnl_usd:+.2f} ({pnl_pct:+.2f}%)</b>\n"
+        f"🧾 <b>Emir ID:</b> <code>{ev_dict['order_id']}</code>"
+        f"{cooldown_line}"
     )
 
 
@@ -99,7 +123,11 @@ def format_exit_message(
     trade_exec: TradeExecution | None = None,
 ) -> str:
     ev = res.evaluation
-    market_label = "FUTURES (USDT-M)" if res.market == "futures" else "SPOT (USDT)"
+    market_label = (
+        "PORTFOLIO MARGIN"
+        if res.market == "papi"
+        else "FUTURES (USDT-M)" if res.market == "futures" else "SPOT (USDT)"
+    )
     pct = ev.exit_trade_pct or 0.0
     icon = "💰" if pct > 0 else "🔴"
     reason = ev.exit_reason or "ÇIKIŞ"
@@ -183,6 +211,12 @@ class TelegramNotifier:
     ) -> tuple[TradeExecution | None, str | None]:
         if trader is None or not trader.is_configured or dry_run:
             return None, None
+        if trader.is_in_cooldown():
+            rem = trader.cooldown_remaining_min()
+            return (
+                None,
+                f"Mola aktif (art arda 3 stop) — {rem} dk boyunca yeni emir açılmayacak.",
+            )
         try:
             exec_res = trader.open_position(res.symbol, res.price, target_usd)
             if exec_res is None:
@@ -203,8 +237,8 @@ class TelegramNotifier:
         trade_on_green: bool = False,
     ) -> dict:
         """
-        Inspect scan results, optionally execute Binance orders, and send
-        Telegram notifications for new entries and exits of tracked positions.
+        1) Manage open Binance positions (-$3 SL & +1% Trailing Stop)
+        2) Inspect 45m scan results, open orders on 5/5 ORANGE, and send Telegram alerts.
         """
         sent_alerts: dict[str, int] = self._state["sent_alerts"]
         tracked: dict[str, dict] = self._state["tracked_positions"]
@@ -218,15 +252,29 @@ class TelegramNotifier:
             "errors": [],
         }
 
+        if trader and trader.is_configured and not dry_run:
+            price_map = {r.symbol: r.price for r in results}
+            try:
+                closed_events = trader.manage_open_positions(price_map)
+                for ev_dict in closed_events:
+                    stats["orders_closed"] += 1
+                    stats["exit"] += 1
+                    try:
+                        self.send_text(format_managed_close_message(ev_dict))
+                    except Exception as exc:
+                        stats["errors"].append(f"{ev_dict['symbol']} CLOSE MSG: {exc}")
+            except Exception as exc:
+                stats["errors"].append(f"MANAGE_POS: {exc}")
+
         for res in results:
             ev = res.evaluation
             track_key = f"{res.market}:{res.symbol}"
 
-            # 1. TURUNCU KESİN AL (5/5) -> Max USD ($350)
+            # 1. TURUNCU KESİN AL (5/5) -> $200-$300 (uses max_usd, clamped to balance)
             if ev.orange_trigger:
-                alert_key = f"{track_key}:4h:ORANGE:{ev.bar_open_time}"
+                alert_key = f"{track_key}:45m:ORANGE:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
-                    target_usd = trader.max_usd if trader else 350.0
+                    target_usd = trader.max_usd if trader else 300.0
                     trade_exec, trade_note = self._try_open_trade(
                         trader, res, target_usd, dry_run
                     )
@@ -250,12 +298,12 @@ class TelegramNotifier:
                     except Exception as exc:
                         stats["errors"].append(f"{res.symbol} ORANGE: {exc}")
 
-            # 2. YEŞİL AL (İlk 3/5) -> Min USD ($250) only if trade_on_green=True
+            # 2. YEŞİL AL (İlk 3/5) -> Ön uyarı (trade_on_green=False by default)
             elif ev.green_trigger:
-                alert_key = f"{track_key}:4h:GREEN:{ev.bar_open_time}"
+                alert_key = f"{track_key}:45m:GREEN:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
                     if trade_on_green:
-                        target_usd = trader.min_usd if trader else 250.0
+                        target_usd = trader.min_usd if trader else 200.0
                         trade_exec, trade_note = self._try_open_trade(
                             trader, res, target_usd, dry_run
                         )
@@ -264,7 +312,7 @@ class TelegramNotifier:
                     else:
                         trade_exec = None
                         trade_note = (
-                            "Ön uyarı (3/5) — Gerçek emir sadece TURUNCU KESİN AL (5/5) onayında açılır."
+                            "Ön uyarı (3/5) — Emir sadece TURUNCU KESİN AL (5/5) onayında açılır."
                             if (trader and trader.is_configured)
                             else None
                         )
@@ -286,19 +334,11 @@ class TelegramNotifier:
                     except Exception as exc:
                         stats["errors"].append(f"{res.symbol} GREEN: {exc}")
 
-            # 3. ÇIKIŞ (for tracked positions or all if requested)
-            elif ev.exit_trigger and (notify_all_exits or track_key in tracked):
-                alert_key = f"{track_key}:4h:EXIT:{ev.bar_open_time}"
+            # 3. İndikatör ÇIKIŞ bildirimi (only when trader is NOT managing live SL/Trailing, or notify_all_exits)
+            elif ev.exit_trigger and (notify_all_exits or (track_key in tracked and not (trader and trader.is_configured))):
+                alert_key = f"{track_key}:45m:EXIT:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
-                    close_exec: TradeExecution | None = None
-                    if trader and trader.is_configured and not dry_run:
-                        try:
-                            close_exec = trader.close_position(res.symbol, res.price)
-                            if close_exec:
-                                stats["orders_closed"] += 1
-                        except Exception as exc:
-                            stats["errors"].append(f"{res.symbol} CLOSE: {exc}")
-                    msg = format_exit_message(res, trade_exec=close_exec)
+                    msg = format_exit_message(res)
                     try:
                         if dry_run:
                             print(f"[DRY-RUN EXIT] {res.symbol} ({ev.exit_reason})")

@@ -11,7 +11,11 @@ from typing import Literal
 import pandas as pd
 import requests
 
-from .indicators import SystemEvaluation, evaluate_4h_system
+from .indicators import (
+    SystemEvaluation,
+    evaluate_45m_scalp_system,
+    resample_15m_to_45m,
+)
 
 FAPI_BASE = "https://fapi.binance.com"
 SPOT_BASE = "https://api.binance.com"
@@ -142,9 +146,9 @@ class Binance4hScanner:
 
     def _scan_one(self, coin: dict) -> Coin4hResult | None:
         sym = coin["symbol"]
-        df_4h = self.fetch_klines(sym, interval="4h", limit=300)
-        df_1m = self.fetch_klines(sym, interval="1M", limit=12)
-        ev = evaluate_4h_system(df_4h, df_1m=df_1m, pivot_len=7, be_trigger_pct=2.5)
+        df_15m = self.fetch_klines(sym, interval="15m", limit=900)
+        df_45m = resample_15m_to_45m(df_15m)
+        ev = evaluate_45m_scalp_system(df_45m, df_15m=df_15m)
         if ev is None:
             return None
         return Coin4hResult(

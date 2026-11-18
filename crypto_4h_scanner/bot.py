@@ -36,14 +36,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--min-usd",
         type=float,
-        default=float(os.getenv("MIN_POSITION_USD", "250")),
-        help="Minimum pozisyon büyüklüğü USD (varsayılan: 250)",
+        default=float(os.getenv("MIN_POSITION_USD", "200")),
+        help="Minimum pozisyon büyüklüğü USD (varsayılan: 200)",
     )
     p.add_argument(
         "--max-usd",
         type=float,
-        default=float(os.getenv("MAX_POSITION_USD", "350")),
-        help="Maksimum pozisyon büyüklüğü USD (varsayılan: 350)",
+        default=float(os.getenv("MAX_POSITION_USD", "300")),
+        help="Maksimum pozisyon büyüklüğü USD (varsayılan: 300)",
     )
     p.add_argument(
         "--max-positions",
@@ -54,8 +54,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--leverage",
         type=int,
-        default=int(os.getenv("LEVERAGE", "1")),
-        help="Futures kaldıraç oranı (varsayılan: 1)",
+        default=int(os.getenv("LEVERAGE", "10")),
+        help="Futures kaldıraç oranı (varsayılan: 10)",
+    )
+    p.add_argument(
+        "--stop-loss-usd",
+        type=float,
+        default=float(os.getenv("STOP_LOSS_USD", "3.0")),
+        help="Sabit zarar kes USD (varsayılan: 3.0)",
+    )
+    p.add_argument(
+        "--trailing-trigger-pct",
+        type=float,
+        default=float(os.getenv("TRAILING_TRIGGER_PCT", "1.0")),
+        help="Trailing stop başlangıç kâr yüzdesi (varsayılan: 1.0)",
+    )
+    p.add_argument(
+        "--trailing-callback-pct",
+        type=float,
+        default=float(os.getenv("TRAILING_CALLBACK_PCT", "0.4")),
+        help="Trailing stop geri çekilme yüzdesi (varsayılan: 0.4)",
+    )
+    p.add_argument(
+        "--cooldown-minutes",
+        type=int,
+        default=int(os.getenv("COOLDOWN_MINUTES", "240")),
+        help="Art arda 3 stop sonrası mola süresi dakika (varsayılan: 240)",
     )
     p.add_argument(
         "--no-auto-trade",
@@ -65,8 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--trade-on-green",
         action="store_true",
-        default=os.getenv("TRADE_ON_GREEN", "true").strip().lower() in ("1", "true", "yes"),
-        help="Yeşil AL (3/5) sinyalinde de emir aç (varsayılan: açık)",
+        default=os.getenv("TRADE_ON_GREEN", "false").strip().lower() in ("1", "true", "yes"),
+        help="Yeşil AL (3/5) sinyalinde de emir aç (varsayılan: kapalı, sadece 5/5)",
     )
     p.add_argument(
         "--min-volume",
@@ -188,6 +212,10 @@ def main() -> None:
             max_usd=args.max_usd,
             max_positions=args.max_positions,
             leverage=args.leverage,
+            stop_loss_usd=args.stop_loss_usd,
+            trailing_trigger_pct=args.trailing_trigger_pct,
+            trailing_callback_pct=args.trailing_callback_pct,
+            cooldown_minutes=args.cooldown_minutes,
             state_file=DEFAULT_TRADE_STATE_FILE,
             proxy_url=proxy_url,
         )
@@ -198,12 +226,12 @@ def main() -> None:
         _start_health_server(args.port)
 
     trade_mode_str = (
-        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz)"
+        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, -${args.stop_loss_usd:g} SL, +{args.trailing_trigger_pct:g}% Trail)"
         if trader
         else "KAPALI (Sadece Bildirim)"
     )
     print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] 4S Tarayıcı başlatıldı | "
+        f"[{datetime.now().strftime('%H:%M:%S')}] 45dk Ultra Scalp Tarayıcı başlatıldı | "
         f"Piyasa={args.market.upper()} | OtoAlım={trade_mode_str} | "
         f"MinHacim=${args.min_volume:,.0f} | Limit={args.limit or 'TÜMÜ'} | Periyot={args.poll_seconds}sn"
     )
