@@ -42,14 +42,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--min-win-rate",
         type=float,
-        default=float(os.getenv("MIN_WIN_RATE", "60.0")),
-        help="Minimum coin başarı oranı yüzdesi (varsayılan: 60.0)",
+        default=float(os.getenv("MIN_WIN_RATE", "55.0")),
+        help="Minimum coin başarı oranı yüzdesi (varsayılan: 55.0)",
     )
     p.add_argument(
         "--min-profit-pct",
         type=float,
-        default=float(os.getenv("MIN_PROFIT_PCT", "200.0")),
-        help="Minimum coin toplam getiri yüzdesi (varsayılan: 200.0)",
+        default=float(os.getenv("MIN_PROFIT_PCT", "180.0")),
+        help="Minimum coin toplam getiri yüzdesi (varsayılan: 180.0)",
     )
     p.add_argument(
         "--min-usd",
