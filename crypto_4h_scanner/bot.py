@@ -35,9 +35,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--timeframe",
-        choices=["1h", "15m"],
-        default=os.getenv("SCAN_TIMEFRAME", "1h"),
-        help="Tarama zaman dilimi: 1h (1S İdeal Mod) veya 15m (varsayılan: 1h)",
+        choices=["45m", "1h", "15m"],
+        default=os.getenv("SCAN_TIMEFRAME", "45m"),
+        help="Tarama zaman dilimi: 45m, 1h veya 15m (varsayılan: 45m)",
+    )
+    p.add_argument(
+        "--min-win-rate",
+        type=float,
+        default=float(os.getenv("MIN_WIN_RATE", "60.0")),
+        help="Minimum coin başarı oranı yüzdesi (varsayılan: 60.0)",
+    )
+    p.add_argument(
+        "--min-profit-pct",
+        type=float,
+        default=float(os.getenv("MIN_PROFIT_PCT", "200.0")),
+        help="Minimum coin toplam getiri yüzdesi (varsayılan: 200.0)",
     )
     p.add_argument(
         "--min-usd",
@@ -254,12 +266,12 @@ def main() -> None:
     active_stop_pct = (
         args.stop_loss_pct
         if args.stop_loss_pct > 0
-        else (1.50 if args.timeframe == "15m" else 2.20)
+        else (1.50 if args.timeframe == "15m" else (2.50 if args.timeframe == "45m" else 2.20))
     )
     active_be_pct = (
         args.trailing_trigger_pct
         if args.trailing_trigger_pct > 0
-        else (1.20 if args.timeframe == "15m" else 2.00)
+        else (1.20 if args.timeframe == "15m" else (2.20 if args.timeframe == "45m" else 2.00))
     )
 
     trader: BinanceTrader | None = None
@@ -306,10 +318,11 @@ def main() -> None:
         if trader
         else "KAPALI (Sadece Bildirim)"
     )
-    tf_title = "15dk" if args.timeframe == "15m" else "1S (1h İdeal Mod)"
+    tf_title = "15dk" if args.timeframe == "15m" else ("45dk" if args.timeframe == "45m" else "1S (1h)")
     print(
         f"[{datetime.now().strftime('%H:%M:%S')}] Kripto {tf_title} 5'li Tarayıcı başlatıldı | "
         f"Piyasa={args.market.upper()} | OtoAlım={trade_mode_str} | "
+        f"Filtre=WR>={args.min_win_rate:g}% & Getiri>={args.min_profit_pct:g}% | "
         f"MinHacim=${args.min_volume:,.0f} | Limit={args.limit or 'TÜMÜ'} | Periyot={args.poll_seconds}sn"
     )
 
@@ -325,6 +338,8 @@ def main() -> None:
                 dry_run=args.dry_run,
                 trader=trader,
                 trade_on_green=args.trade_on_green,
+                min_win_rate=args.min_win_rate,
+                min_profit_pct=args.min_profit_pct,
             )
 
             green_now = sum(1 for r in results if r.evaluation.green_trigger)

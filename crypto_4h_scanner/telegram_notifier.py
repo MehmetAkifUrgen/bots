@@ -79,11 +79,11 @@ def format_entry_message(
     elif trade_note:
         trade_block = f"\nℹ️ <i>{trade_note}</i>\n"
 
-    tf = getattr(res, "timeframe", "1h")
-    tf_badge = "15dk (15m)" if tf == "15m" else "1S (1h)"
+    tf = getattr(res, "timeframe", "45m")
+    tf_badge = "15dk (15m)" if tf == "15m" else ("45dk (45m)" if tf == "45m" else "1S (1h)")
     htf_label = "1S EMA50" if tf == "15m" else "4S EMA50"
-    stop_lbl = "1.50" if tf == "15m" else "2.20"
-    be_lbl = "1.20" if tf == "15m" else "2.00"
+    stop_lbl = "1.50" if tf == "15m" else ("2.50" if tf == "45m" else "2.20")
+    be_lbl = "1.20" if tf == "15m" else ("2.20" if tf == "45m" else "2.00")
 
     return (
         f"{header}\n"
@@ -280,6 +280,8 @@ class TelegramNotifier:
         dry_run: bool = False,
         trader: BinanceTrader | None = None,
         trade_on_green: bool = False,
+        min_win_rate: float = 0.0,
+        min_profit_pct: float = -1e9,
     ) -> dict:
         """
         1) Manage open Binance positions (-$3 SL & +1% Trailing Stop)
@@ -314,9 +316,12 @@ class TelegramNotifier:
         for res in results:
             ev = res.evaluation
             track_key = f"{res.market}:{res.symbol}"
+            quality_ok = (
+                ev.win_rate >= min_win_rate and ev.total_profit_pct >= min_profit_pct
+            )
 
-            # 1. TURUNCU KESİN AL (5/5) -> $200-$300 (uses max_usd, clamped to balance)
-            if ev.orange_trigger:
+            # 1. TURUNCU KESİN AL (5/5) -> $200-$300 (only if coin passes WR & Profit filter)
+            if ev.orange_trigger and quality_ok:
                 alert_key = f"{track_key}:{res.timeframe}:ORANGE:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
                     target_usd = trader.max_usd if trader else 300.0
@@ -343,8 +348,8 @@ class TelegramNotifier:
                     except Exception as exc:
                         stats["errors"].append(f"{res.symbol} ORANGE: {exc}")
 
-            # 2. YEŞİL AL (İlk 3/5) -> Ön uyarı (trade_on_green=False by default)
-            elif ev.green_trigger:
+            # 2. YEŞİL AL (İlk 3/5) -> Ön uyarı (only if coin passes WR & Profit filter)
+            elif ev.green_trigger and quality_ok:
                 alert_key = f"{track_key}:{res.timeframe}:GREEN:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
                     if trade_on_green:

@@ -14,13 +14,14 @@ import requests
 from .indicators import (
     SystemEvaluation,
     evaluate_1h_15m_system,
+    resample_15m_to_45m,
 )
 
 FAPI_BASE = "https://fapi.binance.com"
 SPOT_BASE = "https://api.binance.com"
 
 MarketType = Literal["futures", "papi", "spot"]
-TimeframeType = Literal["1h", "15m"]
+TimeframeType = Literal["45m", "1h", "15m"]
 
 
 @dataclass
@@ -31,7 +32,7 @@ class Coin4hResult:
     change_24h: float
     volume_24h_usdt: float
     evaluation: SystemEvaluation
-    timeframe: TimeframeType = "1h"
+    timeframe: TimeframeType = "45m"
 
 
 def _klines_to_df(raw: list[list]) -> pd.DataFrame:
@@ -52,7 +53,7 @@ class Binance4hScanner:
     def __init__(
         self,
         market: MarketType = "futures",
-        timeframe: TimeframeType = "1h",
+        timeframe: TimeframeType = "45m",
         max_workers: int = 12,
         timeout: float = 10.0,
     ) -> None:
@@ -131,7 +132,11 @@ class Binance4hScanner:
         return coins
 
     def fetch_klines(
-        self, symbol: str, interval: str, limit: int
+        self,
+        symbol: str,
+        interval: str,
+        limit: int,
+        end_time: int | None = None,
     ) -> pd.DataFrame:
         sess = self._get_session()
         if self.market in ("futures", "papi"):
@@ -139,17 +144,38 @@ class Binance4hScanner:
         else:
             url = f"{SPOT_BASE}/api/v3/klines"
 
-        resp = sess.get(
-            url,
-            params={"symbol": symbol, "interval": interval, "limit": limit},
-            timeout=self.timeout,
-        )
+        params: dict = {"symbol": symbol, "interval": interval, "limit": limit}
+        if end_time is not None:
+            params["endTime"] = end_time
+        resp = sess.get(url, params=params, timeout=self.timeout)
         resp.raise_for_status()
         return _klines_to_df(resp.json())
 
     def _scan_one(self, coin: dict) -> Coin4hResult | None:
         sym = coin["symbol"]
-        if self.timeframe == "15m":
+        if self.timeframe == "45m":
+            # Fetch 2 pages of 15m (up to 3000 bars -> ~1000 45m bars / ~31 days)
+            df_15m_recent = self.fetch_klines(sym, interval="15m", limit=1500)
+            if not df_15m_recent.empty:
+                first_ts = int(df_15m_recent["open_time"].iloc[0])
+                try:
+                    df_15m_older = self.fetch_klines(
+                        sym, interval="15m", limit=1500, end_time=first_ts - 1
+                    )
+                    df_15m = (
+                        pd.concat([df_15m_older, df_15m_recent], ignore_index=True)
+                        .drop_duplicates(subset=["open_time"])
+                        .sort_values("open_time")
+                        .reset_index(drop=True)
+                    )
+                except Exception:
+                    df_15m = df_15m_recent
+            else:
+                df_15m = df_15m_recent
+            df_ltf = resample_15m_to_45m(df_15m)
+            df_trend = self.fetch_klines(sym, interval="4h", limit=250)
+            df_pivot = self.fetch_klines(sym, interval="1d", limit=45)
+        elif self.timeframe == "15m":
             df_ltf = self.fetch_klines(sym, interval="15m", limit=300)
             df_trend = self.fetch_klines(sym, interval="1h", limit=120)
             df_pivot = self.fetch_klines(sym, interval="4h", limit=60)
