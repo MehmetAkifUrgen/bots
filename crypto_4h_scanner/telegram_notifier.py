@@ -82,8 +82,6 @@ def format_entry_message(
     tf = getattr(res, "timeframe", "45m")
     tf_badge = "15dk (15m)" if tf == "15m" else ("45dk (45m)" if tf == "45m" else "1S (1h)")
     htf_label = "1S EMA50" if tf == "15m" else "4S EMA50"
-    stop_lbl = "1.50" if tf == "15m" else ("2.50" if tf == "45m" else "2.20")
-    be_lbl = "1.20" if tf == "15m" else ("2.20" if tf == "45m" else "2.00")
 
     return (
         f"{header}\n"
@@ -91,8 +89,8 @@ def format_entry_message(
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
         f"🎯 <b>Kâr Al (Direnç):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
-        f"🛑 <b>Stop-Loss (Max -%{stop_lbl}):</b> <code>{fmt_price(sl)}</code> (<b>{sl_pct:.2f}%</b>)\n"
-        f"🔒 <b>Kâr Kilidi / Trailing:</b> +%{be_lbl} görünce aktif (+%0.20 taban)\n"
+        f"🛑 <b>Stop-Loss:</b> <b>-%1.00</b> (Oto Zarar Kes)\n"
+        f"🔒 <b>Trailing Stop:</b> <b>+%2.00</b> kârda başlar (+%0.20 taban)\n"
         f"{trade_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>5'li İndikatör + Üst Trend:</b>\n"

@@ -78,14 +78,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--stop-loss-pct",
         type=float,
-        default=float(os.getenv("STOP_LOSS_PCT", "0")),
-        help="Zarar kes yüzdesi (0 = Pine Script oto: 1h=%2.2, 15m=%1.5)",
+        default=float(os.getenv("STOP_LOSS_PCT", "1.0")),
+        help="Zarar kes yüzdesi (varsayılan: 1.0)",
     )
     p.add_argument(
         "--trailing-trigger-pct",
         type=float,
-        default=float(os.getenv("TRAILING_TRIGGER_PCT", "0")),
-        help="Kâr kilidi/trailing tetik yüzdesi (0 = Pine Script oto: 1h=%2.0, 15m=%1.2)",
+        default=float(os.getenv("TRAILING_TRIGGER_PCT", "2.0")),
+        help="Trailing stop başlangıç kâr yüzdesi (varsayılan: 2.0)",
     )
     p.add_argument(
         "--trailing-callback-pct",
@@ -263,16 +263,8 @@ def main() -> None:
         or os.getenv("HTTPS_PROXY")
         or ""
     )
-    active_stop_pct = (
-        args.stop_loss_pct
-        if args.stop_loss_pct > 0
-        else (1.50 if args.timeframe == "15m" else (2.50 if args.timeframe == "45m" else 2.20))
-    )
-    active_be_pct = (
-        args.trailing_trigger_pct
-        if args.trailing_trigger_pct > 0
-        else (1.20 if args.timeframe == "15m" else (2.20 if args.timeframe == "45m" else 2.00))
-    )
+    active_stop_pct = args.stop_loss_pct
+    active_be_pct = args.trailing_trigger_pct
 
     trader: BinanceTrader | None = None
     if auto_trade_env and not args.no_auto_trade and api_key and api_secret:
