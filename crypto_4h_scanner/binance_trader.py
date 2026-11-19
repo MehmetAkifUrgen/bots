@@ -55,7 +55,7 @@ class BinanceTrader:
         trailing_callback_pct: float = 0.4,
         trailing_floor_pct: float = 0.3,
         max_consecutive_stops: int = 3,
-        cooldown_minutes: int = 240,
+        cooldown_minutes: int = 0,
         state_file: Path | None = None,
         timeout: float = 10.0,
         proxy_url: str = "",
@@ -105,6 +105,8 @@ class BinanceTrader:
         return {"open_positions": {}, "consecutive_stops": 0, "cooldown_until": 0}
 
     def is_in_cooldown(self) -> bool:
+        if self.cooldown_minutes <= 0:
+            return False
         until = int(self._state.get("cooldown_until", 0))
         if until <= 0:
             return False
@@ -420,7 +422,10 @@ class BinanceTrader:
 
         if is_stop_loss:
             self._state["consecutive_stops"] = int(self._state.get("consecutive_stops", 0)) + 1
-            if self._state["consecutive_stops"] >= self.max_consecutive_stops:
+            if (
+                self.cooldown_minutes > 0
+                and self._state["consecutive_stops"] >= self.max_consecutive_stops
+            ):
                 self._state["cooldown_until"] = int(time.time() + self.cooldown_minutes * 60)
         elif pnl_usd >= 0:
             self._state["consecutive_stops"] = 0

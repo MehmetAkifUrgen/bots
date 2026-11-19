@@ -78,8 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--cooldown-minutes",
         type=int,
-        default=int(os.getenv("COOLDOWN_MINUTES", "240")),
-        help="Art arda 3 stop sonrası mola süresi dakika (varsayılan: 240)",
+        default=int(os.getenv("COOLDOWN_MINUTES", "0")),
+        help="Art arda 3 stop sonrası mola süresi dakika (0 = kapalı, varsayılan: 0)",
     )
     p.add_argument(
         "--no-auto-trade",
