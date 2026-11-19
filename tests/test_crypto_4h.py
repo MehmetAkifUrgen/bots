@@ -14,6 +14,7 @@ from crypto_4h_scanner.binance_trader import BinanceTrader
 from crypto_4h_scanner.indicators import (
     SystemEvaluation,
     compute_pivots,
+    evaluate_1h_15m_system,
     evaluate_45m_scalp_system,
     evaluate_4h_system,
     fisher_transform,
@@ -131,6 +132,15 @@ class TestCrypto4hIndicators(unittest.TestCase):
         df_45m = resample_15m_to_45m(df_15m)
         self.assertEqual(len(df_45m), 100)
         ev = evaluate_45m_scalp_system(df_45m, df_15m)
+        self.assertIsNotNone(ev)
+
+    def test_1h_15m_optimize_system(self) -> None:
+        x = np.linspace(0, 8 * np.pi, 200)
+        closes = 100.0 + 8.0 * np.sin(x) + np.linspace(0, 6.0, 200)
+        df_1h = _make_ohlcv(closes)
+        df_4h = _make_ohlcv(closes[:100])
+        df_1d = _make_ohlcv(closes[:30])
+        ev = evaluate_1h_15m_system(df_1h, df_4h, df_1d, timeframe="1h")
         self.assertIsNotNone(ev)
 
 

@@ -32,13 +32,13 @@ def fmt_vol(vol: float) -> str:
     return f"${vol:,.0f}"
 
 
-def _ind_row(ev) -> str:
+def _ind_row(ev, htf_label: str = "4S EMA50") -> str:
     def mark(ok: bool) -> str:
         return "✅" if ok else "❌"
 
     return (
         f"• StochRSI: {mark(ev.cond1_buy)} | RSI+MA: {mark(ev.cond2_buy)} | Fisher: {mark(ev.cond3_buy)}\n"
-        f"• WaveTrend: {mark(ev.cond4_buy)} | SMI>EMA9: {mark(ev.cond5_buy)} | 15m EMA50: {mark(ev.trend_ok)}"
+        f"• WaveTrend: {mark(ev.cond4_buy)} | SMI>EMA9: {mark(ev.cond5_buy)} | {htf_label}: {mark(ev.trend_ok)}"
     )
 
 
@@ -79,20 +79,26 @@ def format_entry_message(
     elif trade_note:
         trade_block = f"\nℹ️ <i>{trade_note}</i>\n"
 
+    tf = getattr(res, "timeframe", "1h")
+    tf_badge = "15dk (15m)" if tf == "15m" else "1S (1h)"
+    htf_label = "1S EMA50" if tf == "15m" else "4S EMA50"
+    stop_lbl = "1.50" if tf == "15m" else "2.20"
+    be_lbl = "1.20" if tf == "15m" else "2.00"
+
     return (
         f"{header}\n"
-        f"🪙 <b>{res.symbol}</b> | <code>45dk (45m)</code> | {market_label}\n"
+        f"🪙 <b>{res.symbol}</b> | <code>{tf_badge}</code> | {market_label}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
-        f"🛑 <b>Stop-Loss:</b> <b>-%1.00</b> (Pozisyon büyüklüğünün %1'i)\n"
-        f"📈 <b>Trailing Stop:</b> +%1.00 kârda başlar (0.4% takip, +%0.30 taban)\n"
-        f"🎯 <b>45m Pivot TP/SL:</b> <code>{fmt_price(tp)}</code> (+{tp_pct:.2f}%) / <code>{fmt_price(sl)}</code> ({sl_pct:.2f}%)\n"
+        f"🎯 <b>Kâr Al (Direnç):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
+        f"🛑 <b>Stop-Loss (Max -%{stop_lbl}):</b> <code>{fmt_price(sl)}</code> (<b>{sl_pct:.2f}%</b>)\n"
+        f"🔒 <b>Kâr Kilidi / Trailing:</b> +%{be_lbl} görünce aktif (+%0.20 taban)\n"
         f"{trade_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>5'li İndikatör + 15dk Trend:</b>\n"
-        f"{_ind_row(ev)}\n"
+        f"📊 <b>5'li İndikatör + Üst Trend:</b>\n"
+        f"{_ind_row(ev, htf_label=htf_label)}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 <b>45dk Backtest:</b> %{ev.win_rate:.1f} Başarı ({ev.win_trades}/{ev.total_trades} işlem) | Getiri: %{ev.total_profit_pct:+.1f}\n"
+        f"📈 <b>{tf_badge} Backtest:</b> %{ev.win_rate:.1f} Başarı ({ev.win_trades}/{ev.total_trades} işlem) | Getiri: %{ev.total_profit_pct:+.1f}\n"
         f"💧 <b>24s Hacim:</b> {fmt_vol(res.volume_24h_usdt)} | 24s: {res.change_24h:+.2f}%\n"
         f"🕒 <i>Mum: {bar_dt}</i>"
     )
@@ -311,7 +317,7 @@ class TelegramNotifier:
 
             # 1. TURUNCU KESİN AL (5/5) -> $200-$300 (uses max_usd, clamped to balance)
             if ev.orange_trigger:
-                alert_key = f"{track_key}:45m:ORANGE:{ev.bar_open_time}"
+                alert_key = f"{track_key}:{res.timeframe}:ORANGE:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
                     target_usd = trader.max_usd if trader else 300.0
                     trade_exec, trade_note = self._try_open_trade(
@@ -339,7 +345,7 @@ class TelegramNotifier:
 
             # 2. YEŞİL AL (İlk 3/5) -> Ön uyarı (trade_on_green=False by default)
             elif ev.green_trigger:
-                alert_key = f"{track_key}:45m:GREEN:{ev.bar_open_time}"
+                alert_key = f"{track_key}:{res.timeframe}:GREEN:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
                     if trade_on_green:
                         target_usd = trader.min_usd if trader else 200.0
@@ -375,7 +381,7 @@ class TelegramNotifier:
 
             # 3. İndikatör ÇIKIŞ bildirimi (only when trader is NOT managing live SL/Trailing, or notify_all_exits)
             elif ev.exit_trigger and (notify_all_exits or (track_key in tracked and not (trader and trader.is_configured))):
-                alert_key = f"{track_key}:45m:EXIT:{ev.bar_open_time}"
+                alert_key = f"{track_key}:{res.timeframe}:EXIT:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
                     msg = format_exit_message(res)
                     try:

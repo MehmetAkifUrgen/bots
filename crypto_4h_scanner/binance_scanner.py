@@ -13,14 +13,14 @@ import requests
 
 from .indicators import (
     SystemEvaluation,
-    evaluate_45m_scalp_system,
-    resample_15m_to_45m,
+    evaluate_1h_15m_system,
 )
 
 FAPI_BASE = "https://fapi.binance.com"
 SPOT_BASE = "https://api.binance.com"
 
 MarketType = Literal["futures", "papi", "spot"]
+TimeframeType = Literal["1h", "15m"]
 
 
 @dataclass
@@ -31,6 +31,7 @@ class Coin4hResult:
     change_24h: float
     volume_24h_usdt: float
     evaluation: SystemEvaluation
+    timeframe: TimeframeType = "1h"
 
 
 def _klines_to_df(raw: list[list]) -> pd.DataFrame:
@@ -51,10 +52,12 @@ class Binance4hScanner:
     def __init__(
         self,
         market: MarketType = "futures",
+        timeframe: TimeframeType = "1h",
         max_workers: int = 12,
         timeout: float = 10.0,
     ) -> None:
         self.market = market
+        self.timeframe = timeframe
         self.max_workers = max_workers
         self.timeout = timeout
         self._session_local = threading.local()
@@ -146,9 +149,21 @@ class Binance4hScanner:
 
     def _scan_one(self, coin: dict) -> Coin4hResult | None:
         sym = coin["symbol"]
-        df_15m = self.fetch_klines(sym, interval="15m", limit=900)
-        df_45m = resample_15m_to_45m(df_15m)
-        ev = evaluate_45m_scalp_system(df_45m, df_15m=df_15m)
+        if self.timeframe == "15m":
+            df_ltf = self.fetch_klines(sym, interval="15m", limit=300)
+            df_trend = self.fetch_klines(sym, interval="1h", limit=120)
+            df_pivot = self.fetch_klines(sym, interval="4h", limit=60)
+        else:
+            df_ltf = self.fetch_klines(sym, interval="1h", limit=300)
+            df_trend = self.fetch_klines(sym, interval="4h", limit=120)
+            df_pivot = self.fetch_klines(sym, interval="1d", limit=30)
+
+        ev = evaluate_1h_15m_system(
+            df_ltf=df_ltf,
+            df_trend=df_trend,
+            df_pivot=df_pivot,
+            timeframe=self.timeframe,
+        )
         if ev is None:
             return None
         return Coin4hResult(
@@ -158,6 +173,7 @@ class Binance4hScanner:
             change_24h=round(coin["change_24h"], 2),
             volume_24h_usdt=round(coin["volume_24h_usdt"], 0),
             evaluation=ev,
+            timeframe=self.timeframe,
         )
 
     def scan_market(

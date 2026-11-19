@@ -34,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Taranacak ve işlem açılacak Binance piyasası (varsayılan: papi)",
     )
     p.add_argument(
+        "--timeframe",
+        choices=["1h", "15m"],
+        default=os.getenv("SCAN_TIMEFRAME", "1h"),
+        help="Tarama zaman dilimi: 1h (1S İdeal Mod) veya 15m (varsayılan: 1h)",
+    )
+    p.add_argument(
         "--min-usd",
         type=float,
         default=float(os.getenv("MIN_POSITION_USD", "200")),
@@ -60,14 +66,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--stop-loss-pct",
         type=float,
-        default=float(os.getenv("STOP_LOSS_PCT", "1.0")),
-        help="Pozisyon büyüklüğünün yüzde zarar kes oranı (varsayılan: 1.0)",
+        default=float(os.getenv("STOP_LOSS_PCT", "0")),
+        help="Zarar kes yüzdesi (0 = Pine Script oto: 1h=%2.2, 15m=%1.5)",
     )
     p.add_argument(
         "--trailing-trigger-pct",
         type=float,
-        default=float(os.getenv("TRAILING_TRIGGER_PCT", "1.0")),
-        help="Trailing stop başlangıç kâr yüzdesi (varsayılan: 1.0)",
+        default=float(os.getenv("TRAILING_TRIGGER_PCT", "0")),
+        help="Kâr kilidi/trailing tetik yüzdesi (0 = Pine Script oto: 1h=%2.0, 15m=%1.2)",
     )
     p.add_argument(
         "--trailing-callback-pct",
@@ -245,6 +251,17 @@ def main() -> None:
         or os.getenv("HTTPS_PROXY")
         or ""
     )
+    active_stop_pct = (
+        args.stop_loss_pct
+        if args.stop_loss_pct > 0
+        else (1.50 if args.timeframe == "15m" else 2.20)
+    )
+    active_be_pct = (
+        args.trailing_trigger_pct
+        if args.trailing_trigger_pct > 0
+        else (1.20 if args.timeframe == "15m" else 2.00)
+    )
+
     trader: BinanceTrader | None = None
     if auto_trade_env and not args.no_auto_trade and api_key and api_secret:
         trader = BinanceTrader(
@@ -255,15 +272,20 @@ def main() -> None:
             max_usd=args.max_usd,
             max_positions=args.max_positions,
             leverage=args.leverage,
-            stop_loss_pct=args.stop_loss_pct,
-            trailing_trigger_pct=args.trailing_trigger_pct,
+            stop_loss_pct=active_stop_pct,
+            trailing_trigger_pct=active_be_pct,
             trailing_callback_pct=args.trailing_callback_pct,
+            trailing_floor_pct=0.20,
             cooldown_minutes=args.cooldown_minutes,
             state_file=DEFAULT_TRADE_STATE_FILE,
             proxy_url=proxy_url,
         )
 
-    scanner = Binance4hScanner(market=args.market, max_workers=args.workers)
+    scanner = Binance4hScanner(
+        market=args.market,
+        timeframe=args.timeframe,
+        max_workers=args.workers,
+    )
 
     if args.port > 0 and not args.once:
         _start_health_server(args.port)
@@ -280,12 +302,13 @@ def main() -> None:
         _start_position_monitor(trader, notifier, dry_run=args.dry_run, interval_sec=5)
 
     trade_mode_str = (
-        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, -%{args.stop_loss_pct:g} SL, +{args.trailing_trigger_pct:g}% Trail)"
+        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, -%{active_stop_pct:g} SL, +%{active_be_pct:g} Trail)"
         if trader
         else "KAPALI (Sadece Bildirim)"
     )
+    tf_title = "15dk" if args.timeframe == "15m" else "1S (1h İdeal Mod)"
     print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] 45dk Ultra Scalp Tarayıcı başlatıldı | "
+        f"[{datetime.now().strftime('%H:%M:%S')}] Kripto {tf_title} 5'li Tarayıcı başlatıldı | "
         f"Piyasa={args.market.upper()} | OtoAlım={trade_mode_str} | "
         f"MinHacim=${args.min_volume:,.0f} | Limit={args.limit or 'TÜMÜ'} | Periyot={args.poll_seconds}sn"
     )
