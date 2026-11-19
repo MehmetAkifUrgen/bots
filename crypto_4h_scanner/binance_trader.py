@@ -8,6 +8,7 @@ import hmac
 import json
 import math
 from pathlib import Path
+import threading
 import time
 from typing import Literal
 from urllib.parse import urlencode
@@ -77,6 +78,7 @@ class BinanceTrader:
         )
         self.timeout = timeout
         self.proxy_url = proxy_url.strip()
+        self._lock = threading.RLock()
         self._filters_cache: dict[str, dict] = {}
         self._state = self._load_state()
 
@@ -424,79 +426,158 @@ class BinanceTrader:
             notional_usd=round(exec_qty * exec_price, 2),
         )
 
-    def manage_open_positions(self, price_map: dict[str, float]) -> list[dict]:
+    def has_open_positions(self) -> bool:
+        with self._lock:
+            return bool(self._state["open_positions"])
+
+    def fetch_public_price(self, symbol: str) -> float | None:
+        url = (
+            f"{FAPI_BASE}/fapi/v1/ticker/price"
+            if self._is_um_futures()
+            else f"{SPOT_BASE}/api/v3/ticker/price"
+        )
+        try:
+            resp = requests.get(url, params={"symbol": symbol}, timeout=self.timeout)
+            resp.raise_for_status()
+            return float(resp.json().get("price", 0.0)) or None
+        except Exception:
+            return None
+
+    def sync_live_positions(self) -> dict[str, dict]:
+        """
+        Sync live open positions from Binance into local state.
+        Crucial on Railway/ephemeral disks so restarts never drop SL/Trailing tracking!
+        """
+        if not self._is_um_futures() or not self.is_configured:
+            with self._lock:
+                return dict(self._state["open_positions"])
+
+        live = self.get_live_open_positions()
+        with self._lock:
+            tracked = self._state["open_positions"]
+            dirty = False
+
+            # Adopt any live Binance LONG position missing from local state
+            for sym, lpos in live.items():
+                if lpos.get("side") != "LONG":
+                    continue
+                if sym not in tracked:
+                    entry_px = float(lpos["entry_price"])
+                    qty = float(lpos["qty"])
+                    tracked[sym] = {
+                        "symbol": sym,
+                        "order_id": "synced",
+                        "entry_price": entry_px,
+                        "qty": qty,
+                        "notional_usd": round(entry_px * qty, 2),
+                        "sl_price": entry_px * (1.0 - self.stop_loss_pct / 100.0),
+                        "peak_price": entry_px,
+                        "trailing_active": False,
+                        "opened_at": int(time.time()),
+                    }
+                    dirty = True
+
+            # Remove positions no longer open on Binance
+            for sym in list(tracked.keys()):
+                if sym not in live:
+                    tracked.pop(sym, None)
+                    dirty = True
+
+            if dirty:
+                self._save_state()
+            return dict(tracked)
+
+    def manage_open_positions(
+        self, price_map: dict[str, float] | None = None
+    ) -> list[dict]:
         """
         Monitor open positions in state against live prices:
-        - Close at -$3 USD Stop-Loss
+        - Close at -stop_loss_pct% (-1.0%) Stop-Loss
         - Activate Trailing Stop at +1.0% profit, trail by trailing_callback_pct (floor +0.3%)
         Returns list of closed trade event dicts.
         """
+        pmap = price_map or {}
         events: list[dict] = []
-        open_syms = list(self._state["open_positions"].keys())
-        state_dirty = False
 
-        for sym in open_syms:
-            pos = self._state["open_positions"].get(sym)
-            if not pos:
-                continue
-            curr_price = price_map.get(sym)
-            if curr_price is None or curr_price <= 0:
-                continue
+        with self._lock:
+            open_syms = list(self._state["open_positions"].keys())
+            state_dirty = False
 
-            entry_px = float(pos["entry_price"])
-            qty = float(pos["qty"])
-            notional = float(pos.get("notional_usd") or (entry_px * qty))
-            pnl_usd = (curr_price - entry_px) * qty
-            pnl_pct = ((curr_price - entry_px) / entry_px) * 100.0 if entry_px > 0 else 0.0
+            for sym in open_syms:
+                pos = self._state["open_positions"].get(sym)
+                if not pos:
+                    continue
+                curr_price = pmap.get(sym)
+                if curr_price is None or curr_price <= 0:
+                    curr_price = self.fetch_public_price(sym)
+                if curr_price is None or curr_price <= 0:
+                    continue
 
-            # Update peak & trailing state
-            peak_px = max(float(pos.get("peak_price") or entry_px), curr_price)
-            if peak_px > float(pos.get("peak_price") or 0.0):
-                pos["peak_price"] = peak_px
-                state_dirty = True
+                entry_px = float(pos["entry_price"])
+                qty = float(pos["qty"])
+                pnl_pct = (
+                    ((curr_price - entry_px) / entry_px) * 100.0
+                    if entry_px > 0
+                    else 0.0
+                )
 
-            trailing_active = bool(pos.get("trailing_active", False))
-            if not trailing_active and pnl_pct >= self.trailing_trigger_pct:
-                trailing_active = True
-                pos["trailing_active"] = True
-                state_dirty = True
-
-            reason: str | None = None
-            if trailing_active:
-                floor_sl = entry_px * (1.0 + self.trailing_floor_pct / 100.0)
-                trail_sl = peak_px * (1.0 - self.trailing_callback_pct / 100.0)
-                effective_sl = max(floor_sl, trail_sl)
-                if effective_sl > float(pos.get("sl_price") or 0.0):
-                    pos["sl_price"] = effective_sl
+                # Update peak & trailing state
+                peak_px = max(float(pos.get("peak_price") or entry_px), curr_price)
+                if peak_px > float(pos.get("peak_price") or 0.0):
+                    pos["peak_price"] = peak_px
                     state_dirty = True
-                if curr_price <= effective_sl:
-                    reason = "TRAILING STOP"
-            else:
-                sl_px = float(pos.get("sl_price") or (entry_px * (1.0 - self.stop_loss_pct / 100.0)))
-                if pnl_pct <= -self.stop_loss_pct or curr_price <= sl_px:
-                    reason = f"STOP (-%{self.stop_loss_pct:g})"
 
-            if reason:
-                closed = self.close_position(sym, fallback_price=curr_price)
-                if closed:
-                    realized_usd = (closed.price - entry_px) * closed.qty
-                    realized_pct = ((closed.price - entry_px) / entry_px) * 100.0 if entry_px > 0 else 0.0
-                    events.append(
-                        {
-                            "symbol": sym,
-                            "reason": reason,
-                            "entry_price": entry_px,
-                            "exit_price": closed.price,
-                            "pnl_usd": round(realized_usd, 2),
-                            "pnl_pct": round(realized_pct, 2),
-                            "order_id": closed.order_id,
-                            "cooldown_triggered": self.is_in_cooldown(),
-                            "cooldown_minutes": self.cooldown_minutes,
-                            "consecutive_stops": int(self._state.get("consecutive_stops", 0)),
-                        }
+                trailing_active = bool(pos.get("trailing_active", False))
+                if not trailing_active and pnl_pct >= self.trailing_trigger_pct:
+                    trailing_active = True
+                    pos["trailing_active"] = True
+                    state_dirty = True
+
+                reason: str | None = None
+                if trailing_active:
+                    floor_sl = entry_px * (1.0 + self.trailing_floor_pct / 100.0)
+                    trail_sl = peak_px * (1.0 - self.trailing_callback_pct / 100.0)
+                    effective_sl = max(floor_sl, trail_sl)
+                    if effective_sl > float(pos.get("sl_price") or 0.0):
+                        pos["sl_price"] = effective_sl
+                        state_dirty = True
+                    if curr_price <= effective_sl:
+                        reason = "TRAILING STOP"
+                else:
+                    sl_px = float(
+                        pos.get("sl_price")
+                        or (entry_px * (1.0 - self.stop_loss_pct / 100.0))
                     )
+                    if pnl_pct <= -self.stop_loss_pct or curr_price <= sl_px:
+                        reason = f"STOP (-%{self.stop_loss_pct:g})"
 
-        if state_dirty:
-            self._save_state()
+                if reason:
+                    closed = self.close_position(sym, fallback_price=curr_price)
+                    if closed:
+                        realized_usd = (closed.price - entry_px) * closed.qty
+                        realized_pct = (
+                            ((closed.price - entry_px) / entry_px) * 100.0
+                            if entry_px > 0
+                            else 0.0
+                        )
+                        events.append(
+                            {
+                                "symbol": sym,
+                                "reason": reason,
+                                "entry_price": entry_px,
+                                "exit_price": closed.price,
+                                "pnl_usd": round(realized_usd, 2),
+                                "pnl_pct": round(realized_pct, 2),
+                                "order_id": closed.order_id,
+                                "cooldown_triggered": self.is_in_cooldown(),
+                                "cooldown_minutes": self.cooldown_minutes,
+                                "consecutive_stops": int(
+                                    self._state.get("consecutive_stops", 0)
+                                ),
+                            }
+                        )
+
+            if state_dirty:
+                self._save_state()
 
         return events

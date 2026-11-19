@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 from .binance_scanner import Binance4hScanner
 from .binance_trader import BinanceTrader
-from .telegram_notifier import TelegramNotifier
+from .telegram_notifier import TelegramNotifier, format_managed_close_message
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_STATE_FILE = Path(__file__).resolve().parent / "alert_state.json"
@@ -173,6 +173,48 @@ def _start_health_server(port: int) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Health HTTP sunucusu :{port} portunda aktif")
 
 
+def _start_position_monitor(
+    trader: BinanceTrader,
+    notifier: TelegramNotifier,
+    dry_run: bool = False,
+    interval_sec: int = 5,
+) -> None:
+    """Fast 5-second background monitor for -1% SL and +1% Trailing Stop."""
+
+    def _loop() -> None:
+        last_sync = 0.0
+        while True:
+            try:
+                now = time.time()
+                if now - last_sync >= 60.0:
+                    synced = trader.sync_live_positions()
+                    last_sync = now
+                    if synced:
+                        print(
+                            f"[{datetime.now().strftime('%H:%M:%S')}] "
+                            f"Açık pozisyon senkronu: {list(synced.keys())}"
+                        )
+                if trader.has_open_positions() and not dry_run:
+                    closed_events = trader.manage_open_positions()
+                    for ev in closed_events:
+                        print(
+                            f"[{datetime.now().strftime('%H:%M:%S')}] "
+                            f"HIZLI KAPANIŞ: {ev['symbol']} {ev['reason']} "
+                            f"({ev['pnl_usd']:+.2f}$ / {ev['pnl_pct']:+.2f}%)"
+                        )
+                        try:
+                            notifier.send_text(format_managed_close_message(ev))
+                        except Exception as exc:
+                            print(f"  Telegram kapanış bildirim hatası: {exc}")
+            except Exception as exc:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Pozisyon takip hatası: {exc}")
+            time.sleep(interval_sec)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Hızlı Stop-Loss / Trailing takipçisi aktif (her {interval_sec}sn)")
+
+
 def main() -> None:
     load_dotenv(ROOT_DIR / ".env")
     args = build_parser().parse_args()
@@ -224,6 +266,17 @@ def main() -> None:
 
     if args.port > 0 and not args.once:
         _start_health_server(args.port)
+
+    if trader and not args.once:
+        try:
+            synced = trader.sync_live_positions()
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}] "
+                f"Binance canlı pozisyon senkronu: {list(synced.keys()) or 'YOK'}"
+            )
+        except Exception as exc:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] İlk senkron hatası: {exc}")
+        _start_position_monitor(trader, notifier, dry_run=args.dry_run, interval_sec=5)
 
     trade_mode_str = (
         f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, -%{args.stop_loss_pct:g} SL, +{args.trailing_trigger_pct:g}% Trail)"
