@@ -121,6 +121,12 @@ class BinanceTrader:
         rem = int(max(0, (until - time.time()) / 60))
         return rem
 
+    def reset_cooldown(self) -> None:
+        with self._lock:
+            self._state["consecutive_stops"] = 0
+            self._state["cooldown_until"] = 0
+            self._save_state()
+
     def _save_state(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state_file.write_text(
@@ -350,7 +356,12 @@ class BinanceTrader:
             notional_usd=actual_not,
         )
 
-    def close_position(self, symbol: str, fallback_price: float) -> TradeExecution | None:
+    def close_position(
+        self,
+        symbol: str,
+        fallback_price: float,
+        is_stop_loss: bool = False,
+    ) -> TradeExecution | None:
         """Close an open LONG/BUY position on Binance."""
         live_open = self.get_live_open_positions()
         pos = live_open.get(symbol) or self._state["open_positions"].get(symbol)
@@ -407,11 +418,11 @@ class BinanceTrader:
         entry_px = float((prev_pos or pos).get("entry_price") or exec_price)
         pnl_usd = (exec_price - entry_px) * exec_qty
 
-        if pnl_usd < 0:
+        if is_stop_loss:
             self._state["consecutive_stops"] = int(self._state.get("consecutive_stops", 0)) + 1
             if self._state["consecutive_stops"] >= self.max_consecutive_stops:
                 self._state["cooldown_until"] = int(time.time() + self.cooldown_minutes * 60)
-        else:
+        elif pnl_usd >= 0:
             self._state["consecutive_stops"] = 0
             self._state["cooldown_until"] = 0
 
@@ -552,7 +563,11 @@ class BinanceTrader:
                         reason = f"STOP (-%{self.stop_loss_pct:g})"
 
                 if reason:
-                    closed = self.close_position(sym, fallback_price=curr_price)
+                    closed = self.close_position(
+                        sym,
+                        fallback_price=curr_price,
+                        is_stop_loss=reason.startswith("STOP"),
+                    )
                     if closed:
                         realized_usd = (closed.price - entry_px) * closed.qty
                         realized_pct = (

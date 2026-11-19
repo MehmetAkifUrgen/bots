@@ -185,6 +185,7 @@ def _start_position_monitor(
         last_sync = 0.0
         while True:
             try:
+                notifier.poll_commands(trader)
                 now = time.time()
                 if now - last_sync >= 60.0:
                     synced = trader.sync_live_positions()

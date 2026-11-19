@@ -159,6 +159,7 @@ class TelegramNotifier:
         self.chat_id = chat_id.strip()
         self.state_file = state_file
         self.timeout = timeout
+        self._last_update_id: int = 0
         self._state = self._load_state()
 
     def _load_state(self) -> dict:
@@ -201,6 +202,44 @@ class TelegramNotifier:
         resp.raise_for_status()
         payload = resp.json()
         return bool(payload.get("ok"))
+
+    def poll_commands(self, trader: BinanceTrader | None) -> None:
+        """Handle simple Telegram commands (/devam, /durum) from the authorized chat."""
+        if not self.bot_token or not self.chat_id or trader is None:
+            return
+        url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
+        params: dict = {"timeout": 0, "limit": 10}
+        if self._last_update_id > 0:
+            params["offset"] = self._last_update_id + 1
+        try:
+            resp = requests.get(url, params=params, timeout=5.0)
+            resp.raise_for_status()
+            updates = resp.json().get("result", [])
+        except Exception:
+            return
+
+        for upd in updates:
+            uid = int(upd.get("update_id", 0))
+            if uid > self._last_update_id:
+                self._last_update_id = uid
+            msg = upd.get("message") or {}
+            chat_id = str((msg.get("chat") or {}).get("id", ""))
+            if chat_id != self.chat_id:
+                continue
+            text = str(msg.get("text") or "").strip().lower()
+            if text in ("/devam", "/reset", "/mola_iptal"):
+                trader.reset_cooldown()
+                self.send_text("▶️ <b>Mola iptal edildi!</b> Stop sayacı sıfırlandı, yeni 5/5 sinyallerde işlem açılmaya devam edilecek.")
+            elif text == "/durum":
+                open_syms = list(trader._state.get("open_positions", {}).keys())
+                stops = int(trader._state.get("consecutive_stops", 0))
+                cd = f"Aktif ({trader.cooldown_remaining_min()} dk kaldı)" if trader.is_in_cooldown() else "Kapalı"
+                self.send_text(
+                    f"📊 <b>Bot Durumu</b>\n"
+                    f"• Açık Pozisyonlar: <code>{', '.join(open_syms) if open_syms else 'YOK'}</code>\n"
+                    f"• Art Arda Stop Sayacı: <b>{stops}/{trader.max_consecutive_stops}</b>\n"
+                    f"• Mola: <b>{cd}</b>"
+                )
 
     def _try_open_trade(
         self,
