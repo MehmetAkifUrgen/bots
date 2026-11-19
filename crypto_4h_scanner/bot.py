@@ -125,8 +125,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--poll-seconds",
         type=int,
-        default=60,
-        help="Taramalar arası bekleme süresi saniye (varsayılan: 60)",
+        default=int(os.getenv("POLL_SECONDS", "120")),
+        help="Taramalar arası bekleme süresi saniye (varsayılan: 120)",
     )
     p.add_argument(
         "--once",
@@ -151,8 +151,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--workers",
         type=int,
-        default=12,
-        help="Paralel tarama iş parçacığı sayısı (varsayılan: 12)",
+        default=int(os.getenv("SCAN_WORKERS", "4")),
+        help="Paralel tarama iş parçacığı sayısı (varsayılan: 4)",
     )
     p.add_argument(
         "--port",
@@ -367,8 +367,17 @@ def main() -> None:
             if stats["errors"]:
                 print("  Telegram hataları:", stats["errors"][:5])
         except Exception as exc:
-            _HEALTH_STATE.update({"status": "error", "last_error": str(exc)})
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Tarama hatası: {exc}")
+            err_str = str(exc)
+            _HEALTH_STATE.update({"status": "error", "last_error": err_str})
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Tarama hatası: {err_str}")
+            if "418" in err_str or "429" in err_str:
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] "
+                    "Binance rate limit (418/429) — 180sn bekleniyor..."
+                )
+                if not args.once:
+                    time.sleep(180)
+                    continue
 
         if args.once:
             break

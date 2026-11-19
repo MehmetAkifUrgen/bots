@@ -54,7 +54,7 @@ class Binance4hScanner:
         self,
         market: MarketType = "futures",
         timeframe: TimeframeType = "45m",
-        max_workers: int = 12,
+        max_workers: int = 4,
         timeout: float = 10.0,
     ) -> None:
         self.market = market
@@ -62,6 +62,11 @@ class Binance4hScanner:
         self.max_workers = max_workers
         self.timeout = timeout
         self._session_local = threading.local()
+        self._cache_lock = threading.Lock()
+        self._active_symbols: set[str] = set()
+        self._active_symbols_ts: float = 0.0
+        self._kline_cache: dict[tuple[str, str], pd.DataFrame] = {}
+        self._used_weight_1m: int = 0
 
     def _get_session(self) -> requests.Session:
         sess = getattr(self._session_local, "session", None)
@@ -71,10 +76,23 @@ class Binance4hScanner:
             self._session_local.session = sess
         return sess
 
+    def _respect_rate_limit(self, resp: requests.Response) -> None:
+        w = resp.headers.get("X-MBX-USED-WEIGHT-1M") or resp.headers.get("x-mbx-used-weight-1m")
+        if w:
+            try:
+                self._used_weight_1m = int(w)
+            except ValueError:
+                pass
+        if self._used_weight_1m >= 1800:
+            # Pause briefly so 1-minute weight window cools down before hitting 2400
+            time.sleep(5.0)
+        elif self._used_weight_1m >= 1400:
+            time.sleep(0.35)
+
     def get_active_usdt_symbols(
         self, min_volume_usdt: float = 5_000_000.0, limit: int = 0
     ) -> list[dict]:
-        """Fetch active USDT pairs sorted by 24h quote volume descending."""
+        """Fetch active USDT pairs sorted by 24h quote volume descending (exchangeInfo cached 1h)."""
         sess = self._get_session()
         if self.market in ("futures", "papi"):
             info_url = f"{FAPI_BASE}/fapi/v1/exchangeInfo"
@@ -83,29 +101,34 @@ class Binance4hScanner:
             info_url = f"{SPOT_BASE}/api/v3/exchangeInfo"
             ticker_url = f"{SPOT_BASE}/api/v3/ticker/24hr"
 
-        info_resp = sess.get(info_url, timeout=self.timeout)
-        info_resp.raise_for_status()
-        info_data = info_resp.json()
+        if not self._active_symbols or (time.time() - self._active_symbols_ts) > 3600:
+            info_resp = sess.get(info_url, timeout=self.timeout)
+            self._respect_rate_limit(info_resp)
+            info_resp.raise_for_status()
+            info_data = info_resp.json()
 
-        if self.market in ("futures", "papi"):
-            active_symbols = {
-                s["symbol"]
-                for s in info_data.get("symbols", [])
-                if s.get("contractType") == "PERPETUAL"
-                and s.get("quoteAsset") == "USDT"
-                and s.get("status") == "TRADING"
-            }
-        else:
-            active_symbols = {
-                s["symbol"]
-                for s in info_data.get("symbols", [])
-                if s.get("quoteAsset") == "USDT"
-                and s.get("status") == "TRADING"
-                and s.get("isSpotTradingAllowed", True)
-                and not s["symbol"].endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"))
-            }
+            if self.market in ("futures", "papi"):
+                self._active_symbols = {
+                    s["symbol"]
+                    for s in info_data.get("symbols", [])
+                    if s.get("contractType") == "PERPETUAL"
+                    and s.get("quoteAsset") == "USDT"
+                    and s.get("status") == "TRADING"
+                }
+            else:
+                self._active_symbols = {
+                    s["symbol"]
+                    for s in info_data.get("symbols", [])
+                    if s.get("quoteAsset") == "USDT"
+                    and s.get("status") == "TRADING"
+                    and s.get("isSpotTradingAllowed", True)
+                    and not s["symbol"].endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"))
+                }
+            self._active_symbols_ts = time.time()
 
+        active_symbols = self._active_symbols
         ticker_resp = sess.get(ticker_url, timeout=self.timeout)
+        self._respect_rate_limit(ticker_resp)
         ticker_resp.raise_for_status()
         tickers = ticker_resp.json()
 
@@ -148,41 +171,99 @@ class Binance4hScanner:
         if end_time is not None:
             params["endTime"] = end_time
         resp = sess.get(url, params=params, timeout=self.timeout)
+        self._respect_rate_limit(resp)
         resp.raise_for_status()
         return _klines_to_df(resp.json())
+
+    def fetch_klines_cached(
+        self,
+        symbol: str,
+        interval: str,
+        initial_limit: int,
+        pages: int = 1,
+        max_rows: int = 2000,
+    ) -> pd.DataFrame:
+        """
+        Incrementally update cached klines:
+        - First call fetches `pages * initial_limit` bars
+        - Subsequent calls fetch only last 8 bars (weight=1!) and merge.
+        """
+        key = (symbol, interval)
+        with self._cache_lock:
+            cached = self._kline_cache.get(key)
+
+        if cached is not None and not cached.empty:
+            recent = self.fetch_klines(symbol, interval=interval, limit=8)
+            merged = (
+                pd.concat([cached, recent], ignore_index=True)
+                .drop_duplicates(subset=["open_time"], keep="last")
+                .sort_values("open_time")
+                .tail(max_rows)
+                .reset_index(drop=True)
+            )
+            with self._cache_lock:
+                self._kline_cache[key] = merged
+            return merged
+
+        # Initial load
+        df = self.fetch_klines(symbol, interval=interval, limit=initial_limit)
+        for _ in range(max(0, pages - 1)):
+            if df.empty:
+                break
+            first_ts = int(df["open_time"].iloc[0])
+            try:
+                older = self.fetch_klines(
+                    symbol, interval=interval, limit=initial_limit, end_time=first_ts - 1
+                )
+                if older.empty:
+                    break
+                df = (
+                    pd.concat([older, df], ignore_index=True)
+                    .drop_duplicates(subset=["open_time"], keep="last")
+                    .sort_values("open_time")
+                    .reset_index(drop=True)
+                )
+            except Exception:
+                break
+
+        with self._cache_lock:
+            self._kline_cache[key] = df.tail(max_rows).reset_index(drop=True)
+        return self._kline_cache[key]
 
     def _scan_one(self, coin: dict) -> Coin4hResult | None:
         sym = coin["symbol"]
         if self.timeframe == "45m":
-            # Fetch 2 pages of 15m (up to 3000 bars -> ~1000 45m bars / ~31 days)
-            df_15m_recent = self.fetch_klines(sym, interval="15m", limit=1500)
-            if not df_15m_recent.empty:
-                first_ts = int(df_15m_recent["open_time"].iloc[0])
-                try:
-                    df_15m_older = self.fetch_klines(
-                        sym, interval="15m", limit=1500, end_time=first_ts - 1
-                    )
-                    df_15m = (
-                        pd.concat([df_15m_older, df_15m_recent], ignore_index=True)
-                        .drop_duplicates(subset=["open_time"])
-                        .sort_values("open_time")
-                        .reset_index(drop=True)
-                    )
-                except Exception:
-                    df_15m = df_15m_recent
-            else:
-                df_15m = df_15m_recent
+            # 2 pages x 1000 (weight 5 each on first load, weight 1 on subsequent scans!)
+            df_15m = self.fetch_klines_cached(
+                sym, interval="15m", initial_limit=1000, pages=2, max_rows=2000
+            )
             df_ltf = resample_15m_to_45m(df_15m)
-            df_trend = self.fetch_klines(sym, interval="4h", limit=250)
-            df_pivot = self.fetch_klines(sym, interval="1d", limit=45)
+            df_trend = self.fetch_klines_cached(
+                sym, interval="4h", initial_limit=200, pages=1, max_rows=250
+            )
+            df_pivot = self.fetch_klines_cached(
+                sym, interval="1d", initial_limit=45, pages=1, max_rows=60
+            )
         elif self.timeframe == "15m":
-            df_ltf = self.fetch_klines(sym, interval="15m", limit=300)
-            df_trend = self.fetch_klines(sym, interval="1h", limit=120)
-            df_pivot = self.fetch_klines(sym, interval="4h", limit=60)
+            df_ltf = self.fetch_klines_cached(
+                sym, interval="15m", initial_limit=300, pages=1, max_rows=400
+            )
+            df_trend = self.fetch_klines_cached(
+                sym, interval="1h", initial_limit=120, pages=1, max_rows=150
+            )
+            df_pivot = self.fetch_klines_cached(
+                sym, interval="4h", initial_limit=60, pages=1, max_rows=80
+            )
         else:
-            df_ltf = self.fetch_klines(sym, interval="1h", limit=300)
-            df_trend = self.fetch_klines(sym, interval="4h", limit=120)
-            df_pivot = self.fetch_klines(sym, interval="1d", limit=30)
+            df_ltf = self.fetch_klines_cached(
+                sym, interval="1h", initial_limit=300, pages=1, max_rows=400
+            )
+            df_trend = self.fetch_klines_cached(
+                sym, interval="4h", initial_limit=120, pages=1, max_rows=150
+            )
+            df_pivot = self.fetch_klines_cached(
+                sym, interval="1d", initial_limit=30, pages=1, max_rows=45
+            )
 
         ev = evaluate_1h_15m_system(
             df_ltf=df_ltf,
