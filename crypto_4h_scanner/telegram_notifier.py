@@ -541,23 +541,11 @@ class TelegramNotifier:
             elif ev.green_trigger:
                 alert_key = f"4h_bist:{res.symbol}:GREEN:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
-                    trade_exec = None
-                    trade_note = None
-                    if trader and trader.is_configured and not dry_run:
-                        try:
-                            trade_exec = trader.open_position(
-                                res.symbol,
-                                res.price,
-                                trader.min_usd,
-                                tp_price=ev.tp_level or ev.next_res,
-                                sl_price=ev.sl_level or ev.prev_sup,
-                            )
-                            if trade_exec:
-                                stats["orders_opened"] += 1
-                            else:
-                                trade_note = f"Emir açılmadı (Max {trader.max_positions} pozisyon, coin bekleme veya yetersiz marj)."
-                        except Exception as exc:
-                            trade_note = f"Emir hatası: {exc}"
+                    trade_note = (
+                        "Ön uyarı (3/5) — Emir sadece TURUNCU KESİN AL (5/5) onayında açılır."
+                        if (trader and trader.is_configured)
+                        else None
+                    )
                     try:
                         if dry_run:
                             print(
@@ -566,7 +554,7 @@ class TelegramNotifier:
                         else:
                             self.send_text(
                                 format_4h_alert_only_message(
-                                    res, "GREEN", trade_exec=trade_exec, trade_note=trade_note
+                                    res, "GREEN", trade_exec=None, trade_note=trade_note
                                 )
                             )
                         sent_alerts[alert_key] = int(time.time())
