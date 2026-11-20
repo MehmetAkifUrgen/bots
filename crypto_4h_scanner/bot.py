@@ -240,6 +240,56 @@ def _start_position_monitor(
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Hızlı Stop-Loss / Trailing takipçisi aktif (her {interval_sec}sn)")
 
 
+def _start_4h_bist_alert_monitor(
+    market: str,
+    notifier: TelegramNotifier,
+    min_volume_usdt: float = 5_000_000.0,
+    min_win_rate: float = 60.0,
+    min_profit_pct: float = 200.0,
+    interval_sec: int = 900,
+    dry_run: bool = False,
+) -> None:
+    """Separate 4H BIST-style Telegram-only alert scanner (WR>=60%, Profit>=200%)."""
+    scanner_4h = Binance4hScanner(market=market, max_workers=2)  # type: ignore[arg-type]
+
+    def _loop() -> None:
+        # Wait 75s after boot so main 45m warmup finishes first
+        time.sleep(75)
+        while True:
+            try:
+                results, errors, duration = scanner_4h.scan_4h_bist_alerts(
+                    min_volume_usdt=min_volume_usdt
+                )
+                stats = notifier.process_4h_alert_only(
+                    results,
+                    min_win_rate=min_win_rate,
+                    min_profit_pct=min_profit_pct,
+                    dry_run=dry_run,
+                )
+                qual = sum(
+                    1
+                    for r in results
+                    if r.evaluation.win_rate >= min_win_rate
+                    and r.evaluation.total_profit_pct >= min_profit_pct
+                )
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] "
+                    f"[4S BİLDİRİM] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
+                    f"WR>=%{min_win_rate:g} & Getiri>=%{min_profit_pct:g} Uyan: {qual} | "
+                    f"Gönderilen -> Yeşil: {stats['green']}, Turuncu: {stats['orange']}"
+                )
+            except Exception as exc:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [4S BİLDİRİM] Hata: {exc}")
+            time.sleep(interval_sec)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    print(
+        f"[{datetime.now().strftime('%H:%M:%S')}] "
+        f"Ayrı 4S Bildirim Tarayıcısı aktif (her {interval_sec // 60}dk, WR>=%{min_win_rate:g} & Getiri>=%{min_profit_pct:g}, Emir Yok)"
+    )
+
+
 def main() -> None:
     load_dotenv(ROOT_DIR / ".env")
     args = build_parser().parse_args()
@@ -300,6 +350,17 @@ def main() -> None:
 
     if args.port > 0 and not args.once:
         _start_health_server(args.port)
+
+    if not args.once:
+        _start_4h_bist_alert_monitor(
+            market=args.market,
+            notifier=notifier,
+            min_volume_usdt=args.min_volume,
+            min_win_rate=60.0,
+            min_profit_pct=200.0,
+            interval_sec=900,
+            dry_run=args.dry_run,
+        )
 
     if trader and not args.once:
         try:

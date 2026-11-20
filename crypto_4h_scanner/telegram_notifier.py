@@ -122,6 +122,44 @@ def format_managed_close_message(ev_dict: dict) -> str:
     )
 
 
+def format_4h_alert_only_message(res: Coin4hResult, kind: str) -> str:
+    ev = res.evaluation
+    if kind == "ORANGE":
+        header = "📢 <b>[4S TARAYICI] 🟠 TURUNCU KESİN AL (5/5)</b>"
+    else:
+        header = "📢 <b>[4S TARAYICI] 🟢 YEŞİL AL (İlk 3/5)</b>"
+
+    entry = ev.entry_price or res.price
+    tp = ev.tp_level or ev.next_res
+    sl = ev.sl_level or ev.prev_sup
+    tp_pct = ((tp - entry) / entry * 100.0) if entry > 0 else 0.0
+    sl_pct = ((sl - entry) / entry * 100.0) if entry > 0 else 0.0
+    bar_dt = datetime.fromtimestamp(ev.bar_open_time / 1000, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
+
+    def mark(ok: bool) -> str:
+        return "✅" if ok else "❌"
+
+    return (
+        f"{header}\n"
+        f"🪙 <b>{res.symbol}</b> | <code>4S (4H)</code> | <i>Sadece Bildirim (Emir Yok)</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
+        f"🎯 <b>Kâr Al (Direnç):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
+        f"🛑 <b>Stop (Destek):</b> <code>{fmt_price(sl)}</code> (<b>{sl_pct:.2f}%</b>)\n"
+        f"🔒 <b>Kâr Kilidi:</b> +%2.50 görünce SL → +%0.30\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>5'li İndikatör Durumu:</b>\n"
+        f"• StochRSI: {mark(ev.cond1_buy)} | RSI+MA: {mark(ev.cond2_buy)} | Fisher: {mark(ev.cond3_buy)}\n"
+        f"• WaveTrend: {mark(ev.cond4_buy)} | SMI>EMA9: {mark(ev.cond5_buy)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 <b>4S Backtest (~5.5 Ay):</b> <b>%{ev.win_rate:.1f} Başarı</b> ({ev.win_trades}/{ev.total_trades} işlem) | <b>Getiri: %{ev.total_profit_pct:+.1f}</b>\n"
+        f"💧 <b>24s Hacim:</b> {fmt_vol(res.volume_24h_usdt)} | 24s: {res.change_24h:+.2f}%\n"
+        f"🕒 <i>Mum: {bar_dt}</i>"
+    )
+
+
 def format_exit_message(
     res: Coin4hResult,
     trade_exec: TradeExecution | None = None,
@@ -397,6 +435,56 @@ class TelegramNotifier:
                         stats["exit"] += 1
                     except Exception as exc:
                         stats["errors"].append(f"{res.symbol} EXIT: {exc}")
+
+        if not dry_run:
+            self._save_state()
+
+        return stats
+
+    def process_4h_alert_only(
+        self,
+        results: list[Coin4hResult],
+        min_win_rate: float = 60.0,
+        min_profit_pct: float = 200.0,
+        dry_run: bool = False,
+    ) -> dict:
+        """Send Telegram-only alerts for 4H BIST-style system when WR>=60% and Profit>=200%."""
+        sent_alerts: dict[str, int] = self._state["sent_alerts"]
+        stats = {"green": 0, "orange": 0, "errors": []}
+
+        for res in results:
+            ev = res.evaluation
+            if ev.win_rate < min_win_rate or ev.total_profit_pct < min_profit_pct:
+                continue
+
+            if ev.orange_trigger:
+                alert_key = f"4h_bist:{res.symbol}:ORANGE:{ev.bar_open_time}"
+                if alert_key not in sent_alerts:
+                    try:
+                        if dry_run:
+                            print(
+                                f"[DRY-RUN 4H ORANGE] {res.symbol} WR={ev.win_rate}% Profit={ev.total_profit_pct}%"
+                            )
+                        else:
+                            self.send_text(format_4h_alert_only_message(res, "ORANGE"))
+                        sent_alerts[alert_key] = int(time.time())
+                        stats["orange"] += 1
+                    except Exception as exc:
+                        stats["errors"].append(f"4H {res.symbol} ORANGE: {exc}")
+            elif ev.green_trigger:
+                alert_key = f"4h_bist:{res.symbol}:GREEN:{ev.bar_open_time}"
+                if alert_key not in sent_alerts:
+                    try:
+                        if dry_run:
+                            print(
+                                f"[DRY-RUN 4H GREEN] {res.symbol} WR={ev.win_rate}% Profit={ev.total_profit_pct}%"
+                            )
+                        else:
+                            self.send_text(format_4h_alert_only_message(res, "GREEN"))
+                        sent_alerts[alert_key] = int(time.time())
+                        stats["green"] += 1
+                    except Exception as exc:
+                        stats["errors"].append(f"4H {res.symbol} GREEN: {exc}")
 
         if not dry_run:
             self._save_state()
