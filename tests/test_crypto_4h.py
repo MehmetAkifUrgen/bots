@@ -240,13 +240,15 @@ class TestBinanceTrader(unittest.TestCase):
                 min_usd=200.0,
                 max_usd=300.0,
                 max_positions=3,
-                leverage=10,
+                leverage=15,
+                max_leverage=20,
                 stop_loss_pct=1.0,
                 trailing_trigger_pct=1.0,
                 trailing_callback_pct=0.4,
                 trailing_floor_pct=0.3,
                 max_consecutive_stops=3,
                 cooldown_minutes=240,
+                symbol_stop_cooldown_minutes=0,
                 state_file=Path(tmp) / "trade_state.json",
             )
             trader._filters_cache = {
@@ -304,13 +306,15 @@ class TestBinanceTrader(unittest.TestCase):
                 min_usd=200.0,
                 max_usd=300.0,
                 max_positions=3,
-                leverage=10,
+                leverage=15,
+                max_leverage=20,
                 stop_loss_pct=1.0,
                 trailing_trigger_pct=1.0,
                 trailing_callback_pct=0.4,
                 trailing_floor_pct=0.3,
                 max_consecutive_stops=3,
                 cooldown_minutes=240,
+                symbol_stop_cooldown_minutes=0,
                 state_file=Path(tmp) / "trade_state.json",
             )
             trader._filters_cache = {

@@ -89,7 +89,7 @@ def format_entry_message(
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
         f"🎯 <b>Kâr Al (Direnç):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
-        f"🛑 <b>Stop-Loss:</b> <b>-%1.00</b> (Oto Zarar Kes)\n"
+        f"🛑 <b>Stop-Loss:</b> <b>-%2.50</b> (Oto Zarar Kes)\n"
         f"🔒 <b>Trailing Stop:</b> <b>+%2.00</b> kârda başlar (+%0.20 taban)\n"
         f"{trade_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"

@@ -49,13 +49,15 @@ class BinanceTrader:
         min_usd: float = 200.0,
         max_usd: float = 300.0,
         max_positions: int = 3,
-        leverage: int = 20,
-        stop_loss_pct: float = 1.0,
-        trailing_trigger_pct: float = 1.0,
+        leverage: int = 15,
+        max_leverage: int = 15,
+        stop_loss_pct: float = 2.5,
+        trailing_trigger_pct: float = 2.0,
         trailing_callback_pct: float = 0.4,
-        trailing_floor_pct: float = 0.3,
+        trailing_floor_pct: float = 0.2,
         max_consecutive_stops: int = 3,
         cooldown_minutes: int = 0,
+        symbol_stop_cooldown_minutes: int = 180,
         state_file: Path | None = None,
         timeout: float = 10.0,
         proxy_url: str = "",
@@ -66,13 +68,15 @@ class BinanceTrader:
         self.min_usd = min_usd
         self.max_usd = max_usd
         self.max_positions = max_positions
-        self.leverage = max(1, leverage)
+        self.max_leverage = max(1, max_leverage)
+        self.leverage = min(self.max_leverage, max(1, leverage))
         self.stop_loss_pct = stop_loss_pct
         self.trailing_trigger_pct = trailing_trigger_pct
         self.trailing_callback_pct = trailing_callback_pct
         self.trailing_floor_pct = trailing_floor_pct
         self.max_consecutive_stops = max_consecutive_stops
         self.cooldown_minutes = cooldown_minutes
+        self.symbol_stop_cooldown_minutes = max(0, symbol_stop_cooldown_minutes)
         self.state_file = state_file or (
             Path(__file__).resolve().parent / "trade_state.json"
         )
@@ -99,10 +103,29 @@ class BinanceTrader:
                     data.setdefault("open_positions", {})
                     data.setdefault("consecutive_stops", 0)
                     data.setdefault("cooldown_until", 0)
+                    data.setdefault("symbol_cooldowns", {})
                     return data
             except Exception:
                 pass
-        return {"open_positions": {}, "consecutive_stops": 0, "cooldown_until": 0}
+        return {
+            "open_positions": {},
+            "consecutive_stops": 0,
+            "cooldown_until": 0,
+            "symbol_cooldowns": {},
+        }
+
+    def is_symbol_in_cooldown(self, symbol: str) -> bool:
+        if self.symbol_stop_cooldown_minutes <= 0:
+            return False
+        cds = self._state.get("symbol_cooldowns", {})
+        until = int(cds.get(symbol, 0))
+        if until <= 0:
+            return False
+        if time.time() < until:
+            return True
+        cds.pop(symbol, None)
+        self._save_state()
+        return False
 
     def is_in_cooldown(self) -> bool:
         if self.cooldown_minutes <= 0:
@@ -238,7 +261,7 @@ class BinanceTrader:
         self, symbol: str, price: float, target_usd: float
     ) -> TradeExecution | None:
         """Open a BUY/LONG position if under max_positions, not in cooldown, and balance allows."""
-        if self.is_in_cooldown():
+        if self.is_in_cooldown() or self.is_symbol_in_cooldown(symbol):
             return None
         live_open = self.get_live_open_positions()
         tracked = self._state["open_positions"]
@@ -252,19 +275,19 @@ class BinanceTrader:
 
         notional = max(self.min_usd, min(self.max_usd, target_usd))
         free_usdt = self.get_free_usdt()
-        effective_lev = self.leverage
+        effective_lev = min(self.max_leverage, self.leverage)
         if self._is_um_futures() and free_usdt > 0:
-            # Auto-pick leverage if configured leverage is too low for $200-$300 notional
-            if free_usdt * effective_lev * 0.96 < self.min_usd:
-                needed_lev = int(math.ceil(notional / (free_usdt * 0.95)))
-                effective_lev = min(50, max(effective_lev, needed_lev))
+            # Auto-pick leverage up to safe max_leverage (never exceeds 15x so -2.5% SL triggers long before liquidation)
+            if free_usdt * effective_lev * 0.90 < self.min_usd:
+                needed_lev = int(math.ceil(notional / (free_usdt * 0.90)))
+                effective_lev = min(self.max_leverage, max(effective_lev, needed_lev))
 
         required_margin = (
             notional / effective_lev if self._is_um_futures() else notional
         )
         if free_usdt < required_margin:
             max_affordable_notional = (
-                free_usdt * effective_lev * 0.96
+                free_usdt * effective_lev * 0.90
                 if self._is_um_futures()
                 else free_usdt * 0.98
             )
@@ -286,7 +309,7 @@ class BinanceTrader:
         if self._is_um_futures():
             lev_path = "/papi/v1/um/leverage" if self.market == "papi" else "/fapi/v1/leverage"
             ord_path = "/papi/v1/um/order" if self.market == "papi" else "/fapi/v1/order"
-            for try_lev in dict.fromkeys([effective_lev, 40, 25, 20, self.leverage]):
+            for try_lev in dict.fromkeys([effective_lev, min(15, effective_lev), 10, 5]):
                 try:
                     self._signed_request(
                         "POST",
@@ -422,6 +445,10 @@ class BinanceTrader:
 
         if is_stop_loss:
             self._state["consecutive_stops"] = int(self._state.get("consecutive_stops", 0)) + 1
+            if self.symbol_stop_cooldown_minutes > 0:
+                self._state.setdefault("symbol_cooldowns", {})[symbol] = int(
+                    time.time() + self.symbol_stop_cooldown_minutes * 60
+                )
             if (
                 self.cooldown_minutes > 0
                 and self._state["consecutive_stops"] >= self.max_consecutive_stops

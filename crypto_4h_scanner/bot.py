@@ -72,14 +72,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--leverage",
         type=int,
-        default=int(os.getenv("LEVERAGE", "20")),
-        help="Varsayılan Futures kaldıraç oranı (gerekirse otomatik artırılır, varsayılan: 20)",
+        default=int(os.getenv("LEVERAGE", "15")),
+        help="Varsayılan Futures kaldıraç oranı (max 15x güvenlik tavanı, varsayılan: 15)",
+    )
+    p.add_argument(
+        "--max-leverage",
+        type=int,
+        default=int(os.getenv("MAX_LEVERAGE", "15")),
+        help="Likidasyon koruması için maksimum kaldıraç tavanı (varsayılan: 15)",
     )
     p.add_argument(
         "--stop-loss-pct",
         type=float,
-        default=float(os.getenv("STOP_LOSS_PCT", "1.0")),
-        help="Zarar kes yüzdesi (varsayılan: 1.0)",
+        default=float(os.getenv("STOP_LOSS_PCT", "2.5")),
+        help="Zarar kes yüzdesi (varsayılan: 2.5)",
     )
     p.add_argument(
         "--trailing-trigger-pct",
@@ -107,8 +113,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--trade-on-green",
         action="store_true",
-        default=os.getenv("TRADE_ON_GREEN", "true").strip().lower() in ("1", "true", "yes"),
-        help="Yeşil AL (3/5) sinyalinde de emir aç (varsayılan: açık)",
+        default=os.getenv("TRADE_ON_GREEN", "false").strip().lower() in ("1", "true", "yes"),
+        help="Yeşil AL (3/5) sinyalinde de emir aç (varsayılan: kapalı, sadece 5/5)",
     )
     p.add_argument(
         "--min-volume",
@@ -276,6 +282,7 @@ def main() -> None:
             max_usd=args.max_usd,
             max_positions=args.max_positions,
             leverage=args.leverage,
+            max_leverage=args.max_leverage,
             stop_loss_pct=active_stop_pct,
             trailing_trigger_pct=active_be_pct,
             trailing_callback_pct=args.trailing_callback_pct,
