@@ -700,12 +700,29 @@ class BinanceTrader:
                     if curr_price <= effective_sl:
                         reason = "TRAILING STOP" if self.use_trailing else "SAT (Kâr Kilidi)"
                 else:
+                    # At +1.0% profit, move Stop-Loss to 0% (break-even: entry_price)
+                    peak_pct = (
+                        ((peak_px - entry_px) / entry_px) * 100.0
+                        if entry_px > 0
+                        else 0.0
+                    )
+                    be_locked = bool(pos.get("be_locked", False))
+                    if not be_locked and peak_pct >= 1.0:
+                        be_locked = True
+                        pos["be_locked"] = True
+                        if entry_px > float(pos.get("sl_price") or 0.0):
+                            pos["sl_price"] = entry_px
+                            state_dirty = True
+                            if curr_price > entry_px:
+                                if self.place_exchange_stop_loss(sym, entry_px):
+                                    pos["exchange_sl_price"] = entry_px
+
                     sl_px = float(
                         pos.get("sl_price")
                         or (entry_px * (1.0 - self.stop_loss_pct / 100.0))
                     )
-                    if pnl_pct <= -self.stop_loss_pct or curr_price <= sl_px:
-                        reason = f"STOP (-%{self.stop_loss_pct:g})"
+                    if curr_price <= sl_px or (not be_locked and pnl_pct <= -self.stop_loss_pct):
+                        reason = "SAT (Başabaş %0)" if be_locked else f"STOP (-%{self.stop_loss_pct:g})"
 
                 if reason:
                     closed = self.close_position(
