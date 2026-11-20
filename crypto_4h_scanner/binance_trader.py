@@ -327,10 +327,24 @@ class BinanceTrader:
                     "side": "BUY",
                     "type": "MARKET",
                     "quantity": f"{qty:g}",
+                    "newOrderRespType": "RESULT",
                 },
             )
-            exec_price = float(res.get("avgPrice") or 0.0) or price
+            exec_price = float(res.get("avgPrice") or 0.0)
             exec_qty = float(res.get("executedQty") or 0.0) or qty
+            if exec_price <= 0:
+                # Binance PAPI/Futures market orders often return avgPrice=0 before fill settles;
+                # query the real Binance position entryPrice instead of using stale scan price!
+                time.sleep(0.35)
+                try:
+                    live_after = self.get_live_open_positions().get(symbol)
+                    if live_after and float(live_after.get("entry_price") or 0.0) > 0:
+                        exec_price = float(live_after["entry_price"])
+                        exec_qty = float(live_after.get("qty") or exec_qty)
+                except Exception:
+                    pass
+            if exec_price <= 0:
+                exec_price = self.fetch_public_price(symbol) or price
         else:
             res = self._signed_request(
                 "POST",
@@ -519,6 +533,14 @@ class BinanceTrader:
                         "opened_at": int(time.time()),
                     }
                     dirty = True
+                else:
+                    # Keep entry_price synced with Binance's real fill price
+                    live_ep = float(lpos.get("entry_price") or 0.0)
+                    if live_ep > 0 and abs(live_ep - float(tracked[sym].get("entry_price") or 0.0)) / live_ep > 0.001:
+                        tracked[sym]["entry_price"] = live_ep
+                        if not tracked[sym].get("trailing_active"):
+                            tracked[sym]["sl_price"] = live_ep * (1.0 - self.stop_loss_pct / 100.0)
+                        dirty = True
 
             # Remove positions no longer open on Binance
             for sym in list(tracked.keys()):
