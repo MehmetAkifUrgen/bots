@@ -96,8 +96,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--workers",
         type=int,
-        default=int(os.getenv("SCAN_WORKERS", "4")),
-        help="Paralel tarama iş parçacığı sayısı (varsayılan: 4)",
+        default=int(os.getenv("SCAN_WORKERS", "2")),
+        help="Paralel tarama iş parçacığı sayısı (varsayılan: 2)",
     )
     p.add_argument(
         "--no-auto-trade",

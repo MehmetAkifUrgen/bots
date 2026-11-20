@@ -314,12 +314,13 @@ class Binance4hScanner:
 
     def _scan_one_4h_bist(self, coin: dict) -> Coin4hResult | None:
         sym = coin["symbol"]
-        # 1000 x 4h bars = ~166 days (~5.5 months), matching TradingView 4H history
+        # Up to 3000 x 4h bars (~16.5 months) on initial load, matching TradingView 4H history;
+        # subsequent scans fetch only last 8 bars (weight=1)!
         df_4h = self.fetch_klines_cached(
-            sym, interval="4h", initial_limit=1000, pages=1, max_rows=1000
+            sym, interval="4h", initial_limit=1500, pages=2, max_rows=3000
         )
         df_1m = self.fetch_klines_cached(
-            sym, interval="1M", initial_limit=12, pages=1, max_rows=15
+            sym, interval="1M", initial_limit=24, pages=1, max_rows=30
         )
         ev = evaluate_4h_system(
             df_4h, df_1m=df_1m, pivot_len=7, be_trigger_pct=2.5, ema200_filter=False
