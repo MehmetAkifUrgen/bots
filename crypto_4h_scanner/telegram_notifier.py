@@ -94,7 +94,7 @@ def format_entry_message(
         f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
         f"🎯 <b>Kâr Al (Sinyal TP):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
         f"🛑 <b>Stop-Loss:</b> <b>-%2.50</b> (Borsa STOP_MARKET + 2sn takip)\n"
-        f"🔒 <b>Kâr Kilidi:</b> <b>+%2.20</b> görünce +%0.20 kilit + Sinyal SAT çıkışı\n"
+        f"📈 <b>Trailing Stop:</b> <b>+%2.00</b> → +%1.50 kilit, +%3.00 → +%2.50 (%0.5 takip)\n"
         f"{trade_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>5'li İndikatör + Üst Trend:</b>\n"

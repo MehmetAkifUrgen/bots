@@ -90,20 +90,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--trailing-trigger-pct",
         type=float,
-        default=float(os.getenv("TRAILING_TRIGGER_PCT", "2.2")),
-        help="Başabaş kâr kilidi tetik yüzdesi (varsayılan: 2.2)",
+        default=float(os.getenv("TRAILING_TRIGGER_PCT", "2.0")),
+        help="Trailing stop başlangıç kâr yüzdesi (varsayılan: 2.0)",
     )
     p.add_argument(
         "--use-trailing",
         action="store_true",
-        default=os.getenv("USE_TRAILING", "false").strip().lower() in ("1", "true", "yes"),
-        help="Sinyal TP/SAT yerine trailing stop kullan (varsayılan: kapalı, sinyal bazlı)",
+        default=os.getenv("USE_TRAILING", "true").strip().lower() in ("1", "true", "yes"),
+        help="Trailing stop kullan (+2%->+1.5%, +3%->+2.5%, varsayılan: açık)",
     )
     p.add_argument(
         "--trailing-callback-pct",
         type=float,
-        default=float(os.getenv("TRAILING_CALLBACK_PCT", "0.4")),
-        help="Trailing stop geri çekilme yüzdesi (varsayılan: 0.4)",
+        default=float(os.getenv("TRAILING_CALLBACK_PCT", "0.5")),
+        help="Trailing stop geri çekilme yüzdesi (varsayılan: 0.5)",
     )
     p.add_argument(
         "--cooldown-minutes",
@@ -292,7 +292,7 @@ def main() -> None:
             stop_loss_pct=active_stop_pct,
             trailing_trigger_pct=active_be_pct,
             trailing_callback_pct=args.trailing_callback_pct,
-            trailing_floor_pct=0.20,
+            trailing_floor_pct=1.50 if args.use_trailing else 0.20,
             use_trailing=args.use_trailing,
             cooldown_minutes=args.cooldown_minutes,
             state_file=DEFAULT_TRADE_STATE_FILE,

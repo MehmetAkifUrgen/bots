@@ -52,10 +52,10 @@ class BinanceTrader:
         leverage: int = 15,
         max_leverage: int = 15,
         stop_loss_pct: float = 2.5,
-        trailing_trigger_pct: float = 2.2,
-        trailing_callback_pct: float = 0.4,
-        trailing_floor_pct: float = 0.2,
-        use_trailing: bool = False,
+        trailing_trigger_pct: float = 2.0,
+        trailing_callback_pct: float = 0.5,
+        trailing_floor_pct: float = 1.5,
+        use_trailing: bool = True,
         max_consecutive_stops: int = 3,
         cooldown_minutes: int = 0,
         symbol_stop_cooldown_minutes: int = 180,
@@ -674,21 +674,27 @@ class BinanceTrader:
 
                 reason: str | None = None
                 tp_px = float(pos.get("tp_price") or 0.0)
-                if tp_px > 0 and curr_price >= tp_px:
+                if (not self.use_trailing) and tp_px > 0 and curr_price >= tp_px:
                     reason = "KÂR AL (Direnç)"
                 elif trailing_active:
-                    floor_sl = entry_px * (1.0 + self.trailing_floor_pct / 100.0)
                     if self.use_trailing:
-                        trail_sl = peak_px * (1.0 - self.trailing_callback_pct / 100.0)
-                        effective_sl = max(floor_sl, trail_sl)
+                        peak_pct = (
+                            ((peak_px - entry_px) / entry_px) * 100.0
+                            if entry_px > 0
+                            else 0.0
+                        )
+                        lock_pct = max(
+                            self.trailing_floor_pct,
+                            peak_pct - self.trailing_callback_pct,
+                        )
+                        effective_sl = entry_px * (1.0 + lock_pct / 100.0)
                     else:
-                        # Pine Script Break-Even Lock: lock at +0.20% and wait for TP or signal SAT
-                        effective_sl = floor_sl
+                        effective_sl = entry_px * (1.0 + self.trailing_floor_pct / 100.0)
                     if effective_sl > float(pos.get("sl_price") or 0.0):
                         pos["sl_price"] = effective_sl
                         state_dirty = True
                         ex_sl = float(pos.get("exchange_sl_price") or 0.0)
-                        if effective_sl > ex_sl * 1.001 and curr_price > effective_sl:
+                        if effective_sl > ex_sl * 1.002 and curr_price > effective_sl:
                             if self.place_exchange_stop_loss(sym, effective_sl):
                                 pos["exchange_sl_price"] = effective_sl
                     if curr_price <= effective_sl:
