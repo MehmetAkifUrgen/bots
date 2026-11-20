@@ -21,7 +21,7 @@ FAPI_BASE = "https://fapi.binance.com"
 SPOT_BASE = "https://api.binance.com"
 
 MarketType = Literal["futures", "papi", "spot"]
-TimeframeType = Literal["2h", "45m", "1h", "15m"]
+TimeframeType = Literal["45m", "1h", "15m"]
 
 
 @dataclass
@@ -32,7 +32,7 @@ class Coin4hResult:
     change_24h: float
     volume_24h_usdt: float
     evaluation: SystemEvaluation
-    timeframe: TimeframeType = "2h"
+    timeframe: TimeframeType = "45m"
 
 
 def _klines_to_df(raw: list[list]) -> pd.DataFrame:
@@ -53,7 +53,7 @@ class Binance4hScanner:
     def __init__(
         self,
         market: MarketType = "futures",
-        timeframe: TimeframeType = "2h",
+        timeframe: TimeframeType = "45m",
         max_workers: int = 4,
         timeout: float = 10.0,
     ) -> None:
@@ -232,18 +232,7 @@ class Binance4hScanner:
 
     def _scan_one(self, coin: dict) -> Coin4hResult | None:
         sym = coin["symbol"]
-        if self.timeframe == "2h":
-            # Native 2h klines: 1000 bars (~83 days) in 1 request (weight 5 initial, weight 1 incremental)
-            df_ltf = self.fetch_klines_cached(
-                sym, interval="2h", initial_limit=1000, pages=1, max_rows=1000
-            )
-            df_trend = self.fetch_klines_cached(
-                sym, interval="4h", initial_limit=500, pages=1, max_rows=550
-            )
-            df_pivot = self.fetch_klines_cached(
-                sym, interval="1d", initial_limit=90, pages=1, max_rows=100
-            )
-        elif self.timeframe == "45m":
+        if self.timeframe == "45m":
             # 2 pages x 1000 (weight 5 each on first load, weight 1 on subsequent scans!)
             df_15m = self.fetch_klines_cached(
                 sym, interval="15m", initial_limit=1000, pages=2, max_rows=2000
