@@ -207,11 +207,14 @@ class BinanceTrader:
             step_size = 0.001
             min_qty = 0.001
             min_notional = 5.0
+            tick_size = 0.0001
             for f in sym_info.get("filters", []):
                 ftype = f.get("filterType")
                 if ftype == "LOT_SIZE":
                     step_size = float(f.get("stepSize", step_size))
                     min_qty = float(f.get("minQty", min_qty))
+                elif ftype == "PRICE_FILTER":
+                    tick_size = float(f.get("tickSize", tick_size))
                 elif ftype in ("MIN_NOTIONAL", "NOTIONAL"):
                     min_notional = float(
                         f.get("notional") or f.get("minNotional") or min_notional
@@ -220,7 +223,68 @@ class BinanceTrader:
                 "stepSize": step_size,
                 "minQty": min_qty,
                 "minNotional": min_notional,
+                "tickSize": tick_size,
             }
+
+    def cancel_exchange_stop_losses(self, symbol: str) -> None:
+        """Cancel all open algo/stop orders for a symbol on Binance."""
+        if not self._is_um_futures() or not self.is_configured:
+            return
+        try:
+            if self.market == "papi":
+                self._signed_request(
+                    "DELETE", "/papi/v1/um/algo/allOpenOrders", {"symbol": symbol}
+                )
+            else:
+                self._signed_request(
+                    "DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}
+                )
+        except Exception:
+            pass
+
+    def place_exchange_stop_loss(self, symbol: str, sl_price: float) -> str | None:
+        """Place a real exchange-side STOP_MARKET order on Binance (millisecond execution)."""
+        if not self._is_um_futures() or not self.is_configured or sl_price <= 0:
+            return None
+        self._ensure_filters()
+        tick = float(self._filters_cache.get(symbol, {}).get("tickSize", 0.0001))
+        rounded_sl = _round_step(sl_price, tick)
+        if rounded_sl <= 0:
+            rounded_sl = sl_price
+
+        self.cancel_exchange_stop_losses(symbol)
+        try:
+            if self.market == "papi":
+                res = self._signed_request(
+                    "POST",
+                    "/papi/v1/um/algo/order",
+                    {
+                        "symbol": symbol,
+                        "side": "SELL",
+                        "algoType": "CONDITIONAL",
+                        "type": "STOP_MARKET",
+                        "triggerPrice": f"{rounded_sl:g}",
+                        "closePosition": "true",
+                        "workingType": "CONTRACT_PRICE",
+                    },
+                )
+                return str(res.get("algoId") or res.get("orderId") or "")
+            else:
+                res = self._signed_request(
+                    "POST",
+                    "/fapi/v1/order",
+                    {
+                        "symbol": symbol,
+                        "side": "SELL",
+                        "type": "STOP_MARKET",
+                        "stopPrice": f"{rounded_sl:g}",
+                        "closePosition": "true",
+                        "workingType": "CONTRACT_PRICE",
+                    },
+                )
+                return str(res.get("orderId") or "")
+        except Exception:
+            return None
 
     def get_free_usdt(self) -> float:
         if self.market == "papi":
@@ -373,6 +437,7 @@ class BinanceTrader:
         order_id = str(res.get("orderId", ""))
         actual_not = round(exec_qty * exec_price, 2)
         sl_price = exec_price * (1.0 - self.stop_loss_pct / 100.0)
+        algo_sl_id = self.place_exchange_stop_loss(symbol, sl_price)
         self._state["open_positions"][symbol] = {
             "symbol": symbol,
             "order_id": order_id,
@@ -380,6 +445,7 @@ class BinanceTrader:
             "qty": exec_qty,
             "notional_usd": actual_not,
             "sl_price": sl_price,
+            "exchange_sl_price": sl_price if algo_sl_id else 0.0,
             "peak_price": exec_price,
             "trailing_active": False,
             "opened_at": int(time.time()),
@@ -453,6 +519,7 @@ class BinanceTrader:
                 exec_qty = float(res.get("executedQty") or qty)
                 exec_price = fallback_price
 
+        self.cancel_exchange_stop_losses(symbol)
         prev_pos = self._state["open_positions"].pop(symbol, None)
         entry_px = float((prev_pos or pos).get("entry_price") or exec_price)
         pnl_usd = (exec_price - entry_px) * exec_qty
@@ -606,6 +673,10 @@ class BinanceTrader:
                     if effective_sl > float(pos.get("sl_price") or 0.0):
                         pos["sl_price"] = effective_sl
                         state_dirty = True
+                        ex_sl = float(pos.get("exchange_sl_price") or 0.0)
+                        if effective_sl > ex_sl * 1.002 and curr_price > effective_sl:
+                            if self.place_exchange_stop_loss(sym, effective_sl):
+                                pos["exchange_sl_price"] = effective_sl
                     if curr_price <= effective_sl:
                         reason = "TRAILING STOP"
                 else:

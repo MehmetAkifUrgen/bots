@@ -310,7 +310,7 @@ def main() -> None:
             )
         except Exception as exc:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] İlk senkron hatası: {exc}")
-        _start_position_monitor(trader, notifier, dry_run=args.dry_run, interval_sec=5)
+        _start_position_monitor(trader, notifier, dry_run=args.dry_run, interval_sec=2)
 
     trade_mode_str = (
         f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, -%{active_stop_pct:g} SL, +%{active_be_pct:g} Trail)"
