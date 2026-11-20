@@ -1,4 +1,4 @@
-"""Railway / CLI 4-Hour Telegram-Only Alert Scanner (WR >= 60%, Profit >= 200%)."""
+"""Railway / CLI 4-Hour Auto-Trading & Telegram Bot (WR >= 60%, Profit >= 200%)."""
 
 from __future__ import annotations
 
@@ -15,21 +15,53 @@ import time
 from dotenv import load_dotenv
 
 from .binance_scanner import Binance4hScanner
-from .telegram_notifier import TelegramNotifier
+from .binance_trader import BinanceTrader
+from .telegram_notifier import TelegramNotifier, format_managed_close_message
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_STATE_FILE = Path(__file__).resolve().parent / "alert_state.json"
+DEFAULT_TRADE_STATE_FILE = Path(__file__).resolve().parent / "trade_state.json"
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Binance 4S (4H) Telegram Bildirim Tarayıcısı (Sadece Bildirim — Emir Yok)"
+        description="Binance 4S (4H) Otomatik Al-Sat & Telegram Botu (WR >= %60, Getiri >= %200)"
     )
     p.add_argument(
         "--market",
         choices=["futures", "papi", "spot"],
-        default=os.getenv("BINANCE_MARKET", "futures"),
-        help="Taranacak Binance piyasası (varsayılan: futures)",
+        default=os.getenv("BINANCE_MARKET", "papi"),
+        help="Taranacak ve işlem açılacak Binance piyasası (varsayılan: papi)",
+    )
+    p.add_argument(
+        "--min-usd",
+        type=float,
+        default=float(os.getenv("MIN_POSITION_USD", "150")),
+        help="Minimum pozisyon büyüklüğü USD (varsayılan: 150)",
+    )
+    p.add_argument(
+        "--max-usd",
+        type=float,
+        default=float(os.getenv("MAX_POSITION_USD", "250")),
+        help="Maksimum pozisyon büyüklüğü USD (varsayılan: 250)",
+    )
+    p.add_argument(
+        "--max-positions",
+        type=int,
+        default=int(os.getenv("MAX_OPEN_POSITIONS", "3")),
+        help="Aynı anda açık olabilecek maksimum pozisyon sayısı (varsayılan: 3)",
+    )
+    p.add_argument(
+        "--leverage",
+        type=int,
+        default=int(os.getenv("LEVERAGE", "15")),
+        help="Varsayılan kaldıraç (max 15x güvenlik tavanı, varsayılan: 15)",
+    )
+    p.add_argument(
+        "--max-leverage",
+        type=int,
+        default=int(os.getenv("MAX_LEVERAGE", "15")),
+        help="Likidasyon koruması için maksimum kaldıraç tavanı (varsayılan: 15)",
     )
     p.add_argument(
         "--min-volume",
@@ -58,14 +90,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--poll-seconds",
         type=int,
-        default=int(os.getenv("POLL_SECONDS", "300")),
-        help="Taramalar arası bekleme süresi saniye (varsayılan: 300)",
+        default=int(os.getenv("POLL_SECONDS", "180")),
+        help="Taramalar arası bekleme süresi saniye (varsayılan: 180)",
     )
     p.add_argument(
         "--workers",
         type=int,
         default=int(os.getenv("SCAN_WORKERS", "4")),
         help="Paralel tarama iş parçacığı sayısı (varsayılan: 4)",
+    )
+    p.add_argument(
+        "--no-auto-trade",
+        action="store_true",
+        help="Binance API bağlı olsa bile otomatik emir açma (sadece Telegram bildirimi)",
     )
     p.add_argument(
         "--once",
@@ -93,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 _HEALTH_STATE: dict = {
     "status": "starting",
-    "mode": "4h_telegram_only",
+    "mode": "4h_auto_trade",
     "last_scan_at": None,
     "total_scanned": 0,
     "qualifying_coins": 0,
@@ -120,6 +157,49 @@ def _start_health_server(port: int) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Health HTTP sunucusu :{port} portunda aktif")
 
 
+def _start_position_monitor(
+    trader: BinanceTrader,
+    notifier: TelegramNotifier,
+    dry_run: bool = False,
+    interval_sec: int = 2,
+) -> None:
+    """Fast 2-second monitor for Pivot TP, +2.5% Break-Even Lock (+0.3%), and Stop-Loss."""
+
+    def _loop() -> None:
+        last_sync = 0.0
+        while True:
+            try:
+                notifier.poll_commands(trader)
+                now = time.time()
+                if now - last_sync >= 60.0:
+                    synced = trader.sync_live_positions()
+                    last_sync = now
+                    if synced:
+                        print(
+                            f"[{datetime.now().strftime('%H:%M:%S')}] "
+                            f"Açık pozisyon senkronu: {list(synced.keys())}"
+                        )
+                if trader.has_open_positions() and not dry_run:
+                    closed_events = trader.manage_open_positions()
+                    for ev in closed_events:
+                        print(
+                            f"[{datetime.now().strftime('%H:%M:%S')}] "
+                            f"KAPANIŞ: {ev['symbol']} {ev['reason']} "
+                            f"({ev['pnl_usd']:+.2f}$ / {ev['pnl_pct']:+.2f}%)"
+                        )
+                        try:
+                            notifier.send_text(format_managed_close_message(ev))
+                        except Exception as exc:
+                            print(f"  Telegram kapanış bildirim hatası: {exc}")
+            except Exception as exc:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Pozisyon takip hatası: {exc}")
+            time.sleep(interval_sec)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Hızlı TP / Kâr Kilidi / Stop takipçisi aktif (her {interval_sec}sn)")
+
+
 def main() -> None:
     load_dotenv(ROOT_DIR / ".env")
     args = build_parser().parse_args()
@@ -135,20 +215,66 @@ def main() -> None:
 
     if args.test_telegram:
         ok = notifier.send_text(
-            "✅ <b>4S (4H) Telegram Tarayıcı</b> aktif! (Sadece Bildirim — WR>=%60 & Getiri>=%200)"
+            "✅ <b>4S (4H) Otomatik Al-Sat Botu</b> aktif! (WR>=%60 & Getiri>=%200)"
         )
         print("Telegram test:", "OK" if ok else "FAILED")
         return
+
+    auto_trade_env = os.getenv("AUTO_TRADE", "true").strip().lower() not in ("0", "false", "no")
+    api_key = os.getenv("BINANCE_API_KEY", "")
+    api_secret = os.getenv("BINANCE_API_SECRET", "")
+    proxy_url = (
+        os.getenv("BINANCE_PROXY_URL")
+        or os.getenv("FIXIE_URL")
+        or os.getenv("HTTPS_PROXY")
+        or ""
+    )
+    trader: BinanceTrader | None = None
+    if auto_trade_env and not args.no_auto_trade and api_key and api_secret:
+        trader = BinanceTrader(
+            api_key=api_key,
+            api_secret=api_secret,
+            market=args.market,
+            min_usd=args.min_usd,
+            max_usd=args.max_usd,
+            max_positions=args.max_positions,
+            leverage=args.leverage,
+            max_leverage=args.max_leverage,
+            stop_loss_pct=3.5,          # Fallback if pivot SL not in [0.5%..5%]
+            trailing_trigger_pct=2.5,   # Pine Script: +%2.5 Kâr Kilidi tetik
+            trailing_callback_pct=0.8,  # Trailing callback after +%2.5
+            trailing_floor_pct=0.3,     # Pine Script: entry * 1.003 (+%0.30)
+            cooldown_minutes=0,
+            symbol_stop_cooldown_minutes=180,
+            state_file=DEFAULT_TRADE_STATE_FILE,
+            proxy_url=proxy_url,
+        )
 
     scanner = Binance4hScanner(market=args.market, max_workers=args.workers)
 
     if args.port > 0 and not args.once:
         _start_health_server(args.port)
 
+    if trader and not args.once:
+        try:
+            synced = trader.sync_live_positions()
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}] "
+                f"Binance canlı pozisyon senkronu: {list(synced.keys()) or 'YOK'}"
+            )
+        except Exception as exc:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] İlk senkron hatası: {exc}")
+        _start_position_monitor(trader, notifier, dry_run=args.dry_run, interval_sec=2)
+
+    trade_mode_str = (
+        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, Pivot TP/SL, +%2.5 Kâr Kilidi)"
+        if trader
+        else "KAPALI (Sadece Bildirim)"
+    )
     print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] 4S (4H) Telegram Tarayıcısı başlatıldı | "
-        f"Mod=SADECE BİLDİRİM (Emir Yok) | Filtre=WR>={args.min_win_rate:g}% & Getiri>={args.min_profit_pct:g}% | "
-        f"MinHacim=${args.min_volume:,.0f} | Periyot={args.poll_seconds}sn"
+        f"[{datetime.now().strftime('%H:%M:%S')}] 4S (4H) Otomatik Al-Sat Botu başlatıldı | "
+        f"Piyasa={args.market.upper()} | OtoAlım={trade_mode_str} | "
+        f"Filtre=WR>={args.min_win_rate:g}% & Getiri>={args.min_profit_pct:g}% | Periyot={args.poll_seconds}sn"
     )
 
     while True:
@@ -162,6 +288,7 @@ def main() -> None:
                 min_win_rate=args.min_win_rate,
                 min_profit_pct=args.min_profit_pct,
                 dry_run=args.dry_run,
+                trader=trader,
             )
 
             qual = sum(
@@ -184,13 +311,13 @@ def main() -> None:
             )
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
-                f"[4S BİLDİRİM] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
+                f"[4S BOT] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
                 f"Şarta Uyan (WR>=%{args.min_win_rate:g} & Getiri>=%{args.min_profit_pct:g}): {qual} | "
                 f"Tetiklenen Yeşil: {green_now}, Turuncu: {orange_now} | "
-                f"Gönderilen -> Yeşil: {stats['green']}, Turuncu: {stats['orange']}"
+                f"Emir -> Açılan: {stats['orders_opened']}, Kapanan: {stats['orders_closed']}"
             )
             if stats["errors"]:
-                print("  Telegram hataları:", stats["errors"][:5])
+                print("  Hatalar:", stats["errors"][:5])
         except Exception as exc:
             err_str = str(exc)
             _HEALTH_STATE.update({"status": "error", "last_error": err_str})

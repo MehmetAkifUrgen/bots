@@ -122,14 +122,19 @@ def format_managed_close_message(ev_dict: dict) -> str:
     )
 
 
-def format_4h_alert_only_message(res: Coin4hResult, kind: str) -> str:
+def format_4h_alert_only_message(
+    res: Coin4hResult,
+    kind: str,
+    trade_exec: TradeExecution | None = None,
+    trade_note: str | None = None,
+) -> str:
     ev = res.evaluation
     if kind == "ORANGE":
-        header = "📢 <b>[4S TARAYICI] 🟠 TURUNCU KESİN AL (5/5)</b>"
+        header = "🟠 <b>[4S SİSTEM] TURUNCU KESİN AL (5/5)</b>"
     else:
-        header = "📢 <b>[4S TARAYICI] 🟢 YEŞİL AL (İlk 3/5)</b>"
+        header = "🟢 <b>[4S SİSTEM] YEŞİL AL (İlk 3/5)</b>"
 
-    entry = ev.entry_price or res.price
+    entry = trade_exec.price if trade_exec else (ev.entry_price or res.price)
     tp = ev.tp_level or ev.next_res
     sl = ev.sl_level or ev.prev_sup
     tp_pct = ((tp - entry) / entry * 100.0) if entry > 0 else 0.0
@@ -138,17 +143,28 @@ def format_4h_alert_only_message(res: Coin4hResult, kind: str) -> str:
         "%Y-%m-%d %H:%M UTC"
     )
 
+    trade_block = ""
+    if trade_exec:
+        trade_block = (
+            f"\n⚡ <b>OTOMATİK EMİR AÇILDI</b>\n"
+            f"• Büyüklük: <b>${trade_exec.notional_usd:.2f}</b> | Miktar: <code>{trade_exec.qty:g}</code>\n"
+            f"• Emir ID: <code>{trade_exec.order_id}</code>\n"
+        )
+    elif trade_note:
+        trade_block = f"\nℹ️ <i>{trade_note}</i>\n"
+
     def mark(ok: bool) -> str:
         return "✅" if ok else "❌"
 
     return (
         f"{header}\n"
-        f"🪙 <b>{res.symbol}</b> | <code>4S (4H)</code> | <i>Sadece Bildirim (Emir Yok)</i>\n"
+        f"🪙 <b>{res.symbol}</b> | <code>4S (4H)</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
         f"🎯 <b>Kâr Al (Direnç):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
         f"🛑 <b>Stop (Destek):</b> <code>{fmt_price(sl)}</code> (<b>{sl_pct:.2f}%</b>)\n"
         f"🔒 <b>Kâr Kilidi:</b> +%2.50 görünce SL → +%0.30\n"
+        f"{trade_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>5'li İndikatör Durumu:</b>\n"
         f"• StochRSI: {mark(ev.cond1_buy)} | RSI+MA: {mark(ev.cond2_buy)} | Fisher: {mark(ev.cond3_buy)}\n"
@@ -447,10 +463,30 @@ class TelegramNotifier:
         min_win_rate: float = 60.0,
         min_profit_pct: float = 200.0,
         dry_run: bool = False,
+        trader: BinanceTrader | None = None,
     ) -> dict:
-        """Send Telegram-only alerts for 4H BIST-style system when WR>=60% and Profit>=200%."""
+        """Process 4H BIST-style signals: open Binance orders (when trader active) & send Telegram alerts."""
         sent_alerts: dict[str, int] = self._state["sent_alerts"]
-        stats = {"green": 0, "orange": 0, "errors": []}
+        stats = {
+            "green": 0,
+            "orange": 0,
+            "orders_opened": 0,
+            "orders_closed": 0,
+            "errors": [],
+        }
+
+        if trader and trader.is_configured and not dry_run:
+            price_map = {r.symbol: r.price for r in results}
+            try:
+                closed_events = trader.manage_open_positions(price_map)
+                for ev_dict in closed_events:
+                    stats["orders_closed"] += 1
+                    try:
+                        self.send_text(format_managed_close_message(ev_dict))
+                    except Exception as exc:
+                        stats["errors"].append(f"{ev_dict['symbol']} CLOSE MSG: {exc}")
+            except Exception as exc:
+                stats["errors"].append(f"MANAGE_POS: {exc}")
 
         for res in results:
             ev = res.evaluation
@@ -460,13 +496,34 @@ class TelegramNotifier:
             if ev.orange_trigger:
                 alert_key = f"4h_bist:{res.symbol}:ORANGE:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
+                    trade_exec: TradeExecution | None = None
+                    trade_note: str | None = None
+                    if trader and trader.is_configured and not dry_run:
+                        try:
+                            trade_exec = trader.open_position(
+                                res.symbol,
+                                res.price,
+                                trader.max_usd,
+                                tp_price=ev.tp_level or ev.next_res,
+                                sl_price=ev.sl_level or ev.prev_sup,
+                            )
+                            if trade_exec:
+                                stats["orders_opened"] += 1
+                            else:
+                                trade_note = f"Emir açılmadı (Max {trader.max_positions} pozisyon, coin bekleme veya yetersiz marj)."
+                        except Exception as exc:
+                            trade_note = f"Emir hatası: {exc}"
                     try:
                         if dry_run:
                             print(
                                 f"[DRY-RUN 4H ORANGE] {res.symbol} WR={ev.win_rate}% Profit={ev.total_profit_pct}%"
                             )
                         else:
-                            self.send_text(format_4h_alert_only_message(res, "ORANGE"))
+                            self.send_text(
+                                format_4h_alert_only_message(
+                                    res, "ORANGE", trade_exec=trade_exec, trade_note=trade_note
+                                )
+                            )
                         sent_alerts[alert_key] = int(time.time())
                         stats["orange"] += 1
                     except Exception as exc:
@@ -474,13 +531,34 @@ class TelegramNotifier:
             elif ev.green_trigger:
                 alert_key = f"4h_bist:{res.symbol}:GREEN:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
+                    trade_exec = None
+                    trade_note = None
+                    if trader and trader.is_configured and not dry_run:
+                        try:
+                            trade_exec = trader.open_position(
+                                res.symbol,
+                                res.price,
+                                trader.min_usd,
+                                tp_price=ev.tp_level or ev.next_res,
+                                sl_price=ev.sl_level or ev.prev_sup,
+                            )
+                            if trade_exec:
+                                stats["orders_opened"] += 1
+                            else:
+                                trade_note = f"Emir açılmadı (Max {trader.max_positions} pozisyon, coin bekleme veya yetersiz marj)."
+                        except Exception as exc:
+                            trade_note = f"Emir hatası: {exc}"
                     try:
                         if dry_run:
                             print(
                                 f"[DRY-RUN 4H GREEN] {res.symbol} WR={ev.win_rate}% Profit={ev.total_profit_pct}%"
                             )
                         else:
-                            self.send_text(format_4h_alert_only_message(res, "GREEN"))
+                            self.send_text(
+                                format_4h_alert_only_message(
+                                    res, "GREEN", trade_exec=trade_exec, trade_note=trade_note
+                                )
+                            )
                         sent_alerts[alert_key] = int(time.time())
                         stats["green"] += 1
                     except Exception as exc:

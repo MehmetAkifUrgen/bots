@@ -322,7 +322,12 @@ class BinanceTrader:
         return dict(self._state["open_positions"])
 
     def open_position(
-        self, symbol: str, price: float, target_usd: float
+        self,
+        symbol: str,
+        price: float,
+        target_usd: float,
+        tp_price: float | None = None,
+        sl_price: float | None = None,
     ) -> TradeExecution | None:
         """Open a BUY/LONG position if under max_positions, not in cooldown, and balance allows."""
         if self.is_in_cooldown() or self.is_symbol_in_cooldown(symbol):
@@ -436,16 +441,27 @@ class BinanceTrader:
 
         order_id = str(res.get("orderId", ""))
         actual_not = round(exec_qty * exec_price, 2)
-        sl_price = exec_price * (1.0 - self.stop_loss_pct / 100.0)
-        algo_sl_id = self.place_exchange_stop_loss(symbol, sl_price)
+        default_sl = exec_price * (1.0 - self.stop_loss_pct / 100.0)
+        # Use Pine Script Pivot SL if valid and not wider than -5% safety floor
+        if sl_price is not None and exec_price * 0.95 <= sl_price < exec_price * 0.995:
+            final_sl = sl_price
+        else:
+            final_sl = default_sl
+        final_tp = (
+            tp_price
+            if (tp_price is not None and tp_price > exec_price * 1.01)
+            else 0.0
+        )
+        algo_sl_id = self.place_exchange_stop_loss(symbol, final_sl)
         self._state["open_positions"][symbol] = {
             "symbol": symbol,
             "order_id": order_id,
             "entry_price": exec_price,
             "qty": exec_qty,
             "notional_usd": actual_not,
-            "sl_price": sl_price,
-            "exchange_sl_price": sl_price if algo_sl_id else 0.0,
+            "sl_price": final_sl,
+            "tp_price": final_tp,
+            "exchange_sl_price": final_sl if algo_sl_id else 0.0,
             "peak_price": exec_price,
             "trailing_active": False,
             "opened_at": int(time.time()),
@@ -666,7 +682,10 @@ class BinanceTrader:
                     state_dirty = True
 
                 reason: str | None = None
-                if trailing_active:
+                tp_px = float(pos.get("tp_price") or 0.0)
+                if tp_px > 0 and curr_price >= tp_px:
+                    reason = "KÂR AL (Direnç)"
+                elif trailing_active:
                     floor_sl = entry_px * (1.0 + self.trailing_floor_pct / 100.0)
                     trail_sl = peak_px * (1.0 - self.trailing_callback_pct / 100.0)
                     effective_sl = max(floor_sl, trail_sl)
@@ -678,7 +697,7 @@ class BinanceTrader:
                             if self.place_exchange_stop_loss(sym, effective_sl):
                                 pos["exchange_sl_price"] = effective_sl
                     if curr_price <= effective_sl:
-                        reason = "TRAILING STOP"
+                        reason = "SAT (Kâr Kilidi)" if tp_px > 0 else "TRAILING STOP"
                 else:
                     sl_px = float(
                         pos.get("sl_price")
