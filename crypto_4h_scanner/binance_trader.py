@@ -49,8 +49,8 @@ class BinanceTrader:
         min_usd: float = 200.0,
         max_usd: float = 300.0,
         max_positions: int = 3,
-        leverage: int = 15,
-        max_leverage: int = 15,
+        leverage: int = 20,
+        max_leverage: int = 125,
         stop_loss_pct: float = 2.5,
         trailing_trigger_pct: float = 2.0,
         trailing_callback_pct: float = 0.5,
@@ -379,7 +379,7 @@ class BinanceTrader:
         if self._is_um_futures():
             lev_path = "/papi/v1/um/leverage" if self.market == "papi" else "/fapi/v1/leverage"
             ord_path = "/papi/v1/um/order" if self.market == "papi" else "/fapi/v1/order"
-            for try_lev in dict.fromkeys([effective_lev, min(15, effective_lev), 10, 5]):
+            for try_lev in dict.fromkeys([effective_lev, 50, 40, 25, 20, 10, 5]):
                 try:
                     self._signed_request(
                         "POST",

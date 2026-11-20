@@ -72,14 +72,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--leverage",
         type=int,
-        default=int(os.getenv("LEVERAGE", "15")),
-        help="Varsayılan Futures kaldıraç oranı (max 15x güvenlik tavanı, varsayılan: 15)",
+        default=int(os.getenv("LEVERAGE", "20")),
+        help="Varsayılan Futures kaldıraç oranı (gerekirse otomatik artırılır, varsayılan: 20)",
     )
     p.add_argument(
         "--max-leverage",
         type=int,
-        default=int(os.getenv("MAX_LEVERAGE", "15")),
-        help="Likidasyon koruması için maksimum kaldıraç tavanı (varsayılan: 15)",
+        default=int(os.getenv("MAX_LEVERAGE", "125")),
+        help="Maksimum kaldıraç tavanı (varsayılan: 125)",
     )
     p.add_argument(
         "--stop-loss-pct",
