@@ -79,8 +79,12 @@ def format_entry_message(
     elif trade_note:
         trade_block = f"\nℹ️ <i>{trade_note}</i>\n"
 
-    tf = getattr(res, "timeframe", "45m")
-    tf_badge = "15dk (15m)" if tf == "15m" else ("45dk (45m)" if tf == "45m" else "1S (1h)")
+    tf = getattr(res, "timeframe", "2h")
+    tf_badge = (
+        "2S (2h)"
+        if tf == "2h"
+        else ("15dk (15m)" if tf == "15m" else ("45dk (45m)" if tf == "45m" else "1S (1h)"))
+    )
     htf_label = "1S EMA50" if tf == "15m" else "4S EMA50"
 
     return (
@@ -88,9 +92,9 @@ def format_entry_message(
         f"🪙 <b>{res.symbol}</b> | <code>{tf_badge}</code> | {market_label}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
-        f"🎯 <b>Kâr Al (Direnç):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
-        f"🛑 <b>Stop-Loss:</b> <b>-%2.50</b> (Oto Zarar Kes)\n"
-        f"🔒 <b>Trailing Stop:</b> <b>+%2.00</b> kârda başlar (+%0.20 taban)\n"
+        f"🎯 <b>Kâr Al (Sinyal TP):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
+        f"🛑 <b>Stop-Loss:</b> <b>-%2.50</b> (Borsa STOP_MARKET + 2sn takip)\n"
+        f"🔒 <b>Kâr Kilidi:</b> <b>+%2.20</b> görünce +%0.20 kilit + Sinyal SAT çıkışı\n"
         f"{trade_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>5'li İndikatör + Üst Trend:</b>\n"
@@ -261,7 +265,10 @@ class TelegramNotifier:
                 f"Mola aktif (art arda 3 stop) — {rem} dk boyunca yeni emir açılmayacak.",
             )
         try:
-            exec_res = trader.open_position(res.symbol, res.price, target_usd)
+            tp_px = res.evaluation.tp_level or res.evaluation.next_res
+            exec_res = trader.open_position(
+                res.symbol, res.price, target_usd, tp_price=tp_px
+            )
             if exec_res is None:
                 return (
                     None,
@@ -382,11 +389,32 @@ class TelegramNotifier:
                     except Exception as exc:
                         stats["errors"].append(f"{res.symbol} GREEN: {exc}")
 
-            # 3. İndikatör ÇIKIŞ bildirimi (only when trader is NOT managing live SL/Trailing, or notify_all_exits)
-            elif ev.exit_trigger and (notify_all_exits or (track_key in tracked and not (trader and trader.is_configured))):
+            # 3. Sinyal ÇIKIŞ (KÂR AL / SAT / STOP) -> Açık pozisyonu kapat ve bildir
+            elif ev.exit_trigger and (
+                notify_all_exits
+                or track_key in tracked
+                or (trader and trader.is_configured and res.symbol in trader._state.get("open_positions", {}))
+            ):
                 alert_key = f"{track_key}:{res.timeframe}:EXIT:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
-                    msg = format_exit_message(res)
+                    close_exec: TradeExecution | None = None
+                    if (
+                        trader
+                        and trader.is_configured
+                        and not dry_run
+                        and res.symbol in trader._state.get("open_positions", {})
+                    ):
+                        try:
+                            close_exec = trader.close_position(
+                                res.symbol,
+                                fallback_price=res.price,
+                                is_stop_loss=(ev.exit_reason == "STOP"),
+                            )
+                            if close_exec:
+                                stats["orders_closed"] += 1
+                        except Exception as exc:
+                            stats["errors"].append(f"{res.symbol} SIGNAL CLOSE: {exc}")
+                    msg = format_exit_message(res, trade_exec=close_exec)
                     try:
                         if dry_run:
                             print(f"[DRY-RUN EXIT] {res.symbol} ({ev.exit_reason})")

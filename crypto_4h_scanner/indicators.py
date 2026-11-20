@@ -462,8 +462,10 @@ def evaluate_4h_system(
                 be_locked = True
                 sl_level = entry_price * 1.003
 
-            hit_stop = bar_c < sl_level
+            is_confirmed = i < n - 1
+            hit_stop = is_confirmed and (bar_c < sl_level)
             hit_tp = bar_h >= tp_level
+            hit_sell = is_confirmed and real_sell
 
             if hit_tp:
                 exit_trig = True
@@ -499,7 +501,7 @@ def evaluate_4h_system(
                 entry_price = None
                 tp_level = None
                 sl_level = None
-            elif real_sell:
+            elif hit_sell:
                 exit_trig = True
                 trade_pct = ((bar_c - entry_price) / entry_price) * 100.0
                 total_trades += 1
@@ -516,13 +518,26 @@ def evaluate_4h_system(
                 tp_level = None
                 sl_level = None
 
-        if i == n - 1:
-            last_green_trig = green_trig
-            last_orange_trig = orange_trig
-            last_exit_trig = exit_trig
+        if i == n - 2 and exit_trig:
+            # Preserve confirmed bar-close exit so live bot catches it right after 2h candle closes
+            last_exit_trig = True
             last_exit_reason = exit_reason
             last_exit_price = exit_price
             last_exit_pct = exit_pct
+
+        if i == n - 1:
+            last_green_trig = green_trig
+            last_orange_trig = orange_trig
+            if exit_trig:
+                last_exit_trig = True
+                last_exit_reason = exit_reason
+                last_exit_price = exit_price
+                last_exit_pct = exit_pct
+            elif green_trig or orange_trig:
+                last_exit_trig = False
+                last_exit_reason = None
+                last_exit_price = None
+                last_exit_pct = None
             last_c1, last_c2, last_c3, last_c4, last_c5 = c1, c2, c3, c4, c5
             last_trend_ok = trend_ok
             last_first3, last_all5 = first3, all5
@@ -653,7 +668,8 @@ def evaluate_1h_15m_system(
     active_stop_pct = 1.50 if is15m else (2.20 if is1h else 2.50)
     active_be_pct = 1.20 if is15m else (2.00 if is1h else 2.20)
     min_tp_pct = 1.40 if is15m else (2.40 if is1h else 2.80)
-    ltf_ms = (15 if is15m else (45 if timeframe == "45m" else 60)) * 60 * 1000
+    tf_mins = 15 if is15m else (45 if timeframe == "45m" else (120 if timeframe == "2h" else 60))
+    ltf_ms = tf_mins * 60 * 1000
 
     opens = df_ltf["open"].astype(float).reset_index(drop=True)
     highs = df_ltf["high"].astype(float).reset_index(drop=True)
@@ -827,8 +843,10 @@ def evaluate_1h_15m_system(
                 be_locked = True
                 sl_level = entry_price * (1.0 + fee_buffer_pct / 100.0)
 
-            hit_stop = bar_c < sl_level
+            is_confirmed = i < n - 1
+            hit_stop = is_confirmed and (bar_c < sl_level)
             hit_tp = bar_h >= tp_level
+            hit_sell = is_confirmed and real_sell
 
             if hit_tp:
                 exit_trig = True
@@ -856,7 +874,7 @@ def evaluate_1h_15m_system(
                 exit_pct = trade_pct
                 in_green_pos = in_orange_pos = be_locked = False
                 entry_price = tp_level = sl_level = None
-            elif real_sell:
+            elif hit_sell:
                 exit_trig = True
                 trade_pct = ((bar_c - entry_price) / entry_price) * 100.0
                 total_trades += 1
@@ -869,13 +887,26 @@ def evaluate_1h_15m_system(
                 in_green_pos = in_orange_pos = be_locked = False
                 entry_price = tp_level = sl_level = None
 
-        if i == n - 1:
-            last_green_trig = green_trig
-            last_orange_trig = orange_trig
-            last_exit_trig = exit_trig
+        if i == n - 2 and exit_trig:
+            # Preserve confirmed bar-close exit so live bot catches it right after 2h candle closes
+            last_exit_trig = True
             last_exit_reason = exit_reason
             last_exit_price = exit_price
             last_exit_pct = exit_pct
+
+        if i == n - 1:
+            last_green_trig = green_trig
+            last_orange_trig = orange_trig
+            if exit_trig:
+                last_exit_trig = True
+                last_exit_reason = exit_reason
+                last_exit_price = exit_price
+                last_exit_pct = exit_pct
+            elif green_trig or orange_trig:
+                last_exit_trig = False
+                last_exit_reason = None
+                last_exit_price = None
+                last_exit_pct = None
             last_c1, last_c2, last_c3, last_c4, last_c5 = c1, c2, c3, c4, c5
             last_trend_ok = cond_trend
             last_first3, last_all5 = first3, all5
@@ -999,7 +1030,8 @@ def evaluate_1h_15m_system(
     active_stop_pct = 1.50 if is15m else (2.20 if is1h else 2.50)
     active_be_pct = 1.20 if is15m else (2.00 if is1h else 2.20)
     min_tp_pct = 1.40 if is15m else (2.40 if is1h else 2.80)
-    ltf_ms = (15 if is15m else (45 if timeframe == "45m" else 60)) * 60 * 1000
+    tf_mins = 15 if is15m else (45 if timeframe == "45m" else (120 if timeframe == "2h" else 60))
+    ltf_ms = tf_mins * 60 * 1000
 
     opens = df_ltf["open"].astype(float).reset_index(drop=True)
     highs = df_ltf["high"].astype(float).reset_index(drop=True)
@@ -1173,8 +1205,10 @@ def evaluate_1h_15m_system(
                 be_locked = True
                 sl_level = entry_price * (1.0 + fee_buffer_pct / 100.0)
 
-            hit_stop = bar_c < sl_level
+            is_confirmed = i < n - 1
+            hit_stop = is_confirmed and (bar_c < sl_level)
             hit_tp = bar_h >= tp_level
+            hit_sell = is_confirmed and real_sell
 
             if hit_tp:
                 exit_trig = True
@@ -1202,7 +1236,7 @@ def evaluate_1h_15m_system(
                 exit_pct = trade_pct
                 in_green_pos = in_orange_pos = be_locked = False
                 entry_price = tp_level = sl_level = None
-            elif real_sell:
+            elif hit_sell:
                 exit_trig = True
                 trade_pct = ((bar_c - entry_price) / entry_price) * 100.0
                 total_trades += 1
@@ -1215,13 +1249,26 @@ def evaluate_1h_15m_system(
                 in_green_pos = in_orange_pos = be_locked = False
                 entry_price = tp_level = sl_level = None
 
-        if i == n - 1:
-            last_green_trig = green_trig
-            last_orange_trig = orange_trig
-            last_exit_trig = exit_trig
+        if i == n - 2 and exit_trig:
+            # Preserve confirmed bar-close exit so live bot catches it right after 2h candle closes
+            last_exit_trig = True
             last_exit_reason = exit_reason
             last_exit_price = exit_price
             last_exit_pct = exit_pct
+
+        if i == n - 1:
+            last_green_trig = green_trig
+            last_orange_trig = orange_trig
+            if exit_trig:
+                last_exit_trig = True
+                last_exit_reason = exit_reason
+                last_exit_price = exit_price
+                last_exit_pct = exit_pct
+            elif green_trig or orange_trig:
+                last_exit_trig = False
+                last_exit_reason = None
+                last_exit_price = None
+                last_exit_pct = None
             last_c1, last_c2, last_c3, last_c4, last_c5 = c1, c2, c3, c4, c5
             last_trend_ok = cond_trend
             last_first3, last_all5 = first3, all5
@@ -1571,13 +1618,26 @@ def evaluate_45m_scalp_system(
                 in_green_pos = in_orange_pos = be_locked = False
                 entry_price = tp_level = sl_level = None
 
-        if i == n - 1:
-            last_green_trig = green_trig
-            last_orange_trig = orange_trig
-            last_exit_trig = exit_trig
+        if i == n - 2 and exit_trig:
+            # Preserve confirmed bar-close exit so live bot catches it right after 2h candle closes
+            last_exit_trig = True
             last_exit_reason = exit_reason
             last_exit_price = exit_price
             last_exit_pct = exit_pct
+
+        if i == n - 1:
+            last_green_trig = green_trig
+            last_orange_trig = orange_trig
+            if exit_trig:
+                last_exit_trig = True
+                last_exit_reason = exit_reason
+                last_exit_price = exit_price
+                last_exit_pct = exit_pct
+            elif green_trig or orange_trig:
+                last_exit_trig = False
+                last_exit_reason = None
+                last_exit_price = None
+                last_exit_pct = None
             last_c1, last_c2, last_c3, last_c4, last_c5 = c1, c2, c3, c4, c5
             last_trend_ok = cond_15m_trend
             last_first3, last_all5 = first3, all5
@@ -1690,7 +1750,8 @@ def evaluate_1h_15m_system(
     active_stop_pct = 1.50 if is15m else (2.20 if is1h else 2.50)
     active_be_pct = 1.20 if is15m else (2.00 if is1h else 2.20)
     min_tp_pct = 1.40 if is15m else (2.40 if is1h else 2.80)
-    ltf_ms = (15 if is15m else (45 if timeframe == "45m" else 60)) * 60 * 1000
+    tf_mins = 15 if is15m else (45 if timeframe == "45m" else (120 if timeframe == "2h" else 60))
+    ltf_ms = tf_mins * 60 * 1000
 
     opens = df_ltf["open"].astype(float).reset_index(drop=True)
     highs = df_ltf["high"].astype(float).reset_index(drop=True)
@@ -1864,8 +1925,10 @@ def evaluate_1h_15m_system(
                 be_locked = True
                 sl_level = entry_price * (1.0 + fee_buffer_pct / 100.0)
 
-            hit_stop = bar_c < sl_level
+            is_confirmed = i < n - 1
+            hit_stop = is_confirmed and (bar_c < sl_level)
             hit_tp = bar_h >= tp_level
+            hit_sell = is_confirmed and real_sell
 
             if hit_tp:
                 exit_trig = True
@@ -1893,7 +1956,7 @@ def evaluate_1h_15m_system(
                 exit_pct = trade_pct
                 in_green_pos = in_orange_pos = be_locked = False
                 entry_price = tp_level = sl_level = None
-            elif real_sell:
+            elif hit_sell:
                 exit_trig = True
                 trade_pct = ((bar_c - entry_price) / entry_price) * 100.0
                 total_trades += 1
@@ -1906,13 +1969,26 @@ def evaluate_1h_15m_system(
                 in_green_pos = in_orange_pos = be_locked = False
                 entry_price = tp_level = sl_level = None
 
-        if i == n - 1:
-            last_green_trig = green_trig
-            last_orange_trig = orange_trig
-            last_exit_trig = exit_trig
+        if i == n - 2 and exit_trig:
+            # Preserve confirmed bar-close exit so live bot catches it right after 2h candle closes
+            last_exit_trig = True
             last_exit_reason = exit_reason
             last_exit_price = exit_price
             last_exit_pct = exit_pct
+
+        if i == n - 1:
+            last_green_trig = green_trig
+            last_orange_trig = orange_trig
+            if exit_trig:
+                last_exit_trig = True
+                last_exit_reason = exit_reason
+                last_exit_price = exit_price
+                last_exit_pct = exit_pct
+            elif green_trig or orange_trig:
+                last_exit_trig = False
+                last_exit_reason = None
+                last_exit_price = None
+                last_exit_pct = None
             last_c1, last_c2, last_c3, last_c4, last_c5 = c1, c2, c3, c4, c5
             last_trend_ok = cond_trend
             last_first3, last_all5 = first3, all5

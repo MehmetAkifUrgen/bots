@@ -35,9 +35,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--timeframe",
-        choices=["45m", "1h", "15m"],
-        default=os.getenv("SCAN_TIMEFRAME", "45m"),
-        help="Tarama zaman dilimi: 45m, 1h veya 15m (varsayılan: 45m)",
+        choices=["2h", "45m", "1h", "15m"],
+        default=os.getenv("SCAN_TIMEFRAME", "2h"),
+        help="Tarama zaman dilimi: 2h, 45m, 1h veya 15m (varsayılan: 2h)",
     )
     p.add_argument(
         "--min-win-rate",
@@ -90,8 +90,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--trailing-trigger-pct",
         type=float,
-        default=float(os.getenv("TRAILING_TRIGGER_PCT", "2.0")),
-        help="Trailing stop başlangıç kâr yüzdesi (varsayılan: 2.0)",
+        default=float(os.getenv("TRAILING_TRIGGER_PCT", "2.2")),
+        help="Başabaş kâr kilidi tetik yüzdesi (varsayılan: 2.2)",
+    )
+    p.add_argument(
+        "--use-trailing",
+        action="store_true",
+        default=os.getenv("USE_TRAILING", "false").strip().lower() in ("1", "true", "yes"),
+        help="Sinyal TP/SAT yerine trailing stop kullan (varsayılan: kapalı, sinyal bazlı)",
     )
     p.add_argument(
         "--trailing-callback-pct",
@@ -287,6 +293,7 @@ def main() -> None:
             trailing_trigger_pct=active_be_pct,
             trailing_callback_pct=args.trailing_callback_pct,
             trailing_floor_pct=0.20,
+            use_trailing=args.use_trailing,
             cooldown_minutes=args.cooldown_minutes,
             state_file=DEFAULT_TRADE_STATE_FILE,
             proxy_url=proxy_url,
@@ -312,12 +319,17 @@ def main() -> None:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] İlk senkron hatası: {exc}")
         _start_position_monitor(trader, notifier, dry_run=args.dry_run, interval_sec=2)
 
+    exit_mode_str = f"+%{active_be_pct:g} Trail" if args.use_trailing else f"Sinyal TP/SAT (+%{active_be_pct:g} Kilit)"
     trade_mode_str = (
-        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, -%{active_stop_pct:g} SL, +%{active_be_pct:g} Trail)"
+        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, -%{active_stop_pct:g} SL, {exit_mode_str})"
         if trader
         else "KAPALI (Sadece Bildirim)"
     )
-    tf_title = "15dk" if args.timeframe == "15m" else ("45dk" if args.timeframe == "45m" else "1S (1h)")
+    tf_title = (
+        "2S (2h)"
+        if args.timeframe == "2h"
+        else ("15dk" if args.timeframe == "15m" else ("45dk" if args.timeframe == "45m" else "1S (1h)"))
+    )
     print(
         f"[{datetime.now().strftime('%H:%M:%S')}] Kripto {tf_title} 5'li Tarayıcı başlatıldı | "
         f"Piyasa={args.market.upper()} | OtoAlım={trade_mode_str} | "

@@ -52,9 +52,10 @@ class BinanceTrader:
         leverage: int = 15,
         max_leverage: int = 15,
         stop_loss_pct: float = 2.5,
-        trailing_trigger_pct: float = 2.0,
+        trailing_trigger_pct: float = 2.2,
         trailing_callback_pct: float = 0.4,
         trailing_floor_pct: float = 0.2,
+        use_trailing: bool = False,
         max_consecutive_stops: int = 3,
         cooldown_minutes: int = 0,
         symbol_stop_cooldown_minutes: int = 180,
@@ -74,6 +75,7 @@ class BinanceTrader:
         self.trailing_trigger_pct = trailing_trigger_pct
         self.trailing_callback_pct = trailing_callback_pct
         self.trailing_floor_pct = trailing_floor_pct
+        self.use_trailing = use_trailing
         self.max_consecutive_stops = max_consecutive_stops
         self.cooldown_minutes = cooldown_minutes
         self.symbol_stop_cooldown_minutes = max(0, symbol_stop_cooldown_minutes)
@@ -322,7 +324,11 @@ class BinanceTrader:
         return dict(self._state["open_positions"])
 
     def open_position(
-        self, symbol: str, price: float, target_usd: float
+        self,
+        symbol: str,
+        price: float,
+        target_usd: float,
+        tp_price: float | None = None,
     ) -> TradeExecution | None:
         """Open a BUY/LONG position if under max_positions, not in cooldown, and balance allows."""
         if self.is_in_cooldown() or self.is_symbol_in_cooldown(symbol):
@@ -445,6 +451,7 @@ class BinanceTrader:
             "qty": exec_qty,
             "notional_usd": actual_not,
             "sl_price": sl_price,
+            "tp_price": float(tp_price) if (tp_price and tp_price > exec_price) else 0.0,
             "exchange_sl_price": sl_price if algo_sl_id else 0.0,
             "peak_price": exec_price,
             "trailing_active": False,
@@ -666,19 +673,26 @@ class BinanceTrader:
                     state_dirty = True
 
                 reason: str | None = None
-                if trailing_active:
+                tp_px = float(pos.get("tp_price") or 0.0)
+                if tp_px > 0 and curr_price >= tp_px:
+                    reason = "KÂR AL (Direnç)"
+                elif trailing_active:
                     floor_sl = entry_px * (1.0 + self.trailing_floor_pct / 100.0)
-                    trail_sl = peak_px * (1.0 - self.trailing_callback_pct / 100.0)
-                    effective_sl = max(floor_sl, trail_sl)
+                    if self.use_trailing:
+                        trail_sl = peak_px * (1.0 - self.trailing_callback_pct / 100.0)
+                        effective_sl = max(floor_sl, trail_sl)
+                    else:
+                        # Pine Script Break-Even Lock: lock at +0.20% and wait for TP or signal SAT
+                        effective_sl = floor_sl
                     if effective_sl > float(pos.get("sl_price") or 0.0):
                         pos["sl_price"] = effective_sl
                         state_dirty = True
                         ex_sl = float(pos.get("exchange_sl_price") or 0.0)
-                        if effective_sl > ex_sl * 1.002 and curr_price > effective_sl:
+                        if effective_sl > ex_sl * 1.001 and curr_price > effective_sl:
                             if self.place_exchange_stop_loss(sym, effective_sl):
                                 pos["exchange_sl_price"] = effective_sl
                     if curr_price <= effective_sl:
-                        reason = "TRAILING STOP"
+                        reason = "TRAILING STOP" if self.use_trailing else "SAT (Kâr Kilidi)"
                 else:
                     sl_px = float(
                         pos.get("sl_price")
