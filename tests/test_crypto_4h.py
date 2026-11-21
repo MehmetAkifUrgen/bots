@@ -366,22 +366,21 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertTrue(trader.is_in_cooldown())
             self.assertIsNone(trader.open_position("DUSDT", price=100.0, target_usd=250.0))
 
-    def test_sync_live_positions_protects_after_restart(self) -> None:
+    def test_sync_live_positions_ignores_manual_positions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trader = BinanceTrader(
                 api_key="k",
                 api_secret="s",
                 market="papi",
-                stop_loss_pct=1.0,
+                stop_loss_pct=1.5,
                 state_file=Path(tmp) / "trade_state.json",
             )
-            # Simulate Railway restart: empty local state, but Binance has an open LONG
+            # Manual position opened by user on Binance must NOT be adopted/touched by bot
             trader.get_live_open_positions = lambda: {  # type: ignore[method-assign]
                 "HUSDT": {"symbol": "HUSDT", "qty": 1000.0, "entry_price": 0.02, "side": "LONG"}
             }
             synced = trader.sync_live_positions()
-            self.assertIn("HUSDT", synced)
-            self.assertAlmostEqual(synced["HUSDT"]["sl_price"], 0.02 * 0.99)
+            self.assertNotIn("HUSDT", synced)
 
 
 if __name__ == "__main__":

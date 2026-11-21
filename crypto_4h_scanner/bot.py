@@ -78,8 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--min-profit-pct",
         type=float,
-        default=float(os.getenv("MIN_PROFIT_PCT", "200.0")),
-        help="Minimum coin toplam getiri yüzdesi (varsayılan: 200.0)",
+        default=float(os.getenv("MIN_PROFIT_PCT", "250.0")),
+        help="Minimum coin toplam getiri yüzdesi (varsayılan: 250.0)",
     )
     p.add_argument(
         "--limit",

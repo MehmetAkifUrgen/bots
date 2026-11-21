@@ -585,8 +585,10 @@ class BinanceTrader:
 
     def sync_live_positions(self) -> dict[str, dict]:
         """
-        Sync live open positions from Binance into local state.
-        Crucial on Railway/ephemeral disks so restarts never drop SL/Trailing tracking!
+        Sync ONLY bot-opened positions against Binance:
+        - NEVER adopt or touch positions opened manually by the user!
+        - Keep entry_price accurate for bot-opened positions.
+        - Remove bot-opened positions that were already closed on Binance.
         """
         if not self._is_um_futures() or not self.is_configured:
             with self._lock:
@@ -597,38 +599,16 @@ class BinanceTrader:
             tracked = self._state["open_positions"]
             dirty = False
 
-            # Adopt any live Binance LONG position missing from local state
-            for sym, lpos in live.items():
-                if lpos.get("side") != "LONG":
-                    continue
-                if sym not in tracked:
-                    entry_px = float(lpos["entry_price"])
-                    qty = float(lpos["qty"])
-                    tracked[sym] = {
-                        "symbol": sym,
-                        "order_id": "synced",
-                        "entry_price": entry_px,
-                        "qty": qty,
-                        "notional_usd": round(entry_px * qty, 2),
-                        "sl_price": entry_px * (1.0 - self.stop_loss_pct / 100.0),
-                        "peak_price": entry_px,
-                        "trailing_active": False,
-                        "opened_at": int(time.time()),
-                    }
-                    dirty = True
-                else:
-                    # Keep entry_price synced with Binance's real fill price
-                    live_ep = float(lpos.get("entry_price") or 0.0)
-                    if live_ep > 0 and abs(live_ep - float(tracked[sym].get("entry_price") or 0.0)) / live_ep > 0.001:
-                        tracked[sym]["entry_price"] = live_ep
-                        if not tracked[sym].get("trailing_active"):
-                            tracked[sym]["sl_price"] = live_ep * (1.0 - self.stop_loss_pct / 100.0)
-                        dirty = True
-
-            # Remove positions no longer open on Binance
             for sym in list(tracked.keys()):
                 if sym not in live:
                     tracked.pop(sym, None)
+                    dirty = True
+                    continue
+                live_ep = float(live[sym].get("entry_price") or 0.0)
+                if live_ep > 0 and abs(live_ep - float(tracked[sym].get("entry_price") or 0.0)) / live_ep > 0.001:
+                    tracked[sym]["entry_price"] = live_ep
+                    if not tracked[sym].get("trailing_active"):
+                        tracked[sym]["sl_price"] = live_ep * (1.0 - self.stop_loss_pct / 100.0)
                     dirty = True
 
             if dirty:

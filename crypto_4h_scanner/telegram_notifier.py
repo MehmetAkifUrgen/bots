@@ -376,12 +376,23 @@ class TelegramNotifier:
             except Exception as exc:
                 stats["errors"].append(f"MANAGE_POS: {exc}")
 
-            # Sinyal İptal Koruması: Trailing henüz açılmadıysa ve 3/5 sinyali kaybolduysa hemen çık
+            # Sinyal İptal Koruması:
+            # - Pozisyon kârda ise (res.price > entry_px) ASLA erken kapatma!
+            # - Sadece trailing açılmadıysa, 3/5 sinyali kaybolduysa VE pozisyon zarardaysa kapat!
             for res in results:
                 pos = trader._state.get("open_positions", {}).get(res.symbol)
-                if pos and not pos.get("trailing_active") and not res.evaluation.first_three_buy:
+                if not pos:
+                    continue
+                if res.evaluation.all_five_buy and not pos.get("upgraded_5_5"):
+                    pos["upgraded_5_5"] = True
+                entry_px = float(pos.get("entry_price") or 0.0)
+                in_loss = entry_px > 0 and res.price <= entry_px
+                if (
+                    not pos.get("trailing_active")
+                    and not res.evaluation.first_three_buy
+                    and in_loss
+                ):
                     try:
-                        entry_px = float(pos["entry_price"])
                         closed = trader.close_position(
                             res.symbol, fallback_price=res.price, is_stop_loss=False
                         )
@@ -397,7 +408,7 @@ class TelegramNotifier:
                                 format_managed_close_message(
                                     {
                                         "symbol": res.symbol,
-                                        "reason": "Sinyal İptal (3/5 Bozuldu)",
+                                        "reason": "Sinyal İptal (3/5 Bozuldu & Zarar)",
                                         "entry_price": entry_px,
                                         "exit_price": closed.price,
                                         "pnl_usd": round(pnl_usd, 2),
@@ -532,12 +543,23 @@ class TelegramNotifier:
             except Exception as exc:
                 stats["errors"].append(f"MANAGE_POS: {exc}")
 
-            # Sinyal İptal Koruması: Trailing henüz açılmadıysa ve 3/5 sinyali kaybolduysa hemen çık
+            # Sinyal İptal Koruması:
+            # - Pozisyon kârda ise (res.price > entry_px) ASLA erken kapatma!
+            # - Sadece trailing açılmadıysa, 3/5 sinyali kaybolduysa VE pozisyon zarardaysa kapat!
             for res in results:
                 pos = trader._state.get("open_positions", {}).get(res.symbol)
-                if pos and not pos.get("trailing_active") and not res.evaluation.first_three_buy:
+                if not pos:
+                    continue
+                if res.evaluation.all_five_buy and not pos.get("upgraded_5_5"):
+                    pos["upgraded_5_5"] = True
+                entry_px = float(pos.get("entry_price") or 0.0)
+                in_loss = entry_px > 0 and res.price <= entry_px
+                if (
+                    not pos.get("trailing_active")
+                    and not res.evaluation.first_three_buy
+                    and in_loss
+                ):
                     try:
-                        entry_px = float(pos["entry_price"])
                         closed = trader.close_position(
                             res.symbol, fallback_price=res.price, is_stop_loss=False
                         )
@@ -553,7 +575,7 @@ class TelegramNotifier:
                                 format_managed_close_message(
                                     {
                                         "symbol": res.symbol,
-                                        "reason": "Sinyal İptal (3/5 Bozuldu)",
+                                        "reason": "Sinyal İptal (3/5 Bozuldu & Zarar)",
                                         "entry_price": entry_px,
                                         "exit_price": closed.price,
                                         "pnl_usd": round(pnl_usd, 2),
@@ -570,8 +592,8 @@ class TelegramNotifier:
             if ev.win_rate < min_win_rate or ev.total_profit_pct < min_profit_pct:
                 continue
 
-            # Match TradingView's exact entry: open ONLY on fresh 3/5 (green_trigger).
-            # If 5/5 (orange_trigger) fires on a LATER bar after 3/5, do NOT open late at the top!
+            # 1) Fresh 3/5 (green_trigger) OR direct 5/5 (green_trigger & orange_trigger on same bar):
+            # Always target max_usd ($250, auto-clamped down to min_usd $150 if margin is tighter).
             if ev.green_trigger:
                 kind = "ORANGE" if ev.orange_trigger else "GREEN"
                 alert_key = f"4h_bist:{res.symbol}:{kind}:{ev.bar_open_time}"
@@ -580,12 +602,11 @@ class TelegramNotifier:
                     trade_note: str | None = None
                     if trader and trader.is_configured and not dry_run:
                         try:
-                            target_usd = trader.max_usd if kind == "ORANGE" else trader.min_usd
                             trade_exec = trader.open_position(
                                 res.symbol,
                                 res.price,
-                                target_usd,
-                                tp_price=None,  # Sabit TP tavanı yok, +%2.5 sonrası %1.8 trailing ile büyük trendi sür
+                                trader.max_usd,
+                                tp_price=None,
                                 sl_price=ev.sl_level or ev.prev_sup,
                             )
                             if trade_exec:
