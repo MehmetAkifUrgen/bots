@@ -36,7 +36,7 @@ def _round_step(value: float, step: float) -> float:
     if step <= 0:
         return value
     precision = max(0, int(round(-math.log10(step))))
-    floored = math.floor(value / step) * step
+    floored = math.floor(value / step + 1e-12) * step
     return round(floored, precision)
 
 
@@ -57,8 +57,9 @@ class BinanceTrader:
         trailing_floor_pct: float = 0.2,
         max_consecutive_stops: int = 3,
         cooldown_minutes: int = 0,
-        symbol_stop_cooldown_minutes: int = 180,
+        symbol_stop_cooldown_minutes: int = 240,
         signal_cancel_stop_usd: float = 1.5,
+        risk_per_trade_pct: float = 0.0,
         state_file: Path | None = None,
         timeout: float = 10.0,
         proxy_url: str = "",
@@ -79,6 +80,7 @@ class BinanceTrader:
         self.cooldown_minutes = cooldown_minutes
         self.symbol_stop_cooldown_minutes = max(0, symbol_stop_cooldown_minutes)
         self.signal_cancel_stop_usd = max(0.1, float(signal_cancel_stop_usd))
+        self.risk_per_trade_pct = max(0.0, float(risk_per_trade_pct))
         self.state_file = state_file or (
             Path(__file__).resolve().parent / "trade_state.json"
         )
@@ -244,7 +246,9 @@ class BinanceTrader:
         except Exception:
             pass
 
-    def place_exchange_stop_loss(self, symbol: str, sl_price: float) -> str | None:
+    def place_exchange_stop_loss(
+        self, symbol: str, sl_price: float, pos_side: str = "LONG"
+    ) -> str | None:
         """Place a real exchange-side STOP_MARKET order on Binance (millisecond execution)."""
         if not self._is_um_futures() or not self.is_configured or sl_price <= 0:
             return None
@@ -254,6 +258,7 @@ class BinanceTrader:
         if rounded_sl <= 0:
             rounded_sl = sl_price
 
+        close_side = "SELL" if str(pos_side).upper() == "LONG" else "BUY"
         self.cancel_exchange_stop_losses(symbol)
         try:
             if self.market == "papi":
@@ -262,7 +267,7 @@ class BinanceTrader:
                     "/papi/v1/um/algo/order",
                     {
                         "symbol": symbol,
-                        "side": "SELL",
+                        "side": close_side,
                         "algoType": "CONDITIONAL",
                         "type": "STOP_MARKET",
                         "triggerPrice": f"{rounded_sl:g}",
@@ -277,7 +282,7 @@ class BinanceTrader:
                     "/fapi/v1/order",
                     {
                         "symbol": symbol,
-                        "side": "SELL",
+                        "side": close_side,
                         "type": "STOP_MARKET",
                         "stopPrice": f"{rounded_sl:g}",
                         "closePosition": "true",
@@ -287,6 +292,20 @@ class BinanceTrader:
                 return str(res.get("orderId") or "")
         except Exception:
             return None
+
+    def get_account_equity(self) -> float:
+        """Return total account equity in USDT (used for dynamic small-account risk sizing)."""
+        try:
+            if self.market == "papi":
+                acct = self._signed_request("GET", "/papi/v1/account")
+                return float(
+                    acct.get("accountEquity")
+                    or acct.get("virtualMaxWithdrawAmount")
+                    or 0.0
+                )
+        except Exception:
+            pass
+        return self.get_free_usdt()
 
     def get_free_usdt(self) -> float:
         if self.market == "papi":
@@ -330,8 +349,12 @@ class BinanceTrader:
         target_usd: float,
         tp_price: float | None = None,
         sl_price: float | None = None,
+        side: Literal["LONG", "SHORT"] = "LONG",
     ) -> TradeExecution | None:
-        """Open a BUY/LONG position if under max_positions, not in cooldown, and balance allows."""
+        """Open a LONG or SHORT position if under max_positions, not in cooldown, and balance allows."""
+        pos_side: Literal["LONG", "SHORT"] = "SHORT" if str(side).upper() == "SHORT" else "LONG"
+        if pos_side == "SHORT" and not self._is_um_futures():
+            return None
         if self.is_in_cooldown() or self.is_symbol_in_cooldown(symbol):
             return None
         live_open = self.get_live_open_positions()
@@ -344,12 +367,19 @@ class BinanceTrader:
         if len(all_open_syms) >= self.max_positions:
             return None
 
+        effective_min_usd = self.min_usd
         notional = max(self.min_usd, min(self.max_usd, target_usd))
+        if self.risk_per_trade_pct > 0 and self.stop_loss_pct > 0:
+            equity = self.get_account_equity()
+            if equity > 0:
+                risk_notional = equity * (self.risk_per_trade_pct / self.stop_loss_pct)
+                notional = max(20.0, min(self.max_usd, risk_notional))
+                effective_min_usd = min(self.min_usd, max(15.0, notional * 0.85))
+
         free_usdt = self.get_free_usdt()
         effective_lev = min(self.max_leverage, self.leverage)
         if self._is_um_futures() and free_usdt > 0:
-            # Auto-pick leverage up to safe max_leverage (never exceeds 15x so -2.5% SL triggers long before liquidation)
-            if free_usdt * effective_lev * 0.90 < self.min_usd:
+            if free_usdt * effective_lev * 0.90 < effective_min_usd:
                 needed_lev = int(math.ceil(notional / (free_usdt * 0.90)))
                 effective_lev = min(self.max_leverage, max(effective_lev, needed_lev))
 
@@ -362,9 +392,9 @@ class BinanceTrader:
                 if self._is_um_futures()
                 else free_usdt * 0.98
             )
-            if max_affordable_notional < self.min_usd:
+            if max_affordable_notional < effective_min_usd:
                 return None
-            notional = max(self.min_usd, min(self.max_usd, max_affordable_notional))
+            notional = max(effective_min_usd, min(self.max_usd, max_affordable_notional))
 
         self._ensure_filters()
         rules = self._filters_cache.get(
@@ -374,13 +404,14 @@ class BinanceTrader:
         if qty < rules["minQty"]:
             return None
         actual_notional = qty * price
-        if actual_notional < self.min_usd * 0.95 or actual_notional < rules["minNotional"]:
+        if actual_notional < effective_min_usd * 0.90 or actual_notional < rules["minNotional"]:
             return None
 
+        order_side: Literal["BUY", "SELL"] = "BUY" if pos_side == "LONG" else "SELL"
         if self._is_um_futures():
             lev_path = "/papi/v1/um/leverage" if self.market == "papi" else "/fapi/v1/leverage"
             ord_path = "/papi/v1/um/order" if self.market == "papi" else "/fapi/v1/order"
-            for try_lev in dict.fromkeys([effective_lev, min(15, effective_lev), 10, 5]):
+            for try_lev in dict.fromkeys([effective_lev, min(10, effective_lev), 5]):
                 try:
                     self._signed_request(
                         "POST",
@@ -395,7 +426,7 @@ class BinanceTrader:
                 ord_path,
                 {
                     "symbol": symbol,
-                    "side": "BUY",
+                    "side": order_side,
                     "type": "MARKET",
                     "quantity": f"{qty:g}",
                     "newOrderRespType": "RESULT",
@@ -404,8 +435,6 @@ class BinanceTrader:
             exec_price = float(res.get("avgPrice") or 0.0)
             exec_qty = float(res.get("executedQty") or 0.0) or qty
             if exec_price <= 0:
-                # Binance PAPI/Futures market orders often return avgPrice=0 before fill settles;
-                # query the real Binance position entryPrice instead of using stale scan price!
                 time.sleep(0.35)
                 try:
                     live_after = self.get_live_open_positions().get(symbol)
@@ -443,20 +472,33 @@ class BinanceTrader:
 
         order_id = str(res.get("orderId", ""))
         actual_not = round(exec_qty * exec_price, 2)
-        default_sl = exec_price * (1.0 - self.stop_loss_pct / 100.0)
-        # Use Pine Script Pivot SL if between -stop_loss_pct% (-2.5%) and -0.5%, else cap at -stop_loss_pct%
-        if sl_price is not None and default_sl <= sl_price < exec_price * 0.995:
-            final_sl = sl_price
+        if pos_side == "LONG":
+            default_sl = exec_price * (1.0 - self.stop_loss_pct / 100.0)
+            if sl_price is not None and default_sl <= sl_price < exec_price * 0.995:
+                final_sl = sl_price
+            else:
+                final_sl = default_sl
+            final_tp = (
+                tp_price
+                if (tp_price is not None and tp_price > exec_price * 1.01)
+                else 0.0
+            )
         else:
-            final_sl = default_sl
-        final_tp = (
-            tp_price
-            if (tp_price is not None and tp_price > exec_price * 1.01)
-            else 0.0
-        )
-        algo_sl_id = self.place_exchange_stop_loss(symbol, final_sl)
+            default_sl = exec_price * (1.0 + self.stop_loss_pct / 100.0)
+            if sl_price is not None and exec_price * 1.005 < sl_price <= default_sl:
+                final_sl = sl_price
+            else:
+                final_sl = default_sl
+            final_tp = (
+                tp_price
+                if (tp_price is not None and 0 < tp_price < exec_price * 0.99)
+                else 0.0
+            )
+
+        algo_sl_id = self.place_exchange_stop_loss(symbol, final_sl, pos_side=pos_side)
         self._state["open_positions"][symbol] = {
             "symbol": symbol,
+            "side": pos_side,
             "order_id": order_id,
             "entry_price": exec_price,
             "qty": exec_qty,
@@ -472,7 +514,7 @@ class BinanceTrader:
 
         return TradeExecution(
             symbol=symbol,
-            side="BUY",
+            side=order_side,
             order_id=order_id,
             price=exec_price,
             qty=exec_qty,
@@ -485,11 +527,15 @@ class BinanceTrader:
         fallback_price: float,
         is_stop_loss: bool = False,
     ) -> TradeExecution | None:
-        """Close an open LONG/BUY position on Binance."""
+        """Close an open LONG or SHORT position on Binance."""
         live_open = self.get_live_open_positions()
-        pos = live_open.get(symbol) or self._state["open_positions"].get(symbol)
+        tracked_pos = self._state["open_positions"].get(symbol)
+        pos = live_open.get(symbol) or tracked_pos
         if not pos:
             return None
+
+        pos_side = str((tracked_pos or pos).get("side") or "LONG").upper()
+        close_side: Literal["BUY", "SELL"] = "SELL" if pos_side == "LONG" else "BUY"
 
         self._ensure_filters()
         rules = self._filters_cache.get(symbol, {"stepSize": 0.001, "minQty": 0.001})
@@ -504,7 +550,7 @@ class BinanceTrader:
                 ord_path,
                 {
                     "symbol": symbol,
-                    "side": "SELL",
+                    "side": close_side,
                     "type": "MARKET",
                     "quantity": f"{qty:g}",
                     "reduceOnly": "true",
@@ -540,7 +586,11 @@ class BinanceTrader:
         self.cancel_exchange_stop_losses(symbol)
         prev_pos = self._state["open_positions"].pop(symbol, None)
         entry_px = float((prev_pos or pos).get("entry_price") or exec_price)
-        pnl_usd = (exec_price - entry_px) * exec_qty
+        pnl_usd = (
+            (exec_price - entry_px) * exec_qty
+            if pos_side == "LONG"
+            else (entry_px - exec_price) * exec_qty
+        )
 
         if is_stop_loss:
             self._state["consecutive_stops"] = int(self._state.get("consecutive_stops", 0)) + 1
@@ -561,7 +611,7 @@ class BinanceTrader:
 
         return TradeExecution(
             symbol=symbol,
-            side="SELL",
+            side=close_side,
             order_id=str(res.get("orderId", "")),
             price=exec_price,
             qty=exec_qty,
@@ -609,8 +659,13 @@ class BinanceTrader:
                 live_ep = float(live[sym].get("entry_price") or 0.0)
                 if live_ep > 0 and abs(live_ep - float(tracked[sym].get("entry_price") or 0.0)) / live_ep > 0.001:
                     tracked[sym]["entry_price"] = live_ep
+                    pos_side = str(tracked[sym].get("side") or "LONG").upper()
                     if not tracked[sym].get("trailing_active") and not tracked[sym].get("signal_lost"):
-                        tracked[sym]["sl_price"] = live_ep * (1.0 - self.stop_loss_pct / 100.0)
+                        tracked[sym]["sl_price"] = (
+                            live_ep * (1.0 - self.stop_loss_pct / 100.0)
+                            if pos_side == "LONG"
+                            else live_ep * (1.0 + self.stop_loss_pct / 100.0)
+                        )
                     dirty = True
 
             if dirty:
@@ -702,18 +757,28 @@ class BinanceTrader:
                     continue
 
                 entry_px = float(pos["entry_price"])
-                qty = float(pos["qty"])
-                pnl_pct = (
-                    ((curr_price - entry_px) / entry_px) * 100.0
-                    if entry_px > 0
-                    else 0.0
-                )
-
-                # Update peak & trailing state
-                peak_px = max(float(pos.get("peak_price") or entry_px), curr_price)
-                if peak_px > float(pos.get("peak_price") or 0.0):
-                    pos["peak_price"] = peak_px
-                    state_dirty = True
+                pos_side = str(pos.get("side") or "LONG").upper()
+                if pos_side == "LONG":
+                    pnl_pct = (
+                        ((curr_price - entry_px) / entry_px) * 100.0
+                        if entry_px > 0
+                        else 0.0
+                    )
+                    peak_px = max(float(pos.get("peak_price") or entry_px), curr_price)
+                    if peak_px > float(pos.get("peak_price") or 0.0):
+                        pos["peak_price"] = peak_px
+                        state_dirty = True
+                else:
+                    pnl_pct = (
+                        ((entry_px - curr_price) / entry_px) * 100.0
+                        if entry_px > 0
+                        else 0.0
+                    )
+                    prev_peak = float(pos.get("peak_price") or entry_px)
+                    peak_px = min(prev_peak, curr_price)
+                    if peak_px < prev_peak:
+                        pos["peak_price"] = peak_px
+                        state_dirty = True
 
                 trailing_active = bool(pos.get("trailing_active", False))
                 if not trailing_active and pnl_pct >= self.trailing_trigger_pct:
@@ -723,30 +788,55 @@ class BinanceTrader:
 
                 reason: str | None = None
                 tp_px = float(pos.get("tp_price") or 0.0)
-                if tp_px > 0 and curr_price >= tp_px:
-                    reason = "KÂR AL (Direnç)"
-                elif trailing_active:
-                    floor_sl = entry_px * (1.0 + self.trailing_floor_pct / 100.0)
-                    trail_sl = peak_px * (1.0 - self.trailing_callback_pct / 100.0)
-                    effective_sl = max(floor_sl, trail_sl)
-                    if effective_sl > float(pos.get("sl_price") or 0.0):
-                        pos["sl_price"] = effective_sl
-                        state_dirty = True
-                        ex_sl = float(pos.get("exchange_sl_price") or 0.0)
-                        if effective_sl > ex_sl * 1.002 and curr_price > effective_sl:
-                            if self.place_exchange_stop_loss(sym, effective_sl):
-                                pos["exchange_sl_price"] = effective_sl
-                    if curr_price <= effective_sl:
-                        reason = "SAT (Kâr Kilidi)" if tp_px > 0 else "TRAILING STOP"
+                if pos_side == "LONG":
+                    if tp_px > 0 and curr_price >= tp_px:
+                        reason = "KÂR AL (Direnç)"
+                    elif trailing_active:
+                        floor_sl = entry_px * (1.0 + self.trailing_floor_pct / 100.0)
+                        trail_sl = peak_px * (1.0 - self.trailing_callback_pct / 100.0)
+                        effective_sl = max(floor_sl, trail_sl)
+                        if effective_sl > float(pos.get("sl_price") or 0.0):
+                            pos["sl_price"] = effective_sl
+                            state_dirty = True
+                            ex_sl = float(pos.get("exchange_sl_price") or 0.0)
+                            if effective_sl > ex_sl * 1.002 and curr_price > effective_sl:
+                                if self.place_exchange_stop_loss(sym, effective_sl, pos_side="LONG"):
+                                    pos["exchange_sl_price"] = effective_sl
+                        if curr_price <= effective_sl:
+                            reason = "SAT (Kâr Kilidi)" if tp_px > 0 else "TRAILING STOP"
+                    else:
+                        sl_px = float(
+                            pos.get("sl_price")
+                            or (entry_px * (1.0 - self.stop_loss_pct / 100.0))
+                        )
+                        if pnl_pct <= -self.stop_loss_pct or curr_price <= sl_px:
+                            if pos.get("signal_lost") and curr_price <= sl_px:
+                                reason = f"STOP (Sinyal Bozuldu -${self.signal_cancel_stop_usd:g})"
+                            else:
+                                reason = f"STOP (-%{self.stop_loss_pct:g})"
                 else:
-                    sl_px = float(
-                        pos.get("sl_price")
-                        or (entry_px * (1.0 - self.stop_loss_pct / 100.0))
-                    )
-                    if pnl_pct <= -self.stop_loss_pct or curr_price <= sl_px:
-                        if pos.get("signal_lost") and curr_price <= sl_px:
-                            reason = f"STOP (Sinyal Bozuldu -${self.signal_cancel_stop_usd:g})"
-                        else:
+                    if tp_px > 0 and curr_price <= tp_px:
+                        reason = "KÂR AL (Destek)"
+                    elif trailing_active:
+                        floor_sl = entry_px * (1.0 - self.trailing_floor_pct / 100.0)
+                        trail_sl = peak_px * (1.0 + self.trailing_callback_pct / 100.0)
+                        effective_sl = min(floor_sl, trail_sl)
+                        prev_sl = float(pos.get("sl_price") or 0.0)
+                        if prev_sl <= 0 or effective_sl < prev_sl:
+                            pos["sl_price"] = effective_sl
+                            state_dirty = True
+                            ex_sl = float(pos.get("exchange_sl_price") or 0.0)
+                            if (ex_sl <= 0 or effective_sl < ex_sl * 0.998) and curr_price < effective_sl:
+                                if self.place_exchange_stop_loss(sym, effective_sl, pos_side="SHORT"):
+                                    pos["exchange_sl_price"] = effective_sl
+                        if curr_price >= effective_sl:
+                            reason = "TRAILING STOP"
+                    else:
+                        sl_px = float(
+                            pos.get("sl_price")
+                            or (entry_px * (1.0 + self.stop_loss_pct / 100.0))
+                        )
+                        if pnl_pct <= -self.stop_loss_pct or curr_price >= sl_px:
                             reason = f"STOP (-%{self.stop_loss_pct:g})"
 
                 if reason:
@@ -756,15 +846,24 @@ class BinanceTrader:
                         is_stop_loss=reason.startswith("STOP"),
                     )
                     if closed:
-                        realized_usd = (closed.price - entry_px) * closed.qty
-                        realized_pct = (
-                            ((closed.price - entry_px) / entry_px) * 100.0
-                            if entry_px > 0
-                            else 0.0
-                        )
+                        if pos_side == "LONG":
+                            realized_usd = (closed.price - entry_px) * closed.qty
+                            realized_pct = (
+                                ((closed.price - entry_px) / entry_px) * 100.0
+                                if entry_px > 0
+                                else 0.0
+                            )
+                        else:
+                            realized_usd = (entry_px - closed.price) * closed.qty
+                            realized_pct = (
+                                ((entry_px - closed.price) / entry_px) * 100.0
+                                if entry_px > 0
+                                else 0.0
+                            )
                         events.append(
                             {
                                 "symbol": sym,
+                                "side": pos_side,
                                 "reason": reason,
                                 "entry_price": entry_px,
                                 "exit_price": closed.price,

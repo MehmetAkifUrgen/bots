@@ -36,8 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--min-usd",
         type=float,
-        default=float(os.getenv("MIN_POSITION_USD", "150")),
-        help="Minimum pozisyon büyüklüğü USD (varsayılan: 150)",
+        default=float(os.getenv("MIN_POSITION_USD", "25")),
+        help="Minimum pozisyon büyüklüğü USD (varsayılan: 25)",
     )
     p.add_argument(
         "--max-usd",
@@ -54,20 +54,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--leverage",
         type=int,
-        default=int(os.getenv("LEVERAGE", "15")),
-        help="Varsayılan kaldıraç (max 15x güvenlik tavanı, varsayılan: 15)",
+        default=int(os.getenv("LEVERAGE", "10")),
+        help="Varsayılan kaldıraç (max 10x güvenlik tavanı, varsayılan: 10)",
     )
     p.add_argument(
         "--max-leverage",
         type=int,
-        default=int(os.getenv("MAX_LEVERAGE", "15")),
-        help="Likidasyon koruması için maksimum kaldıraç tavanı (varsayılan: 15)",
+        default=int(os.getenv("MAX_LEVERAGE", "10")),
+        help="Likidasyon koruması için maksimum kaldıraç tavanı (varsayılan: 10)",
     )
     p.add_argument(
         "--min-volume",
         type=float,
-        default=float(os.getenv("MIN_VOLUME_USDT", "5000000")),
-        help="Minimum 24s USDT hacim filtresi (varsayılan: 5000000)",
+        default=float(os.getenv("MIN_VOLUME_USDT", "15000000")),
+        help="Minimum 24s USDT hacim filtresi (varsayılan: 15000000)",
     )
     p.add_argument(
         "--min-win-rate",
@@ -240,13 +240,14 @@ def main() -> None:
             max_positions=args.max_positions,
             leverage=args.leverage,
             max_leverage=args.max_leverage,
-            stop_loss_pct=1.5,          # Max/fallback stop-loss: -%1.50
-            trailing_trigger_pct=2.5,   # +%2.50 görünce trailing başlar
-            trailing_callback_pct=1.8,  # 4S altcoinler için nefes alan %1.80 zirve takibi
-            trailing_floor_pct=0.5,     # En kötü +%0.50 kâr tabanı (asla zarar etmez)
+            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "2.5")),            # 4S Çift Yön Stop: -%2.50
+            trailing_trigger_pct=float(os.getenv("TRAILING_TRIGGER_PCT", "3.5")),  # +%3.50 görünce trailing başlar
+            trailing_callback_pct=float(os.getenv("TRAILING_CALLBACK_PCT", "2.0")),  # %2.00 zirve takibi
+            trailing_floor_pct=float(os.getenv("TRAILING_FLOOR_PCT", "0.5")),  # En kötü +%0.50 kâr tabanı
             cooldown_minutes=0,
-            symbol_stop_cooldown_minutes=180,
+            symbol_stop_cooldown_minutes=240,
             signal_cancel_stop_usd=float(os.getenv("SIGNAL_CANCEL_STOP_USD", "1.5")),
+            risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "8.0")),  # Kasa koruma: işlem başı max %8 risk
             state_file=DEFAULT_TRADE_STATE_FILE,
             proxy_url=proxy_url,
         )
@@ -284,37 +285,33 @@ def main() -> None:
                 min_volume_usdt=args.min_volume,
                 limit=args.limit,
             )
+            entry_window_min = int(os.getenv("ENTRY_WINDOW_MINUTES", "15"))
             stats = notifier.process_4h_alert_only(
                 results,
                 min_win_rate=args.min_win_rate,
                 min_profit_pct=args.min_profit_pct,
                 dry_run=args.dry_run,
                 trader=trader,
+                dual_mode=True,
+                entry_window_minutes=entry_window_min,
             )
 
-            qual = sum(
-                1
-                for r in results
-                if r.evaluation.win_rate >= args.min_win_rate
-                and r.evaluation.total_profit_pct >= args.min_profit_pct
-            )
-            green_now = sum(1 for r in results if r.evaluation.green_trigger)
-            orange_now = sum(1 for r in results if r.evaluation.orange_trigger)
+            long_now = sum(1 for r in results if r.evaluation.long_5_trigger)
+            short_now = sum(1 for r in results if r.evaluation.short_5_trigger)
 
             _HEALTH_STATE.update(
                 {
                     "status": "ok",
                     "last_scan_at": datetime.now(timezone.utc).isoformat(),
                     "total_scanned": len(results),
-                    "qualifying_coins": qual,
+                    "qualifying_coins": long_now + short_now,
                     "last_error": None,
                 }
             )
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
-                f"[4S BOT] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
-                f"Şarta Uyan (WR>=%{args.min_win_rate:g} & Getiri>=%{args.min_profit_pct:g}): {qual} | "
-                f"Tetiklenen Yeşil: {green_now}, Turuncu: {orange_now} | "
+                f"[4S ÇİFT YÖN] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
+                f"5/5+EMA200 -> LONG: {long_now}, SHORT: {short_now} (Son {entry_window_min}dk pencere) | "
                 f"Emir -> Açılan: {stats['orders_opened']}, Kapanan: {stats['orders_closed']}"
             )
             if stats["errors"]:

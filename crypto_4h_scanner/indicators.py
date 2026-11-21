@@ -38,6 +38,12 @@ class SystemEvaluation:
     win_trades: int
     win_rate: float
     total_profit_pct: float
+    bar_close_time: int = 0
+    ema200_bull: bool = False
+    ema200_bear: bool = False
+    all_five_sell: bool = False
+    long_5_trigger: bool = False
+    short_5_trigger: bool = False
 
 
 def wilder_rsi(closes: pd.Series, length: int = 14) -> pd.Series:
@@ -370,6 +376,13 @@ def evaluate_4h_system(
     last_c1 = last_c2 = last_c3 = last_c4 = last_c5 = False
     last_trend_ok = True
     last_first3 = last_all5 = False
+    last_all5_sell = False
+    last_ema200_bull = False
+    last_ema200_bear = False
+    last_long_5_trig = False
+    last_short_5_trig = False
+    prev_all5_up_strict = False
+    prev_all5_dn_strict = False
     last_fib_p = last_fib_r1 = last_fib_r2 = last_fib_s1 = last_fib_s2 = None
 
     for i in range(n):
@@ -407,6 +420,20 @@ def evaluate_4h_system(
 
         first3 = c1 and c2 and c3
         all5 = first3 and c4 and c5
+        # Dual-direction 5/5 strict conditions (matches 25-coin 4H backtest)
+        all5_up_strict = bool(
+            c1 and c2 and c3 and c4
+            and (smi.iloc[i] > smi_sig.iloc[i])
+            and (smi.iloc[i] > smi_ema9.iloc[i])
+        )
+        all5_dn_strict = bool(
+            (k.iloc[i] < d.iloc[i])
+            and (rsi_main.iloc[i] < rsi_ma.iloc[i])
+            and (fisher.iloc[i] < fisher_trigger.iloc[i])
+            and (wt1.iloc[i] < wt2.iloc[i])
+            and (smi.iloc[i] < smi_sig.iloc[i])
+            and (smi.iloc[i] < smi_ema9.iloc[i])
+        )
         real_sell = bool(
             (smi.iloc[i] < smi_ema9.iloc[i])
             or ((wt1.iloc[i] < wt2.iloc[i]) and (fisher.iloc[i] < fisher_trigger.iloc[i]))
@@ -526,6 +553,11 @@ def evaluate_4h_system(
             last_c1, last_c2, last_c3, last_c4, last_c5 = c1, c2, c3, c4, c5
             last_trend_ok = trend_ok
             last_first3, last_all5 = first3, all5
+            last_all5_sell = all5_dn_strict
+            last_ema200_bull = bool(not np.isnan(ema200_val) and bar_c > ema200_val)
+            last_ema200_bear = bool(not np.isnan(ema200_val) and bar_c < ema200_val)
+            last_long_5_trig = all5_up_strict and (not prev_all5_up_strict) and last_ema200_bull
+            last_short_5_trig = all5_dn_strict and (not prev_all5_dn_strict) and last_ema200_bear
             last_fib_p, last_fib_r1, last_fib_r2, last_fib_s1, last_fib_s2 = (
                 fib_p,
                 fib_r1,
@@ -533,6 +565,9 @@ def evaluate_4h_system(
                 fib_s1,
                 fib_s2,
             )
+
+        prev_all5_up_strict = all5_up_strict
+        prev_all5_dn_strict = all5_dn_strict
 
     last_close = float(closes.iloc[-1])
     next_res = (
@@ -560,6 +595,12 @@ def evaluate_4h_system(
         )
     )
     win_rate = (win_trades / total_trades) * 100.0 if total_trades > 0 else 0.0
+
+    bar_close_ts = (
+        int(df_4h["close_time"].iloc[-1])
+        if "close_time" in df_4h.columns
+        else int(open_times.iloc[-1]) + 4 * 3600 * 1000 - 1
+    )
 
     return SystemEvaluation(
         bar_open_time=int(open_times.iloc[-1]),
@@ -590,6 +631,12 @@ def evaluate_4h_system(
         win_trades=win_trades,
         win_rate=round(win_rate, 2),
         total_profit_pct=round(total_profit_pct, 2),
+        bar_close_time=bar_close_ts,
+        ema200_bull=last_ema200_bull,
+        ema200_bear=last_ema200_bear,
+        all_five_sell=last_all5_sell,
+        long_5_trigger=last_long_5_trig,
+        short_5_trigger=last_short_5_trig,
     )
 
 

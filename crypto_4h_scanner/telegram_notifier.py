@@ -117,13 +117,65 @@ def format_managed_close_message(ev_dict: dict) -> str:
             f"\n⏸️ <b>MOLA:</b> Art arda 3 işlem stop oldu, "
             f"<b>{ev_dict.get('cooldown_minutes', 240)} dk</b> yeni işlem açılmayacak."
         )
+    side_tag = f" | <b>{ev_dict['side']}</b>" if ev_dict.get("side") else ""
     return (
         f"{icon} <b>POZİSYON KAPATILDI — {ev_dict['reason']}</b>\n"
-        f"🪙 <b>{ev_dict['symbol']}</b> | <code>45dk</code>\n"
+        f"🪙 <b>{ev_dict['symbol']}</b>{side_tag} | <code>4S (4H)</code>\n"
         f"💵 <b>Giriş:</b> <code>{fmt_price(ev_dict['entry_price'])}</code> → <b>Çıkış:</b> <code>{fmt_price(ev_dict['exit_price'])}</code>\n"
         f"📊 <b>Net Kâr/Zarar:</b> <b>${pnl_usd:+.2f} ({pnl_pct:+.2f}%)</b>\n"
         f"🧾 <b>Emir ID:</b> <code>{ev_dict['order_id']}</code>"
         f"{cooldown_line}"
+    )
+
+
+def format_dual_4h_message(
+    res: Coin4hResult,
+    side: str,
+    trade_exec: TradeExecution | None = None,
+    trade_note: str | None = None,
+    stop_loss_pct: float = 2.5,
+    trailing_trigger_pct: float = 3.5,
+    trailing_callback_pct: float = 2.0,
+    trailing_floor_pct: float = 0.5,
+) -> str:
+    ev = res.evaluation
+    is_long = side.upper() == "LONG"
+    header = (
+        "🟢 <b>[4S ÇİFT YÖN] LONG 5/5 + EMA200</b>"
+        if is_long
+        else "🔴 <b>[4S ÇİFT YÖN] SHORT 5/5 + EMA200</b>"
+    )
+    entry = trade_exec.price if trade_exec else res.price
+    sl = (
+        entry * (1.0 - stop_loss_pct / 100.0)
+        if is_long
+        else entry * (1.0 + stop_loss_pct / 100.0)
+    )
+    bar_dt = datetime.fromtimestamp(ev.bar_open_time / 1000, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
+    trade_block = ""
+    if trade_exec:
+        trade_block = (
+            f"\n⚡ <b>OTOMATİK {side.upper()} EMİR AÇILDI</b>\n"
+            f"• Büyüklük: <b>${trade_exec.notional_usd:.2f}</b> | Miktar: <code>{trade_exec.qty:g}</code>\n"
+            f"• Emir ID: <code>{trade_exec.order_id}</code>\n"
+        )
+    elif trade_note:
+        trade_block = f"\nℹ️ <i>{trade_note}</i>\n"
+
+    return (
+        f"{header}\n"
+        f"🪙 <b>{res.symbol}</b> | <code>4S (4H)</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
+        f"🛑 <b>Stop (-%{stop_loss_pct:g}):</b> <code>{fmt_price(sl)}</code>\n"
+        f"🔒 <b>Trailing Stop:</b> +%{trailing_trigger_pct:g} görünce başlar (%{trailing_callback_pct:g} takip, +%{trailing_floor_pct:g} taban)\n"
+        f"📈 <b>Trend:</b> {'Fiyat > 4S EMA200 (Yükseliş)' if is_long else 'Fiyat < 4S EMA200 (Düşüş)'}\n"
+        f"{trade_block}"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💧 <b>24s Hacim:</b> {fmt_vol(res.volume_24h_usdt)} | 24s: {res.change_24h:+.2f}%\n"
+        f"🕒 <i>Mum: {bar_dt} (Kapanış Onayı)</i>"
     )
 
 
@@ -501,12 +553,16 @@ class TelegramNotifier:
         min_profit_pct: float = 250.0,
         dry_run: bool = False,
         trader: BinanceTrader | None = None,
+        dual_mode: bool = True,
+        entry_window_minutes: int = 15,
     ) -> dict:
-        """Process 4H BIST-style signals: open Binance orders (when trader active) & send Telegram alerts."""
+        """Process 4H signals: manage open positions & enter dual-direction 5/5 + EMA200 near candle close."""
         sent_alerts: dict[str, int] = self._state["sent_alerts"]
         stats = {
             "green": 0,
             "orange": 0,
+            "long": 0,
+            "short": 0,
             "orders_opened": 0,
             "orders_closed": 0,
             "errors": [],
@@ -525,9 +581,75 @@ class TelegramNotifier:
             except Exception as exc:
                 stats["errors"].append(f"MANAGE_POS: {exc}")
 
-            # Sinyal İptal Koruması:
-            # - 3/5 sinyali kaybolursa hemen $0'da kapatma; stopu -$1.50'ye çek (Binance'te de güncelle).
-            # - Zaten -$1.50 veya daha fazla zarardaysa anında kapat.
+        if dual_mode:
+            now_ms = int(time.time() * 1000)
+            window_ms = max(0, entry_window_minutes) * 60 * 1000
+            for res in results:
+                ev = res.evaluation
+                side: str | None = None
+                if ev.long_5_trigger:
+                    side = "LONG"
+                elif ev.short_5_trigger:
+                    side = "SHORT"
+                if not side:
+                    continue
+
+                # Only enter in the final `entry_window_minutes` of the 4H candle (zero mid-candle repaint)
+                if window_ms > 0 and ev.bar_close_time > 0:
+                    rem_ms = ev.bar_close_time - now_ms
+                    if rem_ms > window_ms or rem_ms < -60_000:
+                        continue
+
+                alert_key = f"4h_dual:{res.symbol}:{side}:{ev.bar_open_time}"
+                if alert_key in sent_alerts:
+                    continue
+
+                trade_exec: TradeExecution | None = None
+                trade_note: str | None = None
+                if trader and trader.is_configured and not dry_run:
+                    try:
+                        trade_exec = trader.open_position(
+                            res.symbol,
+                            res.price,
+                            trader.max_usd,
+                            tp_price=None,
+                            sl_price=None,
+                            side="LONG" if side == "LONG" else "SHORT",
+                        )
+                        if trade_exec:
+                            stats["orders_opened"] += 1
+                        else:
+                            trade_note = f"Emir açılmadı (Max {trader.max_positions} pozisyon, coin bekleme veya yetersiz marj)."
+                    except Exception as exc:
+                        trade_note = f"Emir hatası: {exc}"
+                try:
+                    if dry_run:
+                        print(f"[DRY-RUN 4H DUAL {side}] {res.symbol} @ {res.price}")
+                    else:
+                        self.send_text(
+                            format_dual_4h_message(
+                                res,
+                                side=side,
+                                trade_exec=trade_exec,
+                                trade_note=trade_note,
+                                stop_loss_pct=trader.stop_loss_pct if trader else 2.5,
+                                trailing_trigger_pct=trader.trailing_trigger_pct if trader else 3.5,
+                                trailing_callback_pct=trader.trailing_callback_pct if trader else 2.0,
+                                trailing_floor_pct=trader.trailing_floor_pct if trader else 0.5,
+                            )
+                        )
+                    sent_alerts[alert_key] = int(time.time())
+                    stats["long" if side == "LONG" else "short"] += 1
+                    stats["orange"] += 1
+                except Exception as exc:
+                    stats["errors"].append(f"4H DUAL {res.symbol} {side}: {exc}")
+
+            if not dry_run:
+                self._save_state()
+            return stats
+
+        if trader and trader.is_configured and not dry_run:
+            # Legacy LONG-only 3/5 signal cancel stop
             for res in results:
                 pos = trader._state.get("open_positions", {}).get(res.symbol)
                 if not pos:

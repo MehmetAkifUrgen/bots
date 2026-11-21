@@ -444,6 +444,113 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertEqual(out2["action"], "closed")
             self.assertNotIn("BUSDT", trader._state["open_positions"])
 
+    def test_short_position_trailing_sl_and_dynamic_risk_sizing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trader = BinanceTrader(
+                api_key="k",
+                api_secret="s",
+                market="papi",
+                min_usd=150.0,  # Even if env has 150, dynamic risk sizing protects $23 equity!
+                max_usd=250.0,
+                leverage=10,
+                max_leverage=10,
+                stop_loss_pct=2.5,
+                trailing_trigger_pct=3.5,
+                trailing_callback_pct=2.0,
+                trailing_floor_pct=0.5,
+                risk_per_trade_pct=8.0,
+                symbol_stop_cooldown_minutes=0,
+                state_file=Path(tmp) / "trade_state.json",
+            )
+            trader._filters_cache = {
+                "SUSDT": {"stepSize": 0.1, "minQty": 0.1, "minNotional": 5.0, "tickSize": 0.01},
+                "TUSDT": {"stepSize": 0.1, "minQty": 0.1, "minNotional": 5.0, "tickSize": 0.01},
+            }
+            trader.get_account_equity = lambda: 23.0  # type: ignore[method-assign]
+            trader.get_free_usdt = lambda: 20.0  # type: ignore[method-assign]
+            trader.get_live_open_positions = lambda: {}  # type: ignore[method-assign]
+
+            order_log: list[tuple[str, str]] = []
+            stop_log: list[tuple[str, str, float]] = []
+            last_price = {"p": 100.0}
+
+            def fake_signed(method: str, path: str, params=None):
+                if path == "/papi/v1/um/order":
+                    order_log.append((params["symbol"], params["side"]))
+                    return {
+                        "orderId": 555,
+                        "avgPrice": str(last_price["p"]),
+                        "executedQty": params["quantity"],
+                    }
+                if path == "/papi/v1/um/algo/order":
+                    stop_log.append((params["symbol"], params["side"], float(params["triggerPrice"])))
+                    return {"algoId": 666}
+                return {}
+
+            trader._signed_request = fake_signed  # type: ignore[method-assign]
+
+            # 1) Open SHORT with $23 equity -> risk notional = 23 * (8/2.5) = $73.6 -> qty=0.7 -> $70
+            t_short = trader.open_position("SUSDT", price=100.0, target_usd=250.0, side="SHORT")
+            self.assertIsNotNone(t_short)
+            assert t_short is not None
+            self.assertEqual(t_short.side, "SELL")
+            self.assertAlmostEqual(t_short.notional_usd, 70.0, places=1)
+            self.assertEqual(stop_log[-1], ("SUSDT", "BUY", 102.5))
+
+            # Price drops to 95.0 (+5% profit -> activates trailing), bounces to 97.0 (> 95 * 1.02 = 96.9) -> closes in profit
+            self.assertEqual(len(trader.manage_open_positions({"SUSDT": 95.0})), 0)
+            self.assertTrue(trader._state["open_positions"]["SUSDT"]["trailing_active"])
+            last_price["p"] = 97.0
+            evs = trader.manage_open_positions({"SUSDT": 97.0})
+            self.assertEqual(len(evs), 1)
+            self.assertEqual(evs[0]["side"], "SHORT")
+            self.assertEqual(evs[0]["reason"], "TRAILING STOP")
+            self.assertGreater(evs[0]["pnl_usd"], 0)
+            self.assertEqual(order_log[-1], ("SUSDT", "BUY"))
+
+            # 2) SHORT Stop-Loss at +2.5% upward move
+            last_price["p"] = 100.0
+            trader.open_position("TUSDT", price=100.0, target_usd=250.0, side="SHORT")
+            last_price["p"] = 102.6
+            sl_evs = trader.manage_open_positions({"TUSDT": 102.6})
+            self.assertEqual(len(sl_evs), 1)
+            self.assertIn("STOP", sl_evs[0]["reason"])
+            self.assertLess(sl_evs[0]["pnl_usd"], 0)
+
+    def test_dual_4h_entry_window_gate(self) -> None:
+        import time as _time
+        with tempfile.TemporaryDirectory() as tmp:
+            notifier = TelegramNotifier("tok", "chat", Path(tmp) / "alert.json")
+            sent: list[str] = []
+            notifier.send_text = lambda text: sent.append(text) or True  # type: ignore[method-assign]
+
+            now_ms = int(_time.time() * 1000)
+            ev_mid = SystemEvaluation(
+                bar_open_time=now_ms - 60 * 60_000,
+                bar_close_time=now_ms + 180 * 60_000,  # 3 hours left -> NOT in last 15m
+                price=100.0,
+                cond1_buy=False, cond2_buy=False, cond3_buy=False, cond4_buy=False, cond5_buy=False,
+                trend_ok=False, first_three_buy=False, all_five_buy=False,
+                green_trigger=False, orange_trigger=False, exit_trigger=False,
+                exit_reason=None, exit_price=None, exit_trade_pct=None,
+                in_green_pos=False, in_orange_pos=False, be_locked=False,
+                entry_price=None, tp_level=None, sl_level=None, next_res=105.0, prev_sup=95.0,
+                total_trades=10, win_trades=5, win_rate=50.0, total_profit_pct=10.0,
+                ema200_bear=True, all_five_sell=True, short_5_trigger=True,
+            )
+            res_mid = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_mid)
+            st1 = notifier.process_4h_alert_only([res_mid], dual_mode=True, entry_window_minutes=15)
+            self.assertEqual(st1["short"], 0)
+            self.assertEqual(len(sent), 0)
+
+            # Now inside last 10 minutes before candle close -> triggers SHORT alert
+            ev_close = SystemEvaluation(**{**ev_mid.__dict__, "bar_close_time": now_ms + 10 * 60_000})
+            res_close = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_close)
+            st2 = notifier.process_4h_alert_only([res_close], dual_mode=True, entry_window_minutes=15)
+            self.assertEqual(st2["short"], 1)
+            self.assertEqual(len(sent), 1)
+            self.assertIn("SHORT 5/5 + EMA200", sent[0])
+
 
 if __name__ == "__main__":
     unittest.main()
