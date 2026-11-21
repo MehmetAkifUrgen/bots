@@ -172,8 +172,9 @@ def format_4h_alert_only_message(
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
         f"🎯 <b>Kâr Al (Direnç):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
-        f"🛑 <b>Stop (Destek):</b> <code>{fmt_price(sl)}</code> (<b>{sl_pct:.2f}%</b>)\n"
-        f"🔒 <b>Kâr Kilidi:</b> +%2.50 görünce SL → +%0.30\n"
+        f"🛑 <b>Stop (Max -%1.50):</b> <code>{fmt_price(sl)}</code> (<b>{sl_pct:.2f}%</b>)\n"
+        f"🔒 <b>Trailing Stop:</b> +%2.50 görünce başlar (%1.80 takip, +%0.50 taban)\n"
+        f"🛡️ <b>Sinyal Koruması:</b> 3/5 bozulursa erken çıkış\n"
         f"{trade_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>5'li İndikatör Durumu:</b>\n"
@@ -375,6 +376,39 @@ class TelegramNotifier:
             except Exception as exc:
                 stats["errors"].append(f"MANAGE_POS: {exc}")
 
+            # Sinyal İptal Koruması: Trailing henüz açılmadıysa ve 3/5 sinyali kaybolduysa hemen çık
+            for res in results:
+                pos = trader._state.get("open_positions", {}).get(res.symbol)
+                if pos and not pos.get("trailing_active") and not res.evaluation.first_three_buy:
+                    try:
+                        entry_px = float(pos["entry_price"])
+                        closed = trader.close_position(
+                            res.symbol, fallback_price=res.price, is_stop_loss=False
+                        )
+                        if closed:
+                            pnl_usd = (closed.price - entry_px) * closed.qty
+                            pnl_pct = (
+                                ((closed.price - entry_px) / entry_px) * 100.0
+                                if entry_px > 0
+                                else 0.0
+                            )
+                            stats["orders_closed"] += 1
+                            self.send_text(
+                                format_managed_close_message(
+                                    {
+                                        "symbol": res.symbol,
+                                        "reason": "Sinyal İptal (3/5 Bozuldu)",
+                                        "entry_price": entry_px,
+                                        "exit_price": closed.price,
+                                        "pnl_usd": round(pnl_usd, 2),
+                                        "pnl_pct": round(pnl_pct, 2),
+                                        "order_id": closed.order_id,
+                                    }
+                                )
+                            )
+                    except Exception as exc:
+                        stats["errors"].append(f"{res.symbol} SIGNAL_CANCEL: {exc}")
+
         for res in results:
             ev = res.evaluation
             track_key = f"{res.market}:{res.symbol}"
@@ -498,6 +532,39 @@ class TelegramNotifier:
             except Exception as exc:
                 stats["errors"].append(f"MANAGE_POS: {exc}")
 
+            # Sinyal İptal Koruması: Trailing henüz açılmadıysa ve 3/5 sinyali kaybolduysa hemen çık
+            for res in results:
+                pos = trader._state.get("open_positions", {}).get(res.symbol)
+                if pos and not pos.get("trailing_active") and not res.evaluation.first_three_buy:
+                    try:
+                        entry_px = float(pos["entry_price"])
+                        closed = trader.close_position(
+                            res.symbol, fallback_price=res.price, is_stop_loss=False
+                        )
+                        if closed:
+                            pnl_usd = (closed.price - entry_px) * closed.qty
+                            pnl_pct = (
+                                ((closed.price - entry_px) / entry_px) * 100.0
+                                if entry_px > 0
+                                else 0.0
+                            )
+                            stats["orders_closed"] += 1
+                            self.send_text(
+                                format_managed_close_message(
+                                    {
+                                        "symbol": res.symbol,
+                                        "reason": "Sinyal İptal (3/5 Bozuldu)",
+                                        "entry_price": entry_px,
+                                        "exit_price": closed.price,
+                                        "pnl_usd": round(pnl_usd, 2),
+                                        "pnl_pct": round(pnl_pct, 2),
+                                        "order_id": closed.order_id,
+                                    }
+                                )
+                            )
+                    except Exception as exc:
+                        stats["errors"].append(f"{res.symbol} SIGNAL_CANCEL: {exc}")
+
         for res in results:
             ev = res.evaluation
             if ev.win_rate < min_win_rate or ev.total_profit_pct < min_profit_pct:
@@ -518,7 +585,7 @@ class TelegramNotifier:
                                 res.symbol,
                                 res.price,
                                 target_usd,
-                                tp_price=ev.tp_level or ev.next_res,
+                                tp_price=None,  # Sabit TP tavanı yok, +%2.5 sonrası %1.8 trailing ile büyük trendi sür
                                 sl_price=ev.sl_level or ev.prev_sup,
                             )
                             if trade_exec:

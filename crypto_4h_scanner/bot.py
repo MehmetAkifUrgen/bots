@@ -241,9 +241,9 @@ def main() -> None:
             leverage=args.leverage,
             max_leverage=args.max_leverage,
             stop_loss_pct=1.5,          # Max/fallback stop-loss: -%1.50
-            trailing_trigger_pct=2.5,   # Pine Script: +%2.5 Kâr Kilidi tetik
-            trailing_callback_pct=0.8,  # Trailing callback after +%2.5
-            trailing_floor_pct=0.3,     # Pine Script: entry * 1.003 (+%0.30)
+            trailing_trigger_pct=2.5,   # +%2.50 görünce trailing başlar
+            trailing_callback_pct=1.8,  # 4S altcoinler için nefes alan %1.80 zirve takibi
+            trailing_floor_pct=0.5,     # En kötü +%0.50 kâr tabanı (asla zarar etmez)
             cooldown_minutes=0,
             symbol_stop_cooldown_minutes=180,
             state_file=DEFAULT_TRADE_STATE_FILE,
