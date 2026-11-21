@@ -240,7 +240,7 @@ def main() -> None:
             max_positions=args.max_positions,
             leverage=args.leverage,
             max_leverage=args.max_leverage,
-            stop_loss_pct=2.5,          # Max/fallback stop-loss: -%2.50
+            stop_loss_pct=1.5,          # Max/fallback stop-loss: -%1.50
             trailing_trigger_pct=2.5,   # Pine Script: +%2.5 Kâr Kilidi tetik
             trailing_callback_pct=0.8,  # Trailing callback after +%2.5
             trailing_floor_pct=0.3,     # Pine Script: entry * 1.003 (+%0.30)
