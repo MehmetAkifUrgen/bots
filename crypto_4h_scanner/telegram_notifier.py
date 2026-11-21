@@ -62,9 +62,9 @@ def format_entry_message(
     entry = trade_exec.price if trade_exec else (ev.entry_price or res.price)
     tp = ev.tp_level or ev.next_res
     raw_sl = ev.sl_level or ev.prev_sup
-    # Show the real clamped stop-loss (same -5% safety floor / -3.5% fallback used on Binance)
-    if entry > 0 and (raw_sl < entry * 0.95 or raw_sl >= entry * 0.995):
-        sl = entry * 0.965
+    # Show the real clamped stop-loss (max -2.50% safety floor used on Binance)
+    if entry > 0 and (raw_sl < entry * 0.975 or raw_sl >= entry * 0.995):
+        sl = entry * 0.975
     else:
         sl = raw_sl
     tp_pct = ((tp - entry) / entry * 100.0) if entry > 0 else 0.0
@@ -142,9 +142,9 @@ def format_4h_alert_only_message(
     entry = trade_exec.price if trade_exec else (ev.entry_price or res.price)
     tp = ev.tp_level or ev.next_res
     raw_sl = ev.sl_level or ev.prev_sup
-    # Show the real clamped stop-loss (same -5% safety floor / -3.5% fallback used on Binance)
-    if entry > 0 and (raw_sl < entry * 0.95 or raw_sl >= entry * 0.995):
-        sl = entry * 0.965
+    # Show the real clamped stop-loss (max -2.50% safety floor used on Binance)
+    if entry > 0 and (raw_sl < entry * 0.975 or raw_sl >= entry * 0.995):
+        sl = entry * 0.975
     else:
         sl = raw_sl
     tp_pct = ((tp - entry) / entry * 100.0) if entry > 0 else 0.0

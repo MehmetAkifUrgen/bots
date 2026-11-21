@@ -442,8 +442,8 @@ class BinanceTrader:
         order_id = str(res.get("orderId", ""))
         actual_not = round(exec_qty * exec_price, 2)
         default_sl = exec_price * (1.0 - self.stop_loss_pct / 100.0)
-        # Use Pine Script Pivot SL if valid and not wider than -5% safety floor
-        if sl_price is not None and exec_price * 0.95 <= sl_price < exec_price * 0.995:
+        # Use Pine Script Pivot SL if between -stop_loss_pct% (-2.5%) and -0.5%, else cap at -stop_loss_pct%
+        if sl_price is not None and default_sl <= sl_price < exec_price * 0.995:
             final_sl = sl_price
         else:
             final_sl = default_sl
