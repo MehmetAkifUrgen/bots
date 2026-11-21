@@ -58,6 +58,7 @@ class BinanceTrader:
         max_consecutive_stops: int = 3,
         cooldown_minutes: int = 0,
         symbol_stop_cooldown_minutes: int = 180,
+        signal_cancel_stop_usd: float = 1.5,
         state_file: Path | None = None,
         timeout: float = 10.0,
         proxy_url: str = "",
@@ -77,6 +78,7 @@ class BinanceTrader:
         self.max_consecutive_stops = max_consecutive_stops
         self.cooldown_minutes = cooldown_minutes
         self.symbol_stop_cooldown_minutes = max(0, symbol_stop_cooldown_minutes)
+        self.signal_cancel_stop_usd = max(0.1, float(signal_cancel_stop_usd))
         self.state_file = state_file or (
             Path(__file__).resolve().parent / "trade_state.json"
         )
@@ -607,13 +609,71 @@ class BinanceTrader:
                 live_ep = float(live[sym].get("entry_price") or 0.0)
                 if live_ep > 0 and abs(live_ep - float(tracked[sym].get("entry_price") or 0.0)) / live_ep > 0.001:
                     tracked[sym]["entry_price"] = live_ep
-                    if not tracked[sym].get("trailing_active"):
+                    if not tracked[sym].get("trailing_active") and not tracked[sym].get("signal_lost"):
                         tracked[sym]["sl_price"] = live_ep * (1.0 - self.stop_loss_pct / 100.0)
                     dirty = True
 
             if dirty:
                 self._save_state()
             return dict(tracked)
+
+    def apply_signal_cancel_stop(self, symbol: str, current_price: float) -> dict | None:
+        """
+        When 3/5 buy signal disappears on an open position (before trailing activates):
+        - Never close early at $0 if in profit or small loss (< signal_cancel_stop_usd).
+        - Tighten SL to -$signal_cancel_stop_usd (default -$1.50) and update Binance STOP_MARKET.
+        - If current price is already at or below that -$1.50 stop, close immediately.
+        """
+        with self._lock:
+            pos = self._state["open_positions"].get(symbol)
+            if not pos or pos.get("trailing_active"):
+                return None
+            entry_px = float(pos.get("entry_price") or 0.0)
+            qty = float(pos.get("qty") or 0.0)
+            if entry_px <= 0 or qty <= 0 or current_price <= 0:
+                return None
+
+            target_sl = max(entry_px * 0.5, entry_px - (self.signal_cancel_stop_usd / qty))
+            prev_sl = float(pos.get("sl_price") or 0.0)
+            new_sl = max(prev_sl, target_sl)
+
+            if current_price <= new_sl:
+                closed = self.close_position(
+                    symbol, fallback_price=current_price, is_stop_loss=True
+                )
+                if not closed:
+                    return None
+                pnl_usd = (closed.price - entry_px) * closed.qty
+                pnl_pct = ((closed.price - entry_px) / entry_px) * 100.0
+                return {
+                    "action": "closed",
+                    "event": {
+                        "symbol": symbol,
+                        "reason": f"STOP (Sinyal Bozuldu -${self.signal_cancel_stop_usd:g})",
+                        "entry_price": entry_px,
+                        "exit_price": closed.price,
+                        "pnl_usd": round(pnl_usd, 2),
+                        "pnl_pct": round(pnl_pct, 2),
+                        "order_id": closed.order_id,
+                    },
+                }
+
+            if pos.get("signal_lost") and new_sl <= prev_sl * 1.0001:
+                return None
+
+            pos["sl_price"] = new_sl
+            pos["signal_lost"] = True
+            if self.place_exchange_stop_loss(symbol, new_sl):
+                pos["exchange_sl_price"] = new_sl
+            self._save_state()
+            return {
+                "action": "tightened",
+                "symbol": symbol,
+                "entry_price": entry_px,
+                "sl_price": new_sl,
+                "current_price": current_price,
+                "stop_usd": self.signal_cancel_stop_usd,
+            }
 
     def manage_open_positions(
         self, price_map: dict[str, float] | None = None
@@ -684,7 +744,10 @@ class BinanceTrader:
                         or (entry_px * (1.0 - self.stop_loss_pct / 100.0))
                     )
                     if pnl_pct <= -self.stop_loss_pct or curr_price <= sl_px:
-                        reason = f"STOP (-%{self.stop_loss_pct:g})"
+                        if pos.get("signal_lost") and curr_price <= sl_px:
+                            reason = f"STOP (Sinyal Bozuldu -${self.signal_cancel_stop_usd:g})"
+                        else:
+                            reason = f"STOP (-%{self.stop_loss_pct:g})"
 
                 if reason:
                     closed = self.close_position(

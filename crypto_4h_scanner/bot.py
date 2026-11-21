@@ -246,6 +246,7 @@ def main() -> None:
             trailing_floor_pct=0.5,     # En kötü +%0.50 kâr tabanı (asla zarar etmez)
             cooldown_minutes=0,
             symbol_stop_cooldown_minutes=180,
+            signal_cancel_stop_usd=float(os.getenv("SIGNAL_CANCEL_STOP_USD", "1.5")),
             state_file=DEFAULT_TRADE_STATE_FILE,
             proxy_url=proxy_url,
         )

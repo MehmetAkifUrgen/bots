@@ -174,7 +174,7 @@ def format_4h_alert_only_message(
         f"🎯 <b>Kâr Al (Direnç):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
         f"🛑 <b>Stop (Max -%1.50):</b> <code>{fmt_price(sl)}</code> (<b>{sl_pct:.2f}%</b>)\n"
         f"🔒 <b>Trailing Stop:</b> +%2.50 görünce başlar (%1.80 takip, +%0.50 taban)\n"
-        f"🛡️ <b>Sinyal Koruması:</b> 3/5 bozulursa erken çıkış\n"
+        f"🛡️ <b>Sinyal Koruması:</b> 3/5 bozulursa stop -$1.50'ye çekilir\n"
         f"{trade_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>5'li İndikatör Durumu:</b>\n"
@@ -377,45 +377,27 @@ class TelegramNotifier:
                 stats["errors"].append(f"MANAGE_POS: {exc}")
 
             # Sinyal İptal Koruması:
-            # - Pozisyon kârda ise (res.price > entry_px) ASLA erken kapatma!
-            # - Sadece trailing açılmadıysa, 3/5 sinyali kaybolduysa VE pozisyon zarardaysa kapat!
+            # - 3/5 sinyali kaybolursa hemen $0'da kapatma; stopu -$1.50'ye çek (Binance'te de güncelle).
+            # - Zaten -$1.50 veya daha fazla zarardaysa anında kapat.
             for res in results:
                 pos = trader._state.get("open_positions", {}).get(res.symbol)
                 if not pos:
                     continue
                 if res.evaluation.all_five_buy and not pos.get("upgraded_5_5"):
                     pos["upgraded_5_5"] = True
-                entry_px = float(pos.get("entry_price") or 0.0)
-                in_loss = entry_px > 0 and res.price <= entry_px
-                if (
-                    not pos.get("trailing_active")
-                    and not res.evaluation.first_three_buy
-                    and in_loss
-                ):
+                if not pos.get("trailing_active") and not res.evaluation.first_three_buy:
                     try:
-                        closed = trader.close_position(
-                            res.symbol, fallback_price=res.price, is_stop_loss=False
-                        )
-                        if closed:
-                            pnl_usd = (closed.price - entry_px) * closed.qty
-                            pnl_pct = (
-                                ((closed.price - entry_px) / entry_px) * 100.0
-                                if entry_px > 0
-                                else 0.0
-                            )
+                        out = trader.apply_signal_cancel_stop(res.symbol, res.price)
+                        if out and out.get("action") == "closed":
                             stats["orders_closed"] += 1
+                            self.send_text(format_managed_close_message(out["event"]))
+                        elif out and out.get("action") == "tightened":
                             self.send_text(
-                                format_managed_close_message(
-                                    {
-                                        "symbol": res.symbol,
-                                        "reason": "Sinyal İptal (3/5 Bozuldu & Zarar)",
-                                        "entry_price": entry_px,
-                                        "exit_price": closed.price,
-                                        "pnl_usd": round(pnl_usd, 2),
-                                        "pnl_pct": round(pnl_pct, 2),
-                                        "order_id": closed.order_id,
-                                    }
-                                )
+                                f"🛡️ <b>SİNYAL BOZULDU — STOP -${out['stop_usd']:g}'YE ÇEKİLDİ</b>\n"
+                                f"🪙 <b>{res.symbol}</b>\n"
+                                f"💵 <b>Giriş:</b> <code>{fmt_price(out['entry_price'])}</code> | "
+                                f"<b>Anlık:</b> <code>{fmt_price(out['current_price'])}</code>\n"
+                                f"🛑 <b>Yeni Stop:</b> <code>{fmt_price(out['sl_price'])}</code> (-${out['stop_usd']:g})"
                             )
                     except Exception as exc:
                         stats["errors"].append(f"{res.symbol} SIGNAL_CANCEL: {exc}")
@@ -516,7 +498,7 @@ class TelegramNotifier:
         self,
         results: list[Coin4hResult],
         min_win_rate: float = 60.0,
-        min_profit_pct: float = 200.0,
+        min_profit_pct: float = 250.0,
         dry_run: bool = False,
         trader: BinanceTrader | None = None,
     ) -> dict:
@@ -544,45 +526,27 @@ class TelegramNotifier:
                 stats["errors"].append(f"MANAGE_POS: {exc}")
 
             # Sinyal İptal Koruması:
-            # - Pozisyon kârda ise (res.price > entry_px) ASLA erken kapatma!
-            # - Sadece trailing açılmadıysa, 3/5 sinyali kaybolduysa VE pozisyon zarardaysa kapat!
+            # - 3/5 sinyali kaybolursa hemen $0'da kapatma; stopu -$1.50'ye çek (Binance'te de güncelle).
+            # - Zaten -$1.50 veya daha fazla zarardaysa anında kapat.
             for res in results:
                 pos = trader._state.get("open_positions", {}).get(res.symbol)
                 if not pos:
                     continue
                 if res.evaluation.all_five_buy and not pos.get("upgraded_5_5"):
                     pos["upgraded_5_5"] = True
-                entry_px = float(pos.get("entry_price") or 0.0)
-                in_loss = entry_px > 0 and res.price <= entry_px
-                if (
-                    not pos.get("trailing_active")
-                    and not res.evaluation.first_three_buy
-                    and in_loss
-                ):
+                if not pos.get("trailing_active") and not res.evaluation.first_three_buy:
                     try:
-                        closed = trader.close_position(
-                            res.symbol, fallback_price=res.price, is_stop_loss=False
-                        )
-                        if closed:
-                            pnl_usd = (closed.price - entry_px) * closed.qty
-                            pnl_pct = (
-                                ((closed.price - entry_px) / entry_px) * 100.0
-                                if entry_px > 0
-                                else 0.0
-                            )
+                        out = trader.apply_signal_cancel_stop(res.symbol, res.price)
+                        if out and out.get("action") == "closed":
                             stats["orders_closed"] += 1
+                            self.send_text(format_managed_close_message(out["event"]))
+                        elif out and out.get("action") == "tightened":
                             self.send_text(
-                                format_managed_close_message(
-                                    {
-                                        "symbol": res.symbol,
-                                        "reason": "Sinyal İptal (3/5 Bozuldu & Zarar)",
-                                        "entry_price": entry_px,
-                                        "exit_price": closed.price,
-                                        "pnl_usd": round(pnl_usd, 2),
-                                        "pnl_pct": round(pnl_pct, 2),
-                                        "order_id": closed.order_id,
-                                    }
-                                )
+                                f"🛡️ <b>SİNYAL BOZULDU — STOP -${out['stop_usd']:g}'YE ÇEKİLDİ</b>\n"
+                                f"🪙 <b>{res.symbol}</b>\n"
+                                f"💵 <b>Giriş:</b> <code>{fmt_price(out['entry_price'])}</code> | "
+                                f"<b>Anlık:</b> <code>{fmt_price(out['current_price'])}</code>\n"
+                                f"🛑 <b>Yeni Stop:</b> <code>{fmt_price(out['sl_price'])}</code> (-${out['stop_usd']:g})"
                             )
                     except Exception as exc:
                         stats["errors"].append(f"{res.symbol} SIGNAL_CANCEL: {exc}")

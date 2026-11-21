@@ -382,6 +382,68 @@ class TestBinanceTrader(unittest.TestCase):
             synced = trader.sync_live_positions()
             self.assertNotIn("HUSDT", synced)
 
+    def test_signal_cancel_tightens_stop_to_1_5_usd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trader = BinanceTrader(
+                api_key="k",
+                api_secret="s",
+                market="papi",
+                min_usd=150.0,
+                max_usd=250.0,
+                stop_loss_pct=1.5,
+                signal_cancel_stop_usd=1.5,
+                state_file=Path(tmp) / "trade_state.json",
+            )
+            trader._filters_cache = {
+                "AUSDT": {"stepSize": 0.1, "minQty": 0.1, "minNotional": 5.0, "tickSize": 0.01},
+                "BUSDT": {"stepSize": 0.1, "minQty": 0.1, "minNotional": 5.0, "tickSize": 0.01},
+            }
+            trader.get_free_usdt = lambda: 500.0  # type: ignore[method-assign]
+            trader.get_live_open_positions = lambda: {}  # type: ignore[method-assign]
+
+            placed_stops: list[tuple[str, float]] = []
+            last_price = {"p": 100.0}
+
+            def fake_signed(method: str, path: str, params=None):
+                if path == "/papi/v1/um/order":
+                    return {
+                        "orderId": 777,
+                        "avgPrice": str(last_price["p"]),
+                        "executedQty": params["quantity"],
+                    }
+                if path == "/papi/v1/um/algo/order":
+                    placed_stops.append((params["symbol"], float(params["triggerPrice"])))
+                    return {"algoId": 888}
+                return {}
+
+            trader._signed_request = fake_signed  # type: ignore[method-assign]
+
+            # 1) Open $250 position (qty=2.5 @ 100.0). Signal drops while in profit (101.0)
+            trader.open_position("AUSDT", price=100.0, target_usd=250.0)
+            out = trader.apply_signal_cancel_stop("AUSDT", current_price=101.0)
+            self.assertIsNotNone(out)
+            assert out is not None
+            self.assertEqual(out["action"], "tightened")
+            self.assertAlmostEqual(out["sl_price"], 99.4, places=4)
+            self.assertEqual(placed_stops[-1], ("AUSDT", 99.4))
+            # Position stays open at 99.5 (-$1.25)
+            self.assertEqual(len(trader.manage_open_positions({"AUSDT": 99.5})), 0)
+            # Hits -$1.50 stop at 99.35 -> closes
+            last_price["p"] = 99.35
+            evs = trader.manage_open_positions({"AUSDT": 99.35})
+            self.assertEqual(len(evs), 1)
+            self.assertIn("Sinyal Bozuldu -$1.5", evs[0]["reason"])
+
+            # 2) If already below -$1.50 when signal drops -> closes immediately
+            last_price["p"] = 100.0
+            trader.open_position("BUSDT", price=100.0, target_usd=250.0)
+            last_price["p"] = 99.3
+            out2 = trader.apply_signal_cancel_stop("BUSDT", current_price=99.3)
+            self.assertIsNotNone(out2)
+            assert out2 is not None
+            self.assertEqual(out2["action"], "closed")
+            self.assertNotIn("BUSDT", trader._state["open_positions"])
+
 
 if __name__ == "__main__":
     unittest.main()
