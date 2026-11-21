@@ -503,17 +503,21 @@ class TelegramNotifier:
             if ev.win_rate < min_win_rate or ev.total_profit_pct < min_profit_pct:
                 continue
 
-            if ev.orange_trigger:
-                alert_key = f"4h_bist:{res.symbol}:ORANGE:{ev.bar_open_time}"
+            # Match TradingView's exact entry: open ONLY on fresh 3/5 (green_trigger).
+            # If 5/5 (orange_trigger) fires on a LATER bar after 3/5, do NOT open late at the top!
+            if ev.green_trigger:
+                kind = "ORANGE" if ev.orange_trigger else "GREEN"
+                alert_key = f"4h_bist:{res.symbol}:{kind}:{ev.bar_open_time}"
                 if alert_key not in sent_alerts:
                     trade_exec: TradeExecution | None = None
                     trade_note: str | None = None
                     if trader and trader.is_configured and not dry_run:
                         try:
+                            target_usd = trader.max_usd if kind == "ORANGE" else trader.min_usd
                             trade_exec = trader.open_position(
                                 res.symbol,
                                 res.price,
-                                trader.max_usd,
+                                target_usd,
                                 tp_price=ev.tp_level or ev.next_res,
                                 sl_price=ev.sl_level or ev.prev_sup,
                             )
@@ -526,41 +530,37 @@ class TelegramNotifier:
                     try:
                         if dry_run:
                             print(
-                                f"[DRY-RUN 4H ORANGE] {res.symbol} WR={ev.win_rate}% Profit={ev.total_profit_pct}%"
+                                f"[DRY-RUN 4H {kind}] {res.symbol} WR={ev.win_rate}% Profit={ev.total_profit_pct}%"
                             )
                         else:
                             self.send_text(
                                 format_4h_alert_only_message(
-                                    res, "ORANGE", trade_exec=trade_exec, trade_note=trade_note
+                                    res, kind, trade_exec=trade_exec, trade_note=trade_note
+                                )
+                            )
+                        sent_alerts[alert_key] = int(time.time())
+                        stats["orange" if kind == "ORANGE" else "green"] += 1
+                    except Exception as exc:
+                        stats["errors"].append(f"4H {res.symbol} {kind}: {exc}")
+            elif ev.orange_trigger:
+                alert_key = f"4h_bist:{res.symbol}:ORANGE_LATE:{ev.bar_open_time}"
+                if alert_key not in sent_alerts:
+                    trade_note = "5/5 onayı geldi (Geç giriş yapılmadı — emir sadece ilk 3/5 girişinde açılır)."
+                    try:
+                        if dry_run:
+                            print(
+                                f"[DRY-RUN 4H ORANGE INFO] {res.symbol} WR={ev.win_rate}% Profit={ev.total_profit_pct}%"
+                            )
+                        else:
+                            self.send_text(
+                                format_4h_alert_only_message(
+                                    res, "ORANGE", trade_exec=None, trade_note=trade_note
                                 )
                             )
                         sent_alerts[alert_key] = int(time.time())
                         stats["orange"] += 1
                     except Exception as exc:
                         stats["errors"].append(f"4H {res.symbol} ORANGE: {exc}")
-            elif ev.green_trigger:
-                alert_key = f"4h_bist:{res.symbol}:GREEN:{ev.bar_open_time}"
-                if alert_key not in sent_alerts:
-                    trade_note = (
-                        "Ön uyarı (3/5) — Emir sadece TURUNCU KESİN AL (5/5) onayında açılır."
-                        if (trader and trader.is_configured)
-                        else None
-                    )
-                    try:
-                        if dry_run:
-                            print(
-                                f"[DRY-RUN 4H GREEN] {res.symbol} WR={ev.win_rate}% Profit={ev.total_profit_pct}%"
-                            )
-                        else:
-                            self.send_text(
-                                format_4h_alert_only_message(
-                                    res, "GREEN", trade_exec=None, trade_note=trade_note
-                                )
-                            )
-                        sent_alerts[alert_key] = int(time.time())
-                        stats["green"] += 1
-                    except Exception as exc:
-                        stats["errors"].append(f"4H {res.symbol} GREEN: {exc}")
 
         if not dry_run:
             self._save_state()
