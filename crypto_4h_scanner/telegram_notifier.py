@@ -135,7 +135,7 @@ def format_dual_4h_message(
     trade_exec: TradeExecution | None = None,
     trade_note: str | None = None,
     stop_loss_pct: float = 2.5,
-    trailing_trigger_pct: float = 3.5,
+    trailing_trigger_pct: float = 2.75,
     trailing_callback_pct: float = 2.0,
     trailing_floor_pct: float = 0.5,
 ) -> str:
@@ -645,7 +645,7 @@ class TelegramNotifier:
                                 trade_exec=trade_exec,
                                 trade_note=trade_note,
                                 stop_loss_pct=trader.stop_loss_pct if trader else 2.5,
-                                trailing_trigger_pct=trader.trailing_trigger_pct if trader else 3.5,
+                                trailing_trigger_pct=trader.trailing_trigger_pct if trader else 2.75,
                                 trailing_callback_pct=trader.trailing_callback_pct if trader else 2.0,
                                 trailing_floor_pct=trader.trailing_floor_pct if trader else 0.5,
                             )
