@@ -18,6 +18,7 @@ import requests
 FAPI_BASE = "https://fapi.binance.com"
 PAPI_BASE = "https://papi.binance.com"
 SPOT_BASE = "https://api.binance.com"
+BOT_CLIENT_ID_PREFIX = "BOT4H_"
 
 MarketType = Literal["futures", "spot", "papi"]
 
@@ -429,6 +430,7 @@ class BinanceTrader:
                     "side": order_side,
                     "type": "MARKET",
                     "quantity": f"{qty:g}",
+                    "newClientOrderId": f"{BOT_CLIENT_ID_PREFIX}{symbol}_{int(time.time())}",
                     "newOrderRespType": "RESULT",
                 },
             )
@@ -635,9 +637,32 @@ class BinanceTrader:
         except Exception:
             return None
 
+    def _is_bot_opened_position(self, symbol: str, pos_side: str) -> bool:
+        """Check Binance recent orders to see if an untracked live position carries our BOT4H_ tag."""
+        entry_order_side = "BUY" if pos_side.upper() == "LONG" else "SELL"
+        path = "/papi/v1/um/allOrders" if self.market == "papi" else "/fapi/v1/allOrders"
+        try:
+            orders = self._signed_request("GET", path, {"symbol": symbol, "limit": 10})
+            if not isinstance(orders, list):
+                return False
+            matching = [
+                o
+                for o in orders
+                if str(o.get("side", "")).upper() == entry_order_side
+                and float(o.get("executedQty") or 0.0) > 0
+                and not bool(o.get("reduceOnly", False))
+            ]
+            if not matching:
+                return False
+            latest = max(matching, key=lambda o: int(o.get("updateTime") or o.get("time") or 0))
+            return str(latest.get("clientOrderId") or "").startswith(BOT_CLIENT_ID_PREFIX)
+        except Exception:
+            return False
+
     def sync_live_positions(self) -> dict[str, dict]:
         """
         Sync ONLY bot-opened positions against Binance:
+        - Re-adopt bot positions tagged with BOT4H_ after a restart/redeploy.
         - NEVER adopt or touch positions opened manually by the user!
         - Keep entry_price accurate for bot-opened positions.
         - Remove bot-opened positions that were already closed on Binance.
@@ -667,6 +692,37 @@ class BinanceTrader:
                             else live_ep * (1.0 + self.stop_loss_pct / 100.0)
                         )
                     dirty = True
+
+            for sym, lpos in live.items():
+                if sym in tracked:
+                    continue
+                pos_side = str(lpos.get("side") or "LONG").upper()
+                ep = float(lpos.get("entry_price") or 0.0)
+                qty = float(lpos.get("qty") or 0.0)
+                if ep <= 0 or qty <= 0:
+                    continue
+                if not self._is_bot_opened_position(sym, pos_side):
+                    continue
+                sl_px = (
+                    ep * (1.0 - self.stop_loss_pct / 100.0)
+                    if pos_side == "LONG"
+                    else ep * (1.0 + self.stop_loss_pct / 100.0)
+                )
+                tracked[sym] = {
+                    "symbol": sym,
+                    "side": pos_side,
+                    "order_id": "recovered",
+                    "entry_price": ep,
+                    "qty": qty,
+                    "notional_usd": round(qty * ep, 2),
+                    "sl_price": sl_px,
+                    "tp_price": 0.0,
+                    "exchange_sl_price": sl_px,
+                    "peak_price": ep,
+                    "trailing_active": False,
+                    "opened_at": int(time.time()),
+                }
+                dirty = True
 
             if dirty:
                 self._save_state()

@@ -372,15 +372,30 @@ class TestBinanceTrader(unittest.TestCase):
                 api_key="k",
                 api_secret="s",
                 market="papi",
-                stop_loss_pct=1.5,
+                stop_loss_pct=2.5,
                 state_file=Path(tmp) / "trade_state.json",
             )
-            # Manual position opened by user on Binance must NOT be adopted/touched by bot
+            # Manual position opened by user on Binance (no BOT4H_ tag) must NOT be adopted,
+            # while bot-opened position (BOT4H_ tag) MUST be re-adopted after restart.
             trader.get_live_open_positions = lambda: {  # type: ignore[method-assign]
-                "HUSDT": {"symbol": "HUSDT", "qty": 1000.0, "entry_price": 0.02, "side": "LONG"}
+                "HUSDT": {"symbol": "HUSDT", "qty": 1000.0, "entry_price": 0.02, "side": "LONG"},
+                "BARDUSDT": {"symbol": "BARDUSDT", "qty": 500.0, "entry_price": 0.10, "side": "SHORT"},
             }
+
+            def fake_signed(method: str, path: str, params=None):
+                if path == "/papi/v1/um/allOrders":
+                    if params["symbol"] == "HUSDT":
+                        return [{"side": "BUY", "executedQty": "1000", "clientOrderId": "web_manual_1", "updateTime": 100}]
+                    if params["symbol"] == "BARDUSDT":
+                        return [{"side": "SELL", "executedQty": "500", "clientOrderId": "BOT4H_BARDUSDT_170000", "updateTime": 200}]
+                return []
+
+            trader._signed_request = fake_signed  # type: ignore[method-assign]
             synced = trader.sync_live_positions()
             self.assertNotIn("HUSDT", synced)
+            self.assertIn("BARDUSDT", synced)
+            self.assertEqual(synced["BARDUSDT"]["side"], "SHORT")
+            self.assertAlmostEqual(synced["BARDUSDT"]["sl_price"], 0.1025, places=5)
 
     def test_signal_cancel_tightens_stop_to_1_5_usd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
