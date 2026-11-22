@@ -242,8 +242,8 @@ def main() -> None:
             max_leverage=args.max_leverage,
             stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "2.5")),            # 4S Çift Yön Stop: -%2.50
             trailing_trigger_pct=float(os.getenv("TRAILING_TRIGGER_PCT", "2.75")),  # +%2.75 görünce trailing başlar
-            trailing_callback_pct=float(os.getenv("TRAILING_CALLBACK_PCT", "0.6")),  # %0.60 zirve takibi (%3 kârda ~%2.38'e kilitler)
-            trailing_floor_pct=float(os.getenv("TRAILING_FLOOR_PCT", "1.5")),  # En kötü +%1.50 kâr tabanı
+            trailing_callback_pct=float(os.getenv("TRAILING_CALLBACK_PCT", "0.3")),  # %0.30 zirve takibi
+            trailing_floor_pct=float(os.getenv("TRAILING_FLOOR_PCT", "2.45")),  # En kötü +%2.45 kâr tabanı
             cooldown_minutes=0,
             symbol_stop_cooldown_minutes=240,
             signal_cancel_stop_usd=float(os.getenv("SIGNAL_CANCEL_STOP_USD", "1.5")),

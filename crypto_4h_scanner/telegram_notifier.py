@@ -136,8 +136,8 @@ def format_dual_4h_message(
     trade_note: str | None = None,
     stop_loss_pct: float = 2.5,
     trailing_trigger_pct: float = 2.75,
-    trailing_callback_pct: float = 0.6,
-    trailing_floor_pct: float = 1.5,
+    trailing_callback_pct: float = 0.3,
+    trailing_floor_pct: float = 2.45,
 ) -> str:
     ev = res.evaluation
     is_long = side.upper() == "LONG"
@@ -646,8 +646,8 @@ class TelegramNotifier:
                                 trade_note=trade_note,
                                 stop_loss_pct=trader.stop_loss_pct if trader else 2.5,
                                 trailing_trigger_pct=trader.trailing_trigger_pct if trader else 2.75,
-                                trailing_callback_pct=trader.trailing_callback_pct if trader else 0.6,
-                                trailing_floor_pct=trader.trailing_floor_pct if trader else 1.5,
+                                trailing_callback_pct=trader.trailing_callback_pct if trader else 0.3,
+                                trailing_floor_pct=trader.trailing_floor_pct if trader else 2.45,
                             )
                         )
                     sent_alerts[alert_key] = int(time.time())
