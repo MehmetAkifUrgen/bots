@@ -312,18 +312,22 @@ class Binance4hScanner:
         duration = round(time.time() - started, 2)
         return results, errors, duration
 
-    def _scan_one_4h_bist(self, coin: dict) -> Coin4hResult | None:
+    def _scan_one_4h_bist(self, coin: dict, interval: str = "1h") -> Coin4hResult | None:
         sym = coin["symbol"]
-        # Up to 3000 x 4h bars (~16.5 months) on initial load, matching TradingView 4H history;
-        # subsequent scans fetch only last 8 bars (weight=1)!
-        df_4h = self.fetch_klines_cached(
-            sym, interval="4h", initial_limit=1500, pages=2, max_rows=3000
-        )
-        df_1m = self.fetch_klines_cached(
-            sym, interval="1M", initial_limit=24, pages=1, max_rows=30
-        )
+        if interval == "1h":
+            df_ohlcv = self.fetch_klines_cached(
+                sym, interval="1h", initial_limit=1500, pages=1, max_rows=1500
+            )
+            df_1m = None
+        else:
+            df_ohlcv = self.fetch_klines_cached(
+                sym, interval="4h", initial_limit=1500, pages=2, max_rows=3000
+            )
+            df_1m = self.fetch_klines_cached(
+                sym, interval="1M", initial_limit=24, pages=1, max_rows=30
+            )
         ev = evaluate_4h_system(
-            df_4h, df_1m=df_1m, pivot_len=7, be_trigger_pct=2.5, ema200_filter=False
+            df_ohlcv, df_1m=df_1m, pivot_len=7, be_trigger_pct=2.5, ema200_filter=False
         )
         if ev is None:
             return None
@@ -334,15 +338,16 @@ class Binance4hScanner:
             change_24h=round(coin["change_24h"], 2),
             volume_24h_usdt=round(coin["volume_24h_usdt"], 0),
             evaluation=ev,
-            timeframe="45m",  # display handled separately in 4h alert formatter
+            timeframe="1h" if interval == "1h" else "45m",
         )
 
     def scan_4h_bist_alerts(
         self,
         min_volume_usdt: float = 5_000_000.0,
         limit: int = 0,
+        interval: str = "1h",
     ) -> tuple[list[Coin4hResult], list[str], float]:
-        """Scan Binance USDT pairs on 4H chart using the original BIST/4H Pine Script."""
+        """Scan Binance USDT pairs on 1H or 4H chart."""
         started = time.time()
         coins = self.get_active_usdt_symbols(
             min_volume_usdt=min_volume_usdt, limit=limit
@@ -352,7 +357,7 @@ class Binance4hScanner:
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             future_map = {
-                pool.submit(self._scan_one_4h_bist, coin): coin["symbol"]
+                pool.submit(self._scan_one_4h_bist, coin, interval): coin["symbol"]
                 for coin in coins
             }
             for fut in as_completed(future_map):

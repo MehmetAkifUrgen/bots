@@ -134,17 +134,19 @@ def format_dual_4h_message(
     side: str,
     trade_exec: TradeExecution | None = None,
     trade_note: str | None = None,
-    stop_loss_pct: float = 2.5,
-    trailing_trigger_pct: float = 2.75,
+    stop_loss_pct: float = 2.0,
+    trailing_trigger_pct: float = 2.0,
     trailing_callback_pct: float = 0.3,
-    trailing_floor_pct: float = 2.45,
+    trailing_floor_pct: float = 1.7,
 ) -> str:
     ev = res.evaluation
     is_long = side.upper() == "LONG"
+    tf_label = "1S (1H)" if getattr(res, "timeframe", "1h") == "1h" else "4S (4H)"
+    tf_short = "1S" if getattr(res, "timeframe", "1h") == "1h" else "4S"
     header = (
-        "🟢 <b>[4S ÇİFT YÖN] LONG 5/5 + EMA200</b>"
+        f"🟢 <b>[{tf_short} ÇİFT YÖN] LONG 5/5 + EMA200</b>"
         if is_long
-        else "🔴 <b>[4S ÇİFT YÖN] SHORT 3/5 + EMA200</b>"
+        else f"🔴 <b>[{tf_short} ÇİFT YÖN] SHORT 2/5 + EMA200</b>"
     )
     entry = trade_exec.price if trade_exec else res.price
     sl = (
@@ -167,12 +169,12 @@ def format_dual_4h_message(
 
     return (
         f"{header}\n"
-        f"🪙 <b>{res.symbol}</b> | <code>4S (4H)</code>\n"
+        f"🪙 <b>{res.symbol}</b> | <code>{tf_label}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
         f"🛑 <b>Stop (-%{stop_loss_pct:g}):</b> <code>{fmt_price(sl)}</code>\n"
         f"🔒 <b>Trailing Stop:</b> +%{trailing_trigger_pct:g} görünce başlar (%{trailing_callback_pct:g} takip, +%{trailing_floor_pct:g} taban)\n"
-        f"📈 <b>Trend:</b> {'Fiyat &gt; 4S EMA200 (Yükseliş)' if is_long else 'Fiyat &lt; 4S EMA200 (Düşüş)'}\n"
+        f"📈 <b>Trend:</b> {'Fiyat &gt; ' + tf_short + ' EMA200 (Yükseliş)' if is_long else 'Fiyat &lt; ' + tf_short + ' EMA200 (Düşüş)'}\n"
         f"{trade_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💧 <b>24s Hacim:</b> {fmt_vol(res.volume_24h_usdt)} | 24s: {res.change_24h:+.2f}%\n"
@@ -610,7 +612,7 @@ class TelegramNotifier:
                 side: str | None = None
                 if ev.long_5_trigger:
                     side = "LONG"
-                elif ev.short_3_trigger:
+                elif ev.short_any2_trigger:
                     side = "SHORT"
                 if not side:
                     continue
@@ -653,10 +655,10 @@ class TelegramNotifier:
                                 side=side,
                                 trade_exec=trade_exec,
                                 trade_note=trade_note,
-                                stop_loss_pct=trader.stop_loss_pct if trader else 2.5,
-                                trailing_trigger_pct=trader.trailing_trigger_pct if trader else 2.75,
+                                stop_loss_pct=trader.stop_loss_pct if trader else 2.0,
+                                trailing_trigger_pct=trader.trailing_trigger_pct if trader else 2.0,
                                 trailing_callback_pct=trader.trailing_callback_pct if trader else 0.3,
-                                trailing_floor_pct=trader.trailing_floor_pct if trader else 2.45,
+                                trailing_floor_pct=trader.trailing_floor_pct if trader else 1.7,
                             )
                         )
                     sent_alerts[alert_key] = int(time.time())

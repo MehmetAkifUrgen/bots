@@ -240,10 +240,10 @@ def main() -> None:
             max_positions=args.max_positions,
             leverage=args.leverage,
             max_leverage=args.max_leverage,
-            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "2.5")),            # 4S Çift Yön Stop: -%2.50
-            trailing_trigger_pct=float(os.getenv("TRAILING_TRIGGER_PCT", "2.75")),  # +%2.75 görünce trailing başlar
+            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "2.0")),            # 1S Çift Yön Stop: -%2.00
+            trailing_trigger_pct=float(os.getenv("TRAILING_TRIGGER_PCT", "2.0")),  # +%2.00 görünce trailing başlar
             trailing_callback_pct=float(os.getenv("TRAILING_CALLBACK_PCT", "0.3")),  # %0.30 zirve takibi
-            trailing_floor_pct=float(os.getenv("TRAILING_FLOOR_PCT", "2.45")),  # En kötü +%2.45 kâr tabanı
+            trailing_floor_pct=float(os.getenv("TRAILING_FLOOR_PCT", "1.7")),  # En kötü +%1.70 kâr tabanı
             cooldown_minutes=0,
             symbol_stop_cooldown_minutes=240,
             signal_cancel_stop_usd=float(os.getenv("SIGNAL_CANCEL_STOP_USD", "1.5")),
@@ -279,11 +279,16 @@ def main() -> None:
         f"Filtre=WR>={args.min_win_rate:g}% & Getiri>={args.min_profit_pct:g}% | Periyot={args.poll_seconds}sn"
     )
 
+    scan_interval = os.getenv("SCAN_INTERVAL", "1h").strip().lower()
+    if scan_interval not in ("1h", "4h"):
+        scan_interval = "1h"
+
     while True:
         try:
             results, errors, duration = scanner.scan_4h_bist_alerts(
                 min_volume_usdt=args.min_volume,
                 limit=args.limit,
+                interval=scan_interval,
             )
             entry_window_min = int(os.getenv("ENTRY_WINDOW_MINUTES", "0"))
             stats = notifier.process_4h_alert_only(
@@ -297,7 +302,7 @@ def main() -> None:
             )
 
             long_now = sum(1 for r in results if r.evaluation.long_5_trigger)
-            short_now = sum(1 for r in results if r.evaluation.short_3_trigger)
+            short_now = sum(1 for r in results if r.evaluation.short_any2_trigger)
 
             _HEALTH_STATE.update(
                 {
@@ -309,10 +314,11 @@ def main() -> None:
                 }
             )
             win_lbl = f"Son {entry_window_min}dk" if entry_window_min > 0 else "Anlık Giriş"
+            tf_tag = "1S" if scan_interval == "1h" else "4S"
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
-                f"[4S ÇİFT YÖN] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
-                f"LONG(5/5): {long_now}, SHORT(3/5): {short_now} ({win_lbl}) | "
+                f"[{tf_tag} ÇİFT YÖN] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
+                f"LONG(5/5): {long_now}, SHORT(2/5): {short_now} ({win_lbl}) | "
                 f"Emir -> Açılan: {stats['orders_opened']}, Kapanan: {stats['orders_closed']}"
             )
             if stats["errors"]:

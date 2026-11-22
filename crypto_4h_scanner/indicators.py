@@ -46,6 +46,7 @@ class SystemEvaluation:
     short_5_trigger: bool = False
     first_three_sell: bool = False
     short_3_trigger: bool = False
+    short_any2_trigger: bool = False
 
 
 def wilder_rsi(closes: pd.Series, length: int = 14) -> pd.Series:
@@ -385,9 +386,11 @@ def evaluate_4h_system(
     last_short_5_trig = False
     last_first3_sell = False
     last_short_3_trig = False
+    last_short_any2_trig = False
     prev_all5_up_strict = False
     prev_all5_dn_strict = False
     prev_first3_dn = False
+    prev_any2_dn = False
     last_fib_p = last_fib_r1 = last_fib_r2 = last_fib_s1 = last_fib_s2 = None
 
     for i in range(n):
@@ -431,17 +434,14 @@ def evaluate_4h_system(
             and (smi.iloc[i] > smi_sig.iloc[i])
             and (smi.iloc[i] > smi_ema9.iloc[i])
         )
-        first3_dn = bool(
-            (k.iloc[i] < d.iloc[i])
-            and (rsi_main.iloc[i] < rsi_ma.iloc[i])
-            and (fisher.iloc[i] < fisher_trigger.iloc[i])
-        )
-        all5_dn_strict = bool(
-            first3_dn
-            and (wt1.iloc[i] < wt2.iloc[i])
-            and (smi.iloc[i] < smi_sig.iloc[i])
-            and (smi.iloc[i] < smi_ema9.iloc[i])
-        )
+        c1_dn = bool(k.iloc[i] < d.iloc[i])
+        c2_dn = bool(rsi_main.iloc[i] < rsi_ma.iloc[i])
+        c3_dn = bool(fisher.iloc[i] < fisher_trigger.iloc[i])
+        c4_dn = bool(wt1.iloc[i] < wt2.iloc[i])
+        c5_dn = bool((smi.iloc[i] < smi_sig.iloc[i]) and (smi.iloc[i] < smi_ema9.iloc[i]))
+        first3_dn = c1_dn and c2_dn and c3_dn
+        any2_dn = (int(c1_dn) + int(c2_dn) + int(c3_dn) + int(c4_dn) + int(c5_dn)) >= 2
+        all5_dn_strict = bool(first3_dn and c4_dn and c5_dn)
         real_sell = bool(
             (smi.iloc[i] < smi_ema9.iloc[i])
             or ((wt1.iloc[i] < wt2.iloc[i]) and (fisher.iloc[i] < fisher_trigger.iloc[i]))
@@ -568,6 +568,7 @@ def evaluate_4h_system(
             last_long_5_trig = all5_up_strict and (not prev_all5_up_strict) and last_ema200_bull
             last_short_5_trig = all5_dn_strict and (not prev_all5_dn_strict) and last_ema200_bear
             last_short_3_trig = first3_dn and (not prev_first3_dn) and last_ema200_bear
+            last_short_any2_trig = any2_dn and (not prev_any2_dn) and last_ema200_bear
             last_fib_p, last_fib_r1, last_fib_r2, last_fib_s1, last_fib_s2 = (
                 fib_p,
                 fib_r1,
@@ -579,6 +580,7 @@ def evaluate_4h_system(
         prev_all5_up_strict = all5_up_strict
         prev_all5_dn_strict = all5_dn_strict
         prev_first3_dn = first3_dn
+        prev_any2_dn = any2_dn
 
     last_close = float(closes.iloc[-1])
     next_res = (
@@ -650,6 +652,7 @@ def evaluate_4h_system(
         short_5_trigger=last_short_5_trig,
         first_three_sell=last_first3_sell,
         short_3_trigger=last_short_3_trig,
+        short_any2_trigger=last_short_any2_trig,
     )
 
 
