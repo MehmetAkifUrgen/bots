@@ -285,7 +285,7 @@ def main() -> None:
                 min_volume_usdt=args.min_volume,
                 limit=args.limit,
             )
-            entry_window_min = int(os.getenv("ENTRY_WINDOW_MINUTES", "15"))
+            entry_window_min = int(os.getenv("ENTRY_WINDOW_MINUTES", "0"))
             stats = notifier.process_4h_alert_only(
                 results,
                 min_win_rate=args.min_win_rate,
@@ -297,7 +297,7 @@ def main() -> None:
             )
 
             long_now = sum(1 for r in results if r.evaluation.long_5_trigger)
-            short_now = sum(1 for r in results if r.evaluation.short_5_trigger)
+            short_now = sum(1 for r in results if r.evaluation.short_3_trigger)
 
             _HEALTH_STATE.update(
                 {
@@ -308,10 +308,11 @@ def main() -> None:
                     "last_error": None,
                 }
             )
+            win_lbl = f"Son {entry_window_min}dk" if entry_window_min > 0 else "Anlık Giriş"
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
                 f"[4S ÇİFT YÖN] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
-                f"5/5+EMA200 -> LONG: {long_now}, SHORT: {short_now} (Son {entry_window_min}dk pencere) | "
+                f"LONG(5/5): {long_now}, SHORT(3/5): {short_now} ({win_lbl}) | "
                 f"Emir -> Açılan: {stats['orders_opened']}, Kapanan: {stats['orders_closed']}"
             )
             if stats["errors"]:

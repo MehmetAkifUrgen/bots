@@ -527,7 +527,7 @@ class TestBinanceTrader(unittest.TestCase):
             now_ms = int(_time.time() * 1000)
             ev_mid = SystemEvaluation(
                 bar_open_time=now_ms - 60 * 60_000,
-                bar_close_time=now_ms + 180 * 60_000,  # 3 hours left -> NOT in last 15m
+                bar_close_time=now_ms + 180 * 60_000,  # 3 hours left
                 price=100.0,
                 cond1_buy=False, cond2_buy=False, cond3_buy=False, cond4_buy=False, cond5_buy=False,
                 trend_ok=False, first_three_buy=False, all_five_buy=False,
@@ -536,20 +536,19 @@ class TestBinanceTrader(unittest.TestCase):
                 in_green_pos=False, in_orange_pos=False, be_locked=False,
                 entry_price=None, tp_level=None, sl_level=None, next_res=105.0, prev_sup=95.0,
                 total_trades=10, win_trades=5, win_rate=50.0, total_profit_pct=10.0,
-                ema200_bear=True, all_five_sell=True, short_5_trigger=True,
+                ema200_bear=True, first_three_sell=True, short_3_trigger=True,
             )
             res_mid = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_mid)
-            st1 = notifier.process_4h_alert_only([res_mid], dual_mode=True, entry_window_minutes=15)
-            self.assertEqual(st1["short"], 0)
-            self.assertEqual(len(sent), 0)
-
-            # Now inside last 10 minutes before candle close -> triggers SHORT alert
-            ev_close = SystemEvaluation(**{**ev_mid.__dict__, "bar_close_time": now_ms + 10 * 60_000})
-            res_close = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_close)
-            st2 = notifier.process_4h_alert_only([res_close], dual_mode=True, entry_window_minutes=15)
-            self.assertEqual(st2["short"], 1)
+            # Immediate entry (default entry_window_minutes=0) fires right away mid-candle!
+            st1 = notifier.process_4h_alert_only([res_mid], dual_mode=True, entry_window_minutes=0)
+            self.assertEqual(st1["short"], 1)
             self.assertEqual(len(sent), 1)
-            self.assertIn("SHORT 5/5 + EMA200", sent[0])
+            self.assertIn("SHORT 3/5 + EMA200", sent[0])
+
+            # Optional 15m close-window gate still blocks mid-candle if explicitly enabled
+            res_eth = Coin4hResult("ETHUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_mid)
+            st2 = notifier.process_4h_alert_only([res_eth], dual_mode=True, entry_window_minutes=15)
+            self.assertEqual(st2["short"], 0)
 
 
 if __name__ == "__main__":

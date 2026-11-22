@@ -143,7 +143,7 @@ def format_dual_4h_message(
     header = (
         "🟢 <b>[4S ÇİFT YÖN] LONG 5/5 + EMA200</b>"
         if is_long
-        else "🔴 <b>[4S ÇİFT YÖN] SHORT 5/5 + EMA200</b>"
+        else "🔴 <b>[4S ÇİFT YÖN] SHORT 3/5 + EMA200</b>"
     )
     entry = trade_exec.price if trade_exec else res.price
     sl = (
@@ -175,7 +175,7 @@ def format_dual_4h_message(
         f"{trade_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💧 <b>24s Hacim:</b> {fmt_vol(res.volume_24h_usdt)} | 24s: {res.change_24h:+.2f}%\n"
-        f"🕒 <i>Mum: {bar_dt} (Kapanış Onayı)</i>"
+        f"🕒 <i>Mum: {bar_dt} (Anlık Giriş)</i>"
     )
 
 
@@ -554,9 +554,9 @@ class TelegramNotifier:
         dry_run: bool = False,
         trader: BinanceTrader | None = None,
         dual_mode: bool = True,
-        entry_window_minutes: int = 15,
+        entry_window_minutes: int = 0,
     ) -> dict:
-        """Process 4H signals: manage open positions & enter dual-direction 5/5 + EMA200 near candle close."""
+        """Process 4H signals: LONG on 5/5 + EMA200, SHORT on 3/5 + EMA200 (immediate entry)."""
         sent_alerts: dict[str, int] = self._state["sent_alerts"]
         stats = {
             "green": 0,
@@ -589,7 +589,7 @@ class TelegramNotifier:
                 side: str | None = None
                 if ev.long_5_trigger:
                     side = "LONG"
-                elif ev.short_5_trigger:
+                elif ev.short_3_trigger:
                     side = "SHORT"
                 if not side:
                     continue
