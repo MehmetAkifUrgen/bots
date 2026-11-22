@@ -112,7 +112,7 @@ class Binance4hScanner:
                 self._active_symbols = {
                     s["symbol"]
                     for s in info_data.get("symbols", [])
-                    if s.get("contractType") == "PERPETUAL"
+                    if s.get("contractType") in ("PERPETUAL", "TRADIFI_PERPETUAL")
                     and s.get("quoteAsset") == "USDT"
                     and s.get("status") == "TRADING"
                 }
