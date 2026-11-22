@@ -302,7 +302,7 @@ def main() -> None:
             )
 
             long_now = sum(1 for r in results if (r.long_evaluation or r.evaluation).long_5_trigger)
-            short_now = sum(1 for r in results if r.evaluation.short_any4_trigger)
+            short_now = sum(1 for r in results if r.evaluation.short_5_trigger)
 
             _HEALTH_STATE.update(
                 {
@@ -318,7 +318,7 @@ def main() -> None:
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
                 f"[{tf_tag} ÇİFT YÖN] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
-                f"LONG(5/5): {long_now}, SHORT(4/5): {short_now} ({win_lbl}) | "
+                f"LONG(5/5): {long_now}, SHORT(5/5): {short_now} ({win_lbl}) | "
                 f"Emir -> Açılan: {stats['orders_opened']}, Kapanan: {stats['orders_closed']}"
             )
             if stats["errors"]:
