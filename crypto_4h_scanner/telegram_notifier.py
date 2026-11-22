@@ -278,7 +278,8 @@ class TelegramNotifier:
         timeout: float = 10.0,
     ) -> None:
         self.bot_token = bot_token.strip()
-        self.chat_id = chat_id.strip()
+        self.chat_ids: list[str] = [c.strip() for c in str(chat_id).split(",") if c.strip()]
+        self.chat_id = self.chat_ids[0] if self.chat_ids else ""
         self.state_file = state_file
         self.timeout = timeout
         self._last_update_id: int = 0
@@ -308,37 +309,45 @@ class TelegramNotifier:
         )
 
     def send_text(self, text: str) -> bool:
-        if not self.bot_token or not self.chat_id:
+        if not self.bot_token or not self.chat_ids:
             raise RuntimeError("TELEGRAM_BOT_TOKEN veya TELEGRAM_CHAT_ID eksik.")
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        resp = requests.post(
-            url,
-            json={
-                "chat_id": self.chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=self.timeout,
-        )
-        if resp.status_code == 400:
-            # Fallback to plain text if HTML entity parsing ever fails so alerts are never lost
-            resp = requests.post(
-                url,
-                json={
-                    "chat_id": self.chat_id,
-                    "text": text,
-                    "disable_web_page_preview": True,
-                },
-                timeout=self.timeout,
-            )
-        resp.raise_for_status()
-        payload = resp.json()
-        return bool(payload.get("ok"))
+        any_ok = False
+        last_err: Exception | None = None
+        for cid in self.chat_ids:
+            try:
+                resp = requests.post(
+                    url,
+                    json={
+                        "chat_id": cid,
+                        "text": text,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=self.timeout,
+                )
+                if resp.status_code == 400:
+                    resp = requests.post(
+                        url,
+                        json={
+                            "chat_id": cid,
+                            "text": text,
+                            "disable_web_page_preview": True,
+                        },
+                        timeout=self.timeout,
+                    )
+                resp.raise_for_status()
+                if resp.json().get("ok"):
+                    any_ok = True
+            except Exception as exc:
+                last_err = exc
+        if not any_ok and last_err is not None:
+            raise last_err
+        return any_ok
 
     def poll_commands(self, trader: BinanceTrader | None) -> None:
-        """Handle simple Telegram commands (/devam, /durum) from the authorized chat."""
-        if not self.bot_token or not self.chat_id or trader is None:
+        """Handle simple Telegram commands (/devam, /durum) from authorized chats."""
+        if not self.bot_token or not self.chat_ids or trader is None:
             return
         url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
         params: dict = {"timeout": 0, "limit": 10}
@@ -357,7 +366,7 @@ class TelegramNotifier:
                 self._last_update_id = uid
             msg = upd.get("message") or {}
             chat_id = str((msg.get("chat") or {}).get("id", ""))
-            if chat_id != self.chat_id:
+            if chat_id not in self.chat_ids:
                 continue
             text = str(msg.get("text") or "").strip().lower()
             if text in ("/devam", "/reset", "/mola_iptal"):
