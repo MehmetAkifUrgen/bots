@@ -134,7 +134,7 @@ def format_dual_4h_message(
     side: str,
     trade_exec: TradeExecution | None = None,
     trade_note: str | None = None,
-    stop_loss_pct: float = 1.5,
+    stop_loss_pct: float = 2.0,
     trailing_trigger_pct: float = 2.0,
     trailing_callback_pct: float = 0.3,
     trailing_floor_pct: float = 1.7,
@@ -142,13 +142,13 @@ def format_dual_4h_message(
 ) -> str:
     is_long = side.upper() == "LONG"
     ev = (res.long_evaluation or res.evaluation) if is_long else res.evaluation
-    tf_raw = tf_override or ("4h" if (is_long and res.long_evaluation is not None) else getattr(res, "timeframe", "1h"))
+    tf_raw = tf_override or ("4h" if (is_long and res.long_evaluation is not None) else getattr(res, "timeframe", "4h"))
     tf_label = "1S (1H)" if tf_raw == "1h" else "4S (4H)"
     tf_short = "1S" if tf_raw == "1h" else "4S"
     header = (
         f"🟢 <b>[{tf_short} ÇİFT YÖN] LONG 5/5 + EMA200</b>"
         if is_long
-        else f"🔴 <b>[{tf_short} ÇİFT YÖN] SHORT 2/5 + EMA200</b>"
+        else f"🔴 <b>[{tf_short} ÇİFT YÖN] SHORT 4/5 + EMA200</b>"
     )
     entry = trade_exec.price if trade_exec else res.price
     sl = (
@@ -619,7 +619,7 @@ class TelegramNotifier:
                     side = "LONG"
                     ev = long_ev
                     tf_used = "4h" if res.long_evaluation is not None else res.timeframe
-                elif short_ev.short_any2_trigger:
+                elif short_ev.short_any4_trigger:
                     side = "SHORT"
                     ev = short_ev
                     tf_used = res.timeframe
@@ -664,7 +664,7 @@ class TelegramNotifier:
                                 side=side,
                                 trade_exec=trade_exec,
                                 trade_note=trade_note,
-                                stop_loss_pct=trader.stop_loss_pct if trader else 1.5,
+                                stop_loss_pct=trader.stop_loss_pct if trader else 2.0,
                                 trailing_trigger_pct=trader.trailing_trigger_pct if trader else 2.0,
                                 trailing_callback_pct=trader.trailing_callback_pct if trader else 0.3,
                                 trailing_floor_pct=trader.trailing_floor_pct if trader else 1.7,

@@ -47,6 +47,7 @@ class SystemEvaluation:
     first_three_sell: bool = False
     short_3_trigger: bool = False
     short_any2_trigger: bool = False
+    short_any4_trigger: bool = False
 
 
 def wilder_rsi(closes: pd.Series, length: int = 14) -> pd.Series:
@@ -387,10 +388,12 @@ def evaluate_4h_system(
     last_first3_sell = False
     last_short_3_trig = False
     last_short_any2_trig = False
+    last_short_any4_trig = False
     prev_all5_up_strict = False
     prev_all5_dn_strict = False
     prev_first3_dn = False
     prev_any2_dn = False
+    prev_any4_dn = False
     last_fib_p = last_fib_r1 = last_fib_r2 = last_fib_s1 = last_fib_s2 = None
 
     for i in range(n):
@@ -440,7 +443,9 @@ def evaluate_4h_system(
         c4_dn = bool(wt1.iloc[i] < wt2.iloc[i])
         c5_dn = bool((smi.iloc[i] < smi_sig.iloc[i]) and (smi.iloc[i] < smi_ema9.iloc[i]))
         first3_dn = c1_dn and c2_dn and c3_dn
-        any2_dn = (int(c1_dn) + int(c2_dn) + int(c3_dn) + int(c4_dn) + int(c5_dn)) >= 2
+        dn_count = int(c1_dn) + int(c2_dn) + int(c3_dn) + int(c4_dn) + int(c5_dn)
+        any2_dn = dn_count >= 2
+        any4_dn = dn_count >= 4
         all5_dn_strict = bool(first3_dn and c4_dn and c5_dn)
         real_sell = bool(
             (smi.iloc[i] < smi_ema9.iloc[i])
@@ -569,6 +574,7 @@ def evaluate_4h_system(
             last_short_5_trig = all5_dn_strict and (not prev_all5_dn_strict) and last_ema200_bear
             last_short_3_trig = first3_dn and (not prev_first3_dn) and last_ema200_bear
             last_short_any2_trig = any2_dn and (not prev_any2_dn) and last_ema200_bear
+            last_short_any4_trig = any4_dn and (not prev_any4_dn) and last_ema200_bear
             last_fib_p, last_fib_r1, last_fib_r2, last_fib_s1, last_fib_s2 = (
                 fib_p,
                 fib_r1,
@@ -581,6 +587,7 @@ def evaluate_4h_system(
         prev_all5_dn_strict = all5_dn_strict
         prev_first3_dn = first3_dn
         prev_any2_dn = any2_dn
+        prev_any4_dn = any4_dn
 
     last_close = float(closes.iloc[-1])
     next_res = (
@@ -653,6 +660,7 @@ def evaluate_4h_system(
         first_three_sell=last_first3_sell,
         short_3_trigger=last_short_3_trig,
         short_any2_trigger=last_short_any2_trig,
+        short_any4_trigger=last_short_any4_trig,
     )
 
 

@@ -240,7 +240,7 @@ def main() -> None:
             max_positions=args.max_positions,
             leverage=args.leverage,
             max_leverage=args.max_leverage,
-            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "1.5")),            # Hibrit Çift Yön Stop: -%1.50
+            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "2.0")),            # 4S Çift Yön Stop: -%2.00
             trailing_trigger_pct=float(os.getenv("TRAILING_TRIGGER_PCT", "2.0")),  # +%2.00 görünce trailing başlar
             trailing_callback_pct=float(os.getenv("TRAILING_CALLBACK_PCT", "0.3")),  # %0.30 zirve takibi
             trailing_floor_pct=float(os.getenv("TRAILING_FLOOR_PCT", "1.7")),  # En kötü +%1.70 kâr tabanı
@@ -279,9 +279,9 @@ def main() -> None:
         f"Filtre=WR>={args.min_win_rate:g}% & Getiri>={args.min_profit_pct:g}% | Periyot={args.poll_seconds}sn"
     )
 
-    scan_interval = os.getenv("SCAN_INTERVAL", "1h").strip().lower()
+    scan_interval = os.getenv("SCAN_INTERVAL", "4h").strip().lower()
     if scan_interval not in ("1h", "4h"):
-        scan_interval = "1h"
+        scan_interval = "4h"
 
     while True:
         try:
@@ -302,7 +302,7 @@ def main() -> None:
             )
 
             long_now = sum(1 for r in results if (r.long_evaluation or r.evaluation).long_5_trigger)
-            short_now = sum(1 for r in results if r.evaluation.short_any2_trigger)
+            short_now = sum(1 for r in results if r.evaluation.short_any4_trigger)
 
             _HEALTH_STATE.update(
                 {
@@ -314,11 +314,11 @@ def main() -> None:
                 }
             )
             win_lbl = f"Son {entry_window_min}dk" if entry_window_min > 0 else "Anlık Giriş"
-            tf_tag = "HİBRİT 4S-L / 1S-S" if scan_interval == "1h" else "4S ÇİFT YÖN"
+            tf_tag = "1S" if scan_interval == "1h" else "4S"
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
-                f"[{tf_tag}] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
-                f"LONG(4S 5/5): {long_now}, SHORT(1S 2/5): {short_now} ({win_lbl}) | "
+                f"[{tf_tag} ÇİFT YÖN] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
+                f"LONG(5/5): {long_now}, SHORT(4/5): {short_now} ({win_lbl}) | "
                 f"Emir -> Açılan: {stats['orders_opened']}, Kapanan: {stats['orders_closed']}"
             )
             if stats["errors"]:

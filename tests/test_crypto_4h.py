@@ -551,19 +551,19 @@ class TestBinanceTrader(unittest.TestCase):
                 in_green_pos=False, in_orange_pos=False, be_locked=False,
                 entry_price=None, tp_level=None, sl_level=None, next_res=105.0, prev_sup=95.0,
                 total_trades=10, win_trades=5, win_rate=50.0, total_profit_pct=10.0,
-                ema200_bear=True, first_three_sell=True, short_any2_trigger=True,
+                ema200_bear=True, first_three_sell=True, short_any4_trigger=True,
             )
-            res_mid = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_mid, timeframe="1h")
+            res_mid = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_mid, timeframe="4h")
             # Immediate entry (default entry_window_minutes=0) fires right away mid-candle!
             st1 = notifier.process_4h_alert_only([res_mid], dual_mode=True, entry_window_minutes=0)
             self.assertEqual(st1["short"], 1)
             self.assertEqual(len(sent), 1)
-            self.assertIn("SHORT 2/5 + EMA200", sent[0])
-            self.assertNotIn("Fiyat < 1S", sent[0])
-            self.assertIn("Fiyat &lt; 1S", sent[0])
+            self.assertIn("SHORT 4/5 + EMA200", sent[0])
+            self.assertNotIn("Fiyat < 4S", sent[0])
+            self.assertIn("Fiyat &lt; 4S", sent[0])
 
             # Optional 15m close-window gate still blocks mid-candle if explicitly enabled
-            res_eth = Coin4hResult("ETHUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_mid, timeframe="1h")
+            res_eth = Coin4hResult("ETHUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_mid, timeframe="4h")
             st2 = notifier.process_4h_alert_only([res_eth], dual_mode=True, entry_window_minutes=15)
             self.assertEqual(st2["short"], 0)
 
@@ -573,7 +573,7 @@ class TestBinanceTrader(unittest.TestCase):
                     **ev_mid.__dict__,
                     "ema200_bear": False,
                     "first_three_sell": False,
-                    "short_any2_trigger": False,
+                    "short_any4_trigger": False,
                     "ema200_bull": True,
                     "long_5_trigger": True,
                 }
@@ -583,7 +583,7 @@ class TestBinanceTrader(unittest.TestCase):
                     **ev_mid.__dict__,
                     "ema200_bear": False,
                     "first_three_sell": False,
-                    "short_any2_trigger": False,
+                    "short_any4_trigger": False,
                 }
             )
             res_sol = Coin4hResult(
