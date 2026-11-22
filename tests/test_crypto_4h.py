@@ -397,6 +397,24 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertEqual(synced["BARDUSDT"]["side"], "SHORT")
             self.assertAlmostEqual(synced["BARDUSDT"]["sl_price"], 0.1025, places=5)
 
+            # When Binance exchange-side STOP_MARKET closes BARDUSDT, sync_live_positions
+            # must emit a close event so Telegram receives the notification!
+            trader.get_live_open_positions = lambda: {}  # type: ignore[method-assign]
+
+            def fake_closed(method: str, path: str, params=None):
+                if path == "/papi/v1/um/userTrades":
+                    return [{"side": "BUY", "price": "0.1025", "qty": "500", "realizedPnl": "-1.25", "orderId": 999, "time": int(1e15)}]
+                return []
+
+            trader._signed_request = fake_closed  # type: ignore[method-assign]
+            trader.sync_live_positions()
+            self.assertTrue(trader.has_pending_close_events())
+            evs = trader.manage_open_positions()
+            self.assertEqual(len(evs), 1)
+            self.assertEqual(evs[0]["symbol"], "BARDUSDT")
+            self.assertEqual(evs[0]["pnl_usd"], -1.25)
+            self.assertIn("Binance", evs[0]["reason"])
+
     def test_signal_cancel_tightens_stop_to_1_5_usd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             trader = BinanceTrader(

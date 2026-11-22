@@ -89,6 +89,7 @@ class BinanceTrader:
         self.proxy_url = proxy_url.strip()
         self._lock = threading.RLock()
         self._filters_cache: dict[str, dict] = {}
+        self._pending_close_events: list[dict] = []
         self._state = self._load_state()
 
     @property
@@ -624,6 +625,10 @@ class BinanceTrader:
         with self._lock:
             return bool(self._state["open_positions"])
 
+    def has_pending_close_events(self) -> bool:
+        with self._lock:
+            return bool(self._pending_close_events)
+
     def fetch_public_price(self, symbol: str) -> float | None:
         url = (
             f"{FAPI_BASE}/fapi/v1/ticker/price"
@@ -678,8 +683,10 @@ class BinanceTrader:
 
             for sym in list(tracked.keys()):
                 if sym not in live:
-                    tracked.pop(sym, None)
+                    prev = tracked.pop(sym, None)
                     dirty = True
+                    if prev:
+                        self._record_external_close(sym, prev)
                     continue
                 live_ep = float(live[sym].get("entry_price") or 0.0)
                 if live_ep > 0 and abs(live_ep - float(tracked[sym].get("entry_price") or 0.0)) / live_ep > 0.001:
@@ -727,6 +734,79 @@ class BinanceTrader:
             if dirty:
                 self._save_state()
             return dict(tracked)
+
+    def _record_external_close(self, symbol: str, prev: dict) -> None:
+        """Build a close event when Binance's own STOP_MARKET/TP closed a tracked bot position."""
+        entry_px = float(prev.get("entry_price") or 0.0)
+        qty = float(prev.get("qty") or 0.0)
+        pos_side = str(prev.get("side") or "LONG").upper()
+        sl_px = float(prev.get("sl_price") or 0.0)
+        exit_px = sl_px if sl_px > 0 else (self.fetch_public_price(symbol) or entry_px)
+        order_id = str(prev.get("order_id") or "exchange")
+        pnl_usd: float | None = None
+
+        try:
+            ut_path = "/papi/v1/um/userTrades" if self.market == "papi" else "/fapi/v1/userTrades"
+            close_side = "SELL" if pos_side == "LONG" else "BUY"
+            trades = self._signed_request("GET", ut_path, {"symbol": symbol, "limit": 5})
+            if isinstance(trades, list):
+                closing = [
+                    t
+                    for t in trades
+                    if str(t.get("side", "")).upper() == close_side
+                    and int(t.get("time") or 0) >= int(prev.get("opened_at") or 0) * 1000
+                ]
+                if closing:
+                    tot_q = sum(float(t.get("qty") or 0.0) for t in closing)
+                    if tot_q > 0:
+                        exit_px = sum(float(t.get("price") or 0.0) * float(t.get("qty") or 0.0) for t in closing) / tot_q
+                    pnl_usd = sum(float(t.get("realizedPnl") or 0.0) for t in closing)
+                    order_id = str(closing[-1].get("orderId") or order_id)
+        except Exception:
+            pass
+
+        if pnl_usd is None:
+            if pos_side == "LONG":
+                pnl_usd = (exit_px - entry_px) * qty
+            else:
+                pnl_usd = (entry_px - exit_px) * qty
+
+        if entry_px > 0:
+            pnl_pct = (
+                ((exit_px - entry_px) / entry_px) * 100.0
+                if pos_side == "LONG"
+                else ((entry_px - exit_px) / entry_px) * 100.0
+            )
+        else:
+            pnl_pct = 0.0
+
+        is_trailing = bool(prev.get("trailing_active"))
+        reason = "TRAILING STOP (Binance)" if is_trailing else f"STOP (Binance -%{self.stop_loss_pct:g})"
+        if pnl_usd < 0 and not is_trailing:
+            self._state["consecutive_stops"] = int(self._state.get("consecutive_stops", 0)) + 1
+            if self.symbol_stop_cooldown_minutes > 0:
+                self._state.setdefault("symbol_cooldowns", {})[symbol] = int(
+                    time.time() + self.symbol_stop_cooldown_minutes * 60
+                )
+        elif pnl_usd >= 0:
+            self._state["consecutive_stops"] = 0
+            self._state["cooldown_until"] = 0
+
+        self._pending_close_events.append(
+            {
+                "symbol": symbol,
+                "side": pos_side,
+                "reason": reason,
+                "entry_price": entry_px,
+                "exit_price": exit_px,
+                "pnl_usd": round(pnl_usd, 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "order_id": order_id,
+                "cooldown_triggered": self.is_in_cooldown(),
+                "cooldown_minutes": self.cooldown_minutes,
+                "consecutive_stops": int(self._state.get("consecutive_stops", 0)),
+            }
+        )
 
     def apply_signal_cancel_stop(self, symbol: str, current_price: float) -> dict | None:
         """
@@ -796,9 +876,9 @@ class BinanceTrader:
         Returns list of closed trade event dicts.
         """
         pmap = price_map or {}
-        events: list[dict] = []
-
         with self._lock:
+            events: list[dict] = list(self._pending_close_events)
+            self._pending_close_events.clear()
             open_syms = list(self._state["open_positions"].keys())
             state_dirty = False
 

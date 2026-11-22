@@ -171,7 +171,7 @@ def _start_position_monitor(
             try:
                 notifier.poll_commands(trader)
                 now = time.time()
-                if now - last_sync >= 60.0:
+                if now - last_sync >= 15.0:
                     synced = trader.sync_live_positions()
                     last_sync = now
                     if synced:
@@ -179,7 +179,7 @@ def _start_position_monitor(
                             f"[{datetime.now().strftime('%H:%M:%S')}] "
                             f"Açık pozisyon senkronu: {list(synced.keys())}"
                         )
-                if trader.has_open_positions() and not dry_run:
+                if (trader.has_open_positions() or trader.has_pending_close_events()) and not dry_run:
                     closed_events = trader.manage_open_positions()
                     for ev in closed_events:
                         print(
