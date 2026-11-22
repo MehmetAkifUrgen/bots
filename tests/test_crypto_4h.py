@@ -567,6 +567,32 @@ class TestBinanceTrader(unittest.TestCase):
             st2 = notifier.process_4h_alert_only([res_eth], dual_mode=True, entry_window_minutes=15)
             self.assertEqual(st2["short"], 0)
 
+            # Hybrid mode: LONG uses 4H long_evaluation even when base timeframe is 1h
+            ev_4h_long = SystemEvaluation(
+                **{
+                    **ev_mid.__dict__,
+                    "ema200_bear": False,
+                    "first_three_sell": False,
+                    "short_any2_trigger": False,
+                    "ema200_bull": True,
+                    "long_5_trigger": True,
+                }
+            )
+            ev_1h_flat = SystemEvaluation(
+                **{
+                    **ev_mid.__dict__,
+                    "ema200_bear": False,
+                    "first_three_sell": False,
+                    "short_any2_trigger": False,
+                }
+            )
+            res_sol = Coin4hResult(
+                "SOLUSDT", "papi", 100.0, 3.0, 100_000_000.0, ev_1h_flat, timeframe="1h", long_evaluation=ev_4h_long
+            )
+            st3 = notifier.process_4h_alert_only([res_sol], dual_mode=True, entry_window_minutes=0)
+            self.assertEqual(st3["long"], 1)
+            self.assertIn("[4S ÇİFT YÖN] LONG 5/5 + EMA200", sent[-1])
+
 
 if __name__ == "__main__":
     unittest.main()

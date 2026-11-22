@@ -16,13 +16,14 @@ from .indicators import (
     evaluate_1h_15m_system,
     evaluate_4h_system,
     resample_15m_to_45m,
+    resample_1h_to_4h,
 )
 
 FAPI_BASE = "https://fapi.binance.com"
 SPOT_BASE = "https://api.binance.com"
 
 MarketType = Literal["futures", "papi", "spot"]
-TimeframeType = Literal["45m", "1h", "15m"]
+TimeframeType = Literal["45m", "1h", "15m", "4h"]
 
 
 @dataclass
@@ -34,6 +35,7 @@ class Coin4hResult:
     volume_24h_usdt: float
     evaluation: SystemEvaluation
     timeframe: TimeframeType = "45m"
+    long_evaluation: SystemEvaluation | None = None
 
 
 def _klines_to_df(raw: list[list]) -> pd.DataFrame:
@@ -315,17 +317,35 @@ class Binance4hScanner:
     def _scan_one_4h_bist(self, coin: dict, interval: str = "1h") -> Coin4hResult | None:
         sym = coin["symbol"]
         if interval == "1h":
-            df_ohlcv = self.fetch_klines_cached(
+            df_1h = self.fetch_klines_cached(
                 sym, interval="1h", initial_limit=1500, pages=1, max_rows=1500
             )
-            df_1m = None
-        else:
-            df_ohlcv = self.fetch_klines_cached(
-                sym, interval="4h", initial_limit=1500, pages=2, max_rows=3000
+            ev_1h = evaluate_4h_system(
+                df_1h, df_1m=None, pivot_len=7, be_trigger_pct=2.5, ema200_filter=False
             )
-            df_1m = self.fetch_klines_cached(
-                sym, interval="1M", initial_limit=24, pages=1, max_rows=30
+            if ev_1h is None:
+                return None
+            df_4h = resample_1h_to_4h(df_1h)
+            ev_4h = evaluate_4h_system(
+                df_4h, df_1m=None, pivot_len=7, be_trigger_pct=2.5, ema200_filter=False
             )
+            return Coin4hResult(
+                symbol=sym,
+                market=self.market,
+                price=ev_1h.price,
+                change_24h=round(coin["change_24h"], 2),
+                volume_24h_usdt=round(coin["volume_24h_usdt"], 0),
+                evaluation=ev_1h,
+                timeframe="1h",
+                long_evaluation=ev_4h,
+            )
+
+        df_ohlcv = self.fetch_klines_cached(
+            sym, interval="4h", initial_limit=1500, pages=2, max_rows=3000
+        )
+        df_1m = self.fetch_klines_cached(
+            sym, interval="1M", initial_limit=24, pages=1, max_rows=30
+        )
         ev = evaluate_4h_system(
             df_ohlcv, df_1m=df_1m, pivot_len=7, be_trigger_pct=2.5, ema200_filter=False
         )
@@ -338,7 +358,7 @@ class Binance4hScanner:
             change_24h=round(coin["change_24h"], 2),
             volume_24h_usdt=round(coin["volume_24h_usdt"], 0),
             evaluation=ev,
-            timeframe="1h" if interval == "1h" else "45m",
+            timeframe="4h",
         )
 
     def scan_4h_bist_alerts(

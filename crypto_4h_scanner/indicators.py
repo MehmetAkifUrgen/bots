@@ -1374,6 +1374,32 @@ def resample_15m_to_45m(df_15m: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
+_4H_MS = 4 * 3600 * 1000
+
+
+def resample_1h_to_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
+    """Resample 1h OHLCV candles into 4h candles aligned to 4h UTC boundaries."""
+    if df_1h.empty:
+        return df_1h.copy()
+
+    df = df_1h.sort_values("open_time").reset_index(drop=True).copy()
+    df["_bucket"] = (df["open_time"].astype("int64") // _4H_MS) * _4H_MS
+    grouped = (
+        df.groupby("_bucket", sort=True, as_index=False)
+        .agg(
+            open_time=("open_time", "first"),
+            open=("open", "first"),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", "last"),
+            volume=("volume", "sum"),
+            close_time=("close_time", "last"),
+        )
+        .drop(columns=["_bucket"])
+    )
+    return grouped
+
+
 def _scalp_res_45m(
     price: float,
     last_res: float | None,

@@ -138,11 +138,13 @@ def format_dual_4h_message(
     trailing_trigger_pct: float = 2.0,
     trailing_callback_pct: float = 0.3,
     trailing_floor_pct: float = 1.7,
+    tf_override: str | None = None,
 ) -> str:
-    ev = res.evaluation
     is_long = side.upper() == "LONG"
-    tf_label = "1S (1H)" if getattr(res, "timeframe", "1h") == "1h" else "4S (4H)"
-    tf_short = "1S" if getattr(res, "timeframe", "1h") == "1h" else "4S"
+    ev = (res.long_evaluation or res.evaluation) if is_long else res.evaluation
+    tf_raw = tf_override or ("4h" if (is_long and res.long_evaluation is not None) else getattr(res, "timeframe", "1h"))
+    tf_label = "1S (1H)" if tf_raw == "1h" else "4S (4H)"
+    tf_short = "1S" if tf_raw == "1h" else "4S"
     header = (
         f"🟢 <b>[{tf_short} ÇİFT YÖN] LONG 5/5 + EMA200</b>"
         if is_long
@@ -608,22 +610,29 @@ class TelegramNotifier:
             now_ms = int(time.time() * 1000)
             window_ms = max(0, entry_window_minutes) * 60 * 1000
             for res in results:
-                ev = res.evaluation
+                long_ev = res.long_evaluation or res.evaluation
+                short_ev = res.evaluation
                 side: str | None = None
-                if ev.long_5_trigger:
+                ev = short_ev
+                tf_used = res.timeframe
+                if long_ev.long_5_trigger:
                     side = "LONG"
-                elif ev.short_any2_trigger:
+                    ev = long_ev
+                    tf_used = "4h" if res.long_evaluation is not None else res.timeframe
+                elif short_ev.short_any2_trigger:
                     side = "SHORT"
+                    ev = short_ev
+                    tf_used = res.timeframe
                 if not side:
                     continue
 
-                # Only enter in the final `entry_window_minutes` of the 4H candle (zero mid-candle repaint)
+                # Only enter in the final `entry_window_minutes` of the candle if configured
                 if window_ms > 0 and ev.bar_close_time > 0:
                     rem_ms = ev.bar_close_time - now_ms
                     if rem_ms > window_ms or rem_ms < -60_000:
                         continue
 
-                alert_key = f"4h_dual:{res.symbol}:{side}:{ev.bar_open_time}"
+                alert_key = f"4h_dual:{tf_used}:{res.symbol}:{side}:{ev.bar_open_time}"
                 if alert_key in sent_alerts:
                     continue
 
@@ -659,6 +668,7 @@ class TelegramNotifier:
                                 trailing_trigger_pct=trader.trailing_trigger_pct if trader else 2.0,
                                 trailing_callback_pct=trader.trailing_callback_pct if trader else 0.3,
                                 trailing_floor_pct=trader.trailing_floor_pct if trader else 1.7,
+                                tf_override=tf_used,
                             )
                         )
                     sent_alerts[alert_key] = int(time.time())
