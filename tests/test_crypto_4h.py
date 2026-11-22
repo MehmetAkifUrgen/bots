@@ -544,6 +544,8 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertEqual(st1["short"], 1)
             self.assertEqual(len(sent), 1)
             self.assertIn("SHORT 3/5 + EMA200", sent[0])
+            self.assertNotIn("Fiyat < 4S", sent[0])
+            self.assertIn("Fiyat &lt; 4S", sent[0])
 
             # Optional 15m close-window gate still blocks mid-candle if explicitly enabled
             res_eth = Coin4hResult("ETHUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_mid)

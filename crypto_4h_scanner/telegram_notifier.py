@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import html
 import json
 from pathlib import Path
 import time
@@ -162,7 +163,7 @@ def format_dual_4h_message(
             f"• Emir ID: <code>{trade_exec.order_id}</code>\n"
         )
     elif trade_note:
-        trade_block = f"\nℹ️ <i>{trade_note}</i>\n"
+        trade_block = f"\nℹ️ <i>{html.escape(str(trade_note))}</i>\n"
 
     return (
         f"{header}\n"
@@ -171,7 +172,7 @@ def format_dual_4h_message(
         f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
         f"🛑 <b>Stop (-%{stop_loss_pct:g}):</b> <code>{fmt_price(sl)}</code>\n"
         f"🔒 <b>Trailing Stop:</b> +%{trailing_trigger_pct:g} görünce başlar (%{trailing_callback_pct:g} takip, +%{trailing_floor_pct:g} taban)\n"
-        f"📈 <b>Trend:</b> {'Fiyat > 4S EMA200 (Yükseliş)' if is_long else 'Fiyat < 4S EMA200 (Düşüş)'}\n"
+        f"📈 <b>Trend:</b> {'Fiyat &gt; 4S EMA200 (Yükseliş)' if is_long else 'Fiyat &lt; 4S EMA200 (Düşüş)'}\n"
         f"{trade_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💧 <b>24s Hacim:</b> {fmt_vol(res.volume_24h_usdt)} | 24s: {res.change_24h:+.2f}%\n"
@@ -320,6 +321,17 @@ class TelegramNotifier:
             },
             timeout=self.timeout,
         )
+        if resp.status_code == 400:
+            # Fallback to plain text if HTML entity parsing ever fails so alerts are never lost
+            resp = requests.post(
+                url,
+                json={
+                    "chat_id": self.chat_id,
+                    "text": text,
+                    "disable_web_page_preview": True,
+                },
+                timeout=self.timeout,
+            )
         resp.raise_for_status()
         payload = resp.json()
         return bool(payload.get("ok"))
