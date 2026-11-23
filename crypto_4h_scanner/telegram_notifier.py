@@ -589,6 +589,7 @@ class TelegramNotifier:
         trader: BinanceTrader | None = None,
         dual_mode: bool = True,
         entry_window_minutes: int = 0,
+        short_top_gainers: int = 20,
     ) -> dict:
         """Process 4H signals: LONG on 5/5 + EMA200, SHORT on 3/5 + EMA200 (immediate entry)."""
         sent_alerts: dict[str, int] = self._state["sent_alerts"]
@@ -618,6 +619,12 @@ class TelegramNotifier:
         if dual_mode:
             now_ms = int(time.time() * 1000)
             window_ms = max(0, entry_window_minutes) * 60 * 1000
+            top_gainers: set[str] | None = None
+            if short_top_gainers > 0:
+                top_gainers = {
+                    r.symbol
+                    for r in sorted(results, key=lambda x: x.change_24h, reverse=True)[:short_top_gainers]
+                }
             for res in results:
                 long_ev = res.long_evaluation or res.evaluation
                 short_ev = res.evaluation
@@ -628,7 +635,7 @@ class TelegramNotifier:
                     side = "LONG"
                     ev = long_ev
                     tf_used = "4h" if res.long_evaluation is not None else res.timeframe
-                elif short_ev.short_rev_trigger:
+                elif short_ev.short_rev_trigger and (top_gainers is None or res.symbol in top_gainers):
                     side = "SHORT"
                     ev = short_ev
                     tf_used = res.timeframe

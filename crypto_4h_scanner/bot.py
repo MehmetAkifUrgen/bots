@@ -291,6 +291,7 @@ def main() -> None:
                 interval=scan_interval,
             )
             entry_window_min = int(os.getenv("ENTRY_WINDOW_MINUTES", "0"))
+            short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "20"))
             stats = notifier.process_4h_alert_only(
                 results,
                 min_win_rate=args.min_win_rate,
@@ -299,10 +300,19 @@ def main() -> None:
                 trader=trader,
                 dual_mode=True,
                 entry_window_minutes=entry_window_min,
+                short_top_gainers=short_top_n,
             )
 
             long_now = sum(1 for r in results if (r.long_evaluation or r.evaluation).long_3_trigger)
-            short_now = sum(1 for r in results if r.evaluation.short_rev_trigger)
+            top_syms = {
+                r.symbol
+                for r in sorted(results, key=lambda x: x.change_24h, reverse=True)[:short_top_n]
+            } if short_top_n > 0 else None
+            short_now = sum(
+                1
+                for r in results
+                if r.evaluation.short_rev_trigger and (top_syms is None or r.symbol in top_syms)
+            )
 
             _HEALTH_STATE.update(
                 {
@@ -318,7 +328,7 @@ def main() -> None:
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
                 f"[{tf_tag}] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
-                f"LONG(4S 3/5): {long_now}, SHORT(1S Tepe Dönüşü): {short_now} ({win_lbl}) | "
+                f"LONG(4S 3/5): {long_now}, SHORT(1S Top{short_top_n}): {short_now} ({win_lbl}) | "
                 f"Emir -> Açılan: {stats['orders_opened']}, Kapanan: {stats['orders_closed']}"
             )
             if stats["errors"]:
