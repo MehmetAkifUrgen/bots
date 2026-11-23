@@ -291,7 +291,7 @@ def main() -> None:
                 interval=scan_interval,
             )
             entry_window_min = int(os.getenv("ENTRY_WINDOW_MINUTES", "0"))
-            short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "20"))
+            short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "10"))
             stats = notifier.process_4h_alert_only(
                 results,
                 min_win_rate=args.min_win_rate,
@@ -304,10 +304,12 @@ def main() -> None:
             )
 
             long_now = sum(1 for r in results if (r.long_evaluation or r.evaluation).long_3_trigger)
-            top_syms = {
-                r.symbol
-                for r in sorted(results, key=lambda x: x.change_24h, reverse=True)[:short_top_n]
-            } if short_top_n > 0 else None
+            if short_top_n > 0:
+                today_top = {r.symbol for r in sorted(results, key=lambda x: x.change_24h, reverse=True)[:short_top_n]}
+                prev_top = {r.symbol for r in sorted(results, key=lambda x: x.prev_change_24h, reverse=True)[:short_top_n]}
+                top_syms: set[str] | None = today_top | prev_top
+            else:
+                top_syms = None
             short_now = sum(
                 1
                 for r in results
@@ -328,7 +330,7 @@ def main() -> None:
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
                 f"[{tf_tag}] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
-                f"LONG(4S 3/5): {long_now}, SHORT(1S Top{short_top_n}): {short_now} ({win_lbl}) | "
+                f"LONG(4S 3/5): {long_now}, SHORT(1S Bugün+Dün Top{short_top_n}): {short_now} ({win_lbl}) | "
                 f"Emir -> Açılan: {stats['orders_opened']}, Kapanan: {stats['orders_closed']}"
             )
             if stats["errors"]:

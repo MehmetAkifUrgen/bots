@@ -36,6 +36,7 @@ class Coin4hResult:
     evaluation: SystemEvaluation
     timeframe: TimeframeType = "45m"
     long_evaluation: SystemEvaluation | None = None
+    prev_change_24h: float = 0.0
 
 
 def _klines_to_df(raw: list[list]) -> pd.DataFrame:
@@ -329,6 +330,12 @@ class Binance4hScanner:
             ev_4h = evaluate_4h_system(
                 df_4h, df_1m=None, pivot_len=7, be_trigger_pct=2.5, ema200_filter=False
             )
+            prev_chg_24h = 0.0
+            if len(df_1h) >= 49:
+                c_48 = float(df_1h["close"].iloc[-49])
+                c_24 = float(df_1h["close"].iloc[-25])
+                if c_48 > 0:
+                    prev_chg_24h = round((c_24 - c_48) / c_48 * 100.0, 2)
             return Coin4hResult(
                 symbol=sym,
                 market=self.market,
@@ -338,6 +345,7 @@ class Binance4hScanner:
                 evaluation=ev_1h,
                 timeframe="1h",
                 long_evaluation=ev_4h,
+                prev_change_24h=prev_chg_24h,
             )
 
         df_ohlcv = self.fetch_klines_cached(

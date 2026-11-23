@@ -611,18 +611,18 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertEqual(st3["long"], 1)
             self.assertIn("[4S ÇİFT YÖN] LONG 3/5 + EMA200", sent[-1])
 
-            # Top-20 gainers filter applies ONLY to SHORT (not LONG)
+            # Top-10 today + Top-10 yesterday gainers filter applies ONLY to SHORT (not LONG)
             gainers = [
-                Coin4hResult(f"G{i}USDT", "papi", 10.0, float(30 - i), 50_000_000.0, ev_1h_flat, timeframe="1h")
-                for i in range(20)
+                Coin4hResult(f"G{i}USDT", "papi", 10.0, float(30 - i), 50_000_000.0, ev_1h_flat, timeframe="1h", prev_change_24h=float(i))
+                for i in range(15)
             ]
-            # 21st coin has lower 24h gain (+1.0%) and short_rev_trigger=True -> MUST be skipped
-            low_coin = Coin4hResult("LOWUSDT", "papi", 10.0, 1.0, 50_000_000.0, ev_mid, timeframe="1h")
-            st4 = notifier.process_4h_alert_only(gainers + [low_coin], dual_mode=True, short_top_gainers=20)
+            # Coin outside BOTH today's Top 10 and yesterday's Top 10 -> MUST be skipped
+            low_coin = Coin4hResult("LOWUSDT", "papi", 10.0, 1.0, 50_000_000.0, ev_mid, timeframe="1h", prev_change_24h=1.0)
+            st4 = notifier.process_4h_alert_only(gainers + [low_coin], dual_mode=True, short_top_gainers=10)
             self.assertEqual(st4["short"], 0)
-            # A coin inside Top 20 (+25.0%) with short_rev_trigger=True -> MUST trigger
-            top_coin = Coin4hResult("TOPUSDT", "papi", 10.0, 25.0, 50_000_000.0, ev_mid, timeframe="1h")
-            st5 = notifier.process_4h_alert_only(gainers + [top_coin], dual_mode=True, short_top_gainers=20)
+            # Coin in yesterday's Top 10 (+25% yesterday, -3% today!) -> MUST trigger SHORT
+            yest_coin = Coin4hResult("YESTUSDT", "papi", 10.0, -3.0, 50_000_000.0, ev_mid, timeframe="1h", prev_change_24h=25.0)
+            st5 = notifier.process_4h_alert_only(gainers + [yest_coin], dual_mode=True, short_top_gainers=10)
             self.assertEqual(st5["short"], 1)
 
 
