@@ -240,7 +240,7 @@ def main() -> None:
             max_positions=args.max_positions,
             leverage=args.leverage,
             max_leverage=args.max_leverage,
-            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "2.0")),            # 4S Çift Yön Stop: -%2.00
+            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "2.5")),            # Hibrit Çift Yön Stop: -%2.50
             trailing_trigger_pct=float(os.getenv("TRAILING_TRIGGER_PCT", "2.0")),  # +%2.00 görünce trailing başlar
             trailing_callback_pct=float(os.getenv("TRAILING_CALLBACK_PCT", "0.3")),  # %0.30 zirve takibi
             trailing_floor_pct=float(os.getenv("TRAILING_FLOOR_PCT", "1.7")),  # En kötü +%1.70 kâr tabanı

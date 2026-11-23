@@ -602,7 +602,7 @@ def evaluate_4h_system(
         prev_any2_dn = any2_dn
         prev_any4_dn = any4_dn
         prev_rev_dn = rev_dn
-        bull4_hist.append(up_count >= 4)
+        bull4_hist.append(up_count == 5)
 
     last_close = float(closes.iloc[-1])
     next_res = (

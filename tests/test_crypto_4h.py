@@ -576,7 +576,7 @@ class TestBinanceTrader(unittest.TestCase):
             st1 = notifier.process_4h_alert_only([res_mid], dual_mode=True, entry_window_minutes=0)
             self.assertEqual(st1["short"], 1)
             self.assertEqual(len(sent), 1)
-            self.assertIn("SHORT (4/5 AL → 3/5 SAT)", sent[0])
+            self.assertIn("SHORT (5/5 AL → 3/5 SAT)", sent[0])
             self.assertNotIn("Fiyat < 1S", sent[0])
             self.assertIn("Fiyat &lt; 1S", sent[0])
 

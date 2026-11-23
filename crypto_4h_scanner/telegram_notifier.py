@@ -134,7 +134,7 @@ def format_dual_4h_message(
     side: str,
     trade_exec: TradeExecution | None = None,
     trade_note: str | None = None,
-    stop_loss_pct: float = 2.0,
+    stop_loss_pct: float = 2.5,
     trailing_trigger_pct: float = 2.0,
     trailing_callback_pct: float = 0.3,
     trailing_floor_pct: float = 1.7,
@@ -148,7 +148,7 @@ def format_dual_4h_message(
     header = (
         f"🟢 <b>[{tf_short} ÇİFT YÖN] LONG 3/5 + EMA200</b>"
         if is_long
-        else f"🔴 <b>[{tf_short} ÇİFT YÖN] SHORT (4/5 AL → 3/5 SAT)</b>"
+        else f"🔴 <b>[{tf_short} ÇİFT YÖN] SHORT (5/5 AL → 3/5 SAT)</b>"
     )
     entry = trade_exec.price if trade_exec else res.price
     sl = (
@@ -673,7 +673,7 @@ class TelegramNotifier:
                                 side=side,
                                 trade_exec=trade_exec,
                                 trade_note=trade_note,
-                                stop_loss_pct=trader.stop_loss_pct if trader else 2.0,
+                                stop_loss_pct=trader.stop_loss_pct if trader else 2.5,
                                 trailing_trigger_pct=trader.trailing_trigger_pct if trader else 2.0,
                                 trailing_callback_pct=trader.trailing_callback_pct if trader else 0.3,
                                 trailing_floor_pct=trader.trailing_floor_pct if trader else 1.7,
