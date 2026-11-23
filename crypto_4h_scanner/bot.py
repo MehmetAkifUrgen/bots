@@ -247,7 +247,7 @@ def main() -> None:
             cooldown_minutes=0,
             symbol_stop_cooldown_minutes=240,
             signal_cancel_stop_usd=float(os.getenv("SIGNAL_CANCEL_STOP_USD", "1.5")),
-            risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "0.0")),  # Direkt $150-$250 hedefle (20x'e kadar otomatik kaldıraç)
+            risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "12.5")),  # Kasaya göre boyut (stop %2.5 iken kasa x 5: $44 -> ~$220)
             state_file=DEFAULT_TRADE_STATE_FILE,
             proxy_url=proxy_url,
         )
