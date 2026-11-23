@@ -456,7 +456,7 @@ def evaluate_4h_system(
         all5_dn_strict = bool(first3_dn and c4_dn and c5_dn)
         up_count = int(c1) + int(c2) + int(c3) + int(c4) + int((smi.iloc[i] > smi_sig.iloc[i]) and (smi.iloc[i] > smi_ema9.iloc[i]))
         recent_bull4 = any(bull4_hist[-3:]) if bull4_hist else False
-        rev_dn = recent_bull4 and (dn_count >= 3)
+        rev_dn = recent_bull4 and (dn_count >= 2)
         real_sell = bool(
             (smi.iloc[i] < smi_ema9.iloc[i])
             or ((wt1.iloc[i] < wt2.iloc[i]) and (fisher.iloc[i] < fisher_trigger.iloc[i]))

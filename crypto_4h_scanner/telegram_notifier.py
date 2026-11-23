@@ -148,7 +148,7 @@ def format_dual_4h_message(
     header = (
         f"🟢 <b>[{tf_short} ÇİFT YÖN] LONG 3/5 + EMA200</b>"
         if is_long
-        else f"🔴 <b>[{tf_short} ÇİFT YÖN] SHORT (5/5 AL → 3/5 SAT)</b>"
+        else f"🔴 <b>[{tf_short} ÇİFT YÖN] SHORT (5/5 AL → 2/5 SAT)</b>"
     )
     entry = trade_exec.price if trade_exec else res.price
     sl = (
