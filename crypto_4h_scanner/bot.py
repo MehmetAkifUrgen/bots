@@ -36,8 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--min-usd",
         type=float,
-        default=float(os.getenv("MIN_POSITION_USD", "25")),
-        help="Minimum pozisyon büyüklüğü USD (varsayılan: 25)",
+        default=float(os.getenv("MIN_POSITION_USD", "150")),
+        help="Minimum pozisyon büyüklüğü USD (varsayılan: 150)",
     )
     p.add_argument(
         "--max-usd",
@@ -54,14 +54,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--leverage",
         type=int,
-        default=int(os.getenv("LEVERAGE", "10")),
-        help="Varsayılan kaldıraç (max 10x güvenlik tavanı, varsayılan: 10)",
+        default=int(os.getenv("LEVERAGE", "20")),
+        help="Varsayılan kaldıraç (varsayılan: 20)",
     )
     p.add_argument(
         "--max-leverage",
         type=int,
-        default=int(os.getenv("MAX_LEVERAGE", "10")),
-        help="Likidasyon koruması için maksimum kaldıraç tavanı (varsayılan: 10)",
+        default=int(os.getenv("MAX_LEVERAGE", "20")),
+        help="Maksimum kaldıraç tavanı (varsayılan: 20)",
     )
     p.add_argument(
         "--min-volume",
@@ -247,7 +247,7 @@ def main() -> None:
             cooldown_minutes=0,
             symbol_stop_cooldown_minutes=240,
             signal_cancel_stop_usd=float(os.getenv("SIGNAL_CANCEL_STOP_USD", "1.5")),
-            risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "8.0")),  # Kasa koruma: işlem başı max %8 risk
+            risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "0.0")),  # Direkt $150-$250 hedefle (20x'e kadar otomatik kaldıraç)
             state_file=DEFAULT_TRADE_STATE_FILE,
             proxy_url=proxy_url,
         )
