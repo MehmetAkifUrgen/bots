@@ -148,7 +148,7 @@ def format_dual_4h_message(
     header = (
         f"🟢 <b>[{tf_short} ÇİFT YÖN] LONG 3/5 + EMA200</b>"
         if is_long
-        else f"🔴 <b>[{tf_short} ÇİFT YÖN] SHORT 2/5 + EMA200</b>"
+        else f"🔴 <b>[{tf_short} ÇİFT YÖN] SHORT (4/5 AL → 3/5 SAT)</b>"
     )
     entry = trade_exec.price if trade_exec else res.price
     sl = (
@@ -169,6 +169,15 @@ def format_dual_4h_message(
     elif trade_note:
         trade_block = f"\nℹ️ <i>{html.escape(str(trade_note))}</i>\n"
 
+    trend_line = (
+        f"Fiyat &gt; {tf_short} EMA200 (Yükseliş)"
+        if is_long
+        else (
+            f"Fiyat &lt; {tf_short} EMA200 (Tepe Dönüşü + Düşüş Trendi)"
+            if ev.ema200_bear
+            else f"Tepe Dönüşü ({tf_short} EMA200 Üstü)"
+        )
+    )
     return (
         f"{header}\n"
         f"🪙 <b>{res.symbol}</b> | <code>{tf_label}</code>\n"
@@ -176,7 +185,7 @@ def format_dual_4h_message(
         f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
         f"🛑 <b>Stop (-%{stop_loss_pct:g}):</b> <code>{fmt_price(sl)}</code>\n"
         f"🔒 <b>Trailing Stop:</b> +%{trailing_trigger_pct:g} görünce başlar (%{trailing_callback_pct:g} takip, +%{trailing_floor_pct:g} taban)\n"
-        f"📈 <b>Trend:</b> {'Fiyat &gt; ' + tf_short + ' EMA200 (Yükseliş)' if is_long else 'Fiyat &lt; ' + tf_short + ' EMA200 (Düşüş)'}\n"
+        f"📈 <b>Trend:</b> {trend_line}\n"
         f"{trade_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💧 <b>24s Hacim:</b> {fmt_vol(res.volume_24h_usdt)} | 24s: {res.change_24h:+.2f}%\n"
@@ -619,7 +628,7 @@ class TelegramNotifier:
                     side = "LONG"
                     ev = long_ev
                     tf_used = "4h" if res.long_evaluation is not None else res.timeframe
-                elif short_ev.short_any2_trigger:
+                elif short_ev.short_rev_trigger:
                     side = "SHORT"
                     ev = short_ev
                     tf_used = res.timeframe

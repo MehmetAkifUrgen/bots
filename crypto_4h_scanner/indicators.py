@@ -49,6 +49,7 @@ class SystemEvaluation:
     short_any2_trigger: bool = False
     short_any4_trigger: bool = False
     long_3_trigger: bool = False
+    short_rev_trigger: bool = False
 
 
 def wilder_rsi(closes: pd.Series, length: int = 14) -> pd.Series:
@@ -391,12 +392,15 @@ def evaluate_4h_system(
     last_short_3_trig = False
     last_short_any2_trig = False
     last_short_any4_trig = False
+    last_short_rev_trig = False
     prev_all5_up_strict = False
     prev_first3_up = False
     prev_all5_dn_strict = False
     prev_first3_dn = False
     prev_any2_dn = False
     prev_any4_dn = False
+    prev_rev_dn = False
+    bull4_hist: list[bool] = []
     last_fib_p = last_fib_r1 = last_fib_r2 = last_fib_s1 = last_fib_s2 = None
 
     for i in range(n):
@@ -450,6 +454,9 @@ def evaluate_4h_system(
         any2_dn = dn_count >= 2
         any4_dn = dn_count >= 4
         all5_dn_strict = bool(first3_dn and c4_dn and c5_dn)
+        up_count = int(c1) + int(c2) + int(c3) + int(c4) + int((smi.iloc[i] > smi_sig.iloc[i]) and (smi.iloc[i] > smi_ema9.iloc[i]))
+        recent_bull4 = any(bull4_hist[-3:]) if bull4_hist else False
+        rev_dn = recent_bull4 and (dn_count >= 3)
         real_sell = bool(
             (smi.iloc[i] < smi_ema9.iloc[i])
             or ((wt1.iloc[i] < wt2.iloc[i]) and (fisher.iloc[i] < fisher_trigger.iloc[i]))
@@ -579,6 +586,7 @@ def evaluate_4h_system(
             last_short_3_trig = first3_dn and (not prev_first3_dn) and last_ema200_bear
             last_short_any2_trig = any2_dn and (not prev_any2_dn) and last_ema200_bear
             last_short_any4_trig = any4_dn and (not prev_any4_dn) and last_ema200_bear
+            last_short_rev_trig = rev_dn and (not prev_rev_dn)
             last_fib_p, last_fib_r1, last_fib_r2, last_fib_s1, last_fib_s2 = (
                 fib_p,
                 fib_r1,
@@ -593,6 +601,8 @@ def evaluate_4h_system(
         prev_first3_dn = first3_dn
         prev_any2_dn = any2_dn
         prev_any4_dn = any4_dn
+        prev_rev_dn = rev_dn
+        bull4_hist.append(up_count >= 4)
 
     last_close = float(closes.iloc[-1])
     next_res = (
@@ -667,6 +677,7 @@ def evaluate_4h_system(
         short_any2_trigger=last_short_any2_trig,
         short_any4_trigger=last_short_any4_trig,
         long_3_trigger=last_long_3_trig,
+        short_rev_trigger=last_short_rev_trig,
     )
 
 
