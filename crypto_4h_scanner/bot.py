@@ -279,9 +279,9 @@ def main() -> None:
         f"Filtre=WR>={args.min_win_rate:g}% & Getiri>={args.min_profit_pct:g}% | Periyot={args.poll_seconds}sn"
     )
 
-    scan_interval = os.getenv("SCAN_INTERVAL", "4h").strip().lower()
+    scan_interval = os.getenv("SCAN_INTERVAL", "1h").strip().lower()
     if scan_interval not in ("1h", "4h"):
-        scan_interval = "4h"
+        scan_interval = "1h"
 
     while True:
         try:
@@ -302,7 +302,7 @@ def main() -> None:
             )
 
             long_now = sum(1 for r in results if (r.long_evaluation or r.evaluation).long_3_trigger)
-            short_now = sum(1 for r in results if r.evaluation.short_5_trigger)
+            short_now = sum(1 for r in results if r.evaluation.short_any2_trigger)
 
             _HEALTH_STATE.update(
                 {
@@ -314,11 +314,11 @@ def main() -> None:
                 }
             )
             win_lbl = f"Son {entry_window_min}dk" if entry_window_min > 0 else "Anlık Giriş"
-            tf_tag = "1S" if scan_interval == "1h" else "4S"
+            tf_tag = "HİBRİT 4S-L / 1S-S" if scan_interval == "1h" else "4S ÇİFT YÖN"
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
-                f"[{tf_tag} ÇİFT YÖN] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
-                f"LONG(3/5): {long_now}, SHORT(5/5): {short_now} ({win_lbl}) | "
+                f"[{tf_tag}] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
+                f"LONG(4S 3/5): {long_now}, SHORT(1S 2/5): {short_now} ({win_lbl}) | "
                 f"Emir -> Açılan: {stats['orders_opened']}, Kapanan: {stats['orders_closed']}"
             )
             if stats["errors"]:
