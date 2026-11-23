@@ -593,7 +593,7 @@ class TestBinanceTrader(unittest.TestCase):
                     "first_three_sell": False,
                     "short_5_trigger": False,
                     "ema200_bull": True,
-                    "long_5_trigger": True,
+                    "long_3_trigger": True,
                 }
             )
             ev_1h_flat = SystemEvaluation(
@@ -609,7 +609,7 @@ class TestBinanceTrader(unittest.TestCase):
             )
             st3 = notifier.process_4h_alert_only([res_sol], dual_mode=True, entry_window_minutes=0)
             self.assertEqual(st3["long"], 1)
-            self.assertIn("[4S ÇİFT YÖN] LONG 5/5 + EMA200", sent[-1])
+            self.assertIn("[4S ÇİFT YÖN] LONG 3/5 + EMA200", sent[-1])
 
 
 if __name__ == "__main__":

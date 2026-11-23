@@ -48,6 +48,7 @@ class SystemEvaluation:
     short_3_trigger: bool = False
     short_any2_trigger: bool = False
     short_any4_trigger: bool = False
+    long_3_trigger: bool = False
 
 
 def wilder_rsi(closes: pd.Series, length: int = 14) -> pd.Series:
@@ -384,12 +385,14 @@ def evaluate_4h_system(
     last_ema200_bull = False
     last_ema200_bear = False
     last_long_5_trig = False
+    last_long_3_trig = False
     last_short_5_trig = False
     last_first3_sell = False
     last_short_3_trig = False
     last_short_any2_trig = False
     last_short_any4_trig = False
     prev_all5_up_strict = False
+    prev_first3_up = False
     prev_all5_dn_strict = False
     prev_first3_dn = False
     prev_any2_dn = False
@@ -571,6 +574,7 @@ def evaluate_4h_system(
             last_ema200_bull = bool(not np.isnan(ema200_val) and bar_c > ema200_val)
             last_ema200_bear = bool(not np.isnan(ema200_val) and bar_c < ema200_val)
             last_long_5_trig = all5_up_strict and (not prev_all5_up_strict) and last_ema200_bull
+            last_long_3_trig = first3 and (not prev_first3_up) and last_ema200_bull
             last_short_5_trig = all5_dn_strict and (not prev_all5_dn_strict) and last_ema200_bear
             last_short_3_trig = first3_dn and (not prev_first3_dn) and last_ema200_bear
             last_short_any2_trig = any2_dn and (not prev_any2_dn) and last_ema200_bear
@@ -584,6 +588,7 @@ def evaluate_4h_system(
             )
 
         prev_all5_up_strict = all5_up_strict
+        prev_first3_up = first3
         prev_all5_dn_strict = all5_dn_strict
         prev_first3_dn = first3_dn
         prev_any2_dn = any2_dn
@@ -661,6 +666,7 @@ def evaluate_4h_system(
         short_3_trigger=last_short_3_trig,
         short_any2_trigger=last_short_any2_trig,
         short_any4_trigger=last_short_any4_trig,
+        long_3_trigger=last_long_3_trig,
     )
 
 

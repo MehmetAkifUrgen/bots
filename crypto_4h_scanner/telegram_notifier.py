@@ -146,7 +146,7 @@ def format_dual_4h_message(
     tf_label = "1S (1H)" if tf_raw == "1h" else "4S (4H)"
     tf_short = "1S" if tf_raw == "1h" else "4S"
     header = (
-        f"🟢 <b>[{tf_short} ÇİFT YÖN] LONG 5/5 + EMA200</b>"
+        f"🟢 <b>[{tf_short} ÇİFT YÖN] LONG 3/5 + EMA200</b>"
         if is_long
         else f"🔴 <b>[{tf_short} ÇİFT YÖN] SHORT 5/5 + EMA200</b>"
     )
@@ -615,7 +615,7 @@ class TelegramNotifier:
                 side: str | None = None
                 ev = short_ev
                 tf_used = res.timeframe
-                if long_ev.long_5_trigger:
+                if long_ev.long_3_trigger:
                     side = "LONG"
                     ev = long_ev
                     tf_used = "4h" if res.long_evaluation is not None else res.timeframe
