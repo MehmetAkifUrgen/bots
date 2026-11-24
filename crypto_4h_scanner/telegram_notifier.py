@@ -134,7 +134,7 @@ def format_dual_4h_message(
     side: str,
     trade_exec: TradeExecution | None = None,
     trade_note: str | None = None,
-    stop_loss_pct: float = 2.5,
+    stop_loss_pct: float = 1.5,
     trailing_trigger_pct: float = 2.0,
     trailing_callback_pct: float = 0.3,
     trailing_floor_pct: float = 1.7,
@@ -589,7 +589,7 @@ class TelegramNotifier:
         trader: BinanceTrader | None = None,
         dual_mode: bool = True,
         entry_window_minutes: int = 0,
-        short_top_gainers: int = 10,
+        short_top_gainers: int = 30,
     ) -> dict:
         """Process 4H signals: LONG on 5/5 + EMA200, SHORT on 3/5 + EMA200 (immediate entry)."""
         sent_alerts: dict[str, int] = self._state["sent_alerts"]
@@ -621,15 +621,10 @@ class TelegramNotifier:
             window_ms = max(0, entry_window_minutes) * 60 * 1000
             top_gainers: set[str] | None = None
             if short_top_gainers > 0:
-                today_top = {
+                top_gainers = {
                     r.symbol
                     for r in sorted(results, key=lambda x: x.change_24h, reverse=True)[:short_top_gainers]
                 }
-                prev_top = {
-                    r.symbol
-                    for r in sorted(results, key=lambda x: x.prev_change_24h, reverse=True)[:short_top_gainers]
-                }
-                top_gainers = today_top | prev_top
             for res in results:
                 long_ev = res.long_evaluation or res.evaluation
                 short_ev = res.evaluation
@@ -685,7 +680,7 @@ class TelegramNotifier:
                                 side=side,
                                 trade_exec=trade_exec,
                                 trade_note=trade_note,
-                                stop_loss_pct=trader.stop_loss_pct if trader else 2.5,
+                                stop_loss_pct=trader.stop_loss_pct if trader else 1.5,
                                 trailing_trigger_pct=trader.trailing_trigger_pct if trader else 2.0,
                                 trailing_callback_pct=trader.trailing_callback_pct if trader else 0.3,
                                 trailing_floor_pct=trader.trailing_floor_pct if trader else 1.7,

@@ -240,14 +240,14 @@ def main() -> None:
             max_positions=args.max_positions,
             leverage=args.leverage,
             max_leverage=args.max_leverage,
-            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "2.5")),            # Hibrit Çift Yön Stop: -%2.50
+            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "1.5")),            # Hibrit Çift Yön Stop: -%1.50
             trailing_trigger_pct=float(os.getenv("TRAILING_TRIGGER_PCT", "2.0")),  # +%2.00 görünce trailing başlar
             trailing_callback_pct=float(os.getenv("TRAILING_CALLBACK_PCT", "0.3")),  # %0.30 zirve takibi
             trailing_floor_pct=float(os.getenv("TRAILING_FLOOR_PCT", "1.7")),  # En kötü +%1.70 kâr tabanı
             cooldown_minutes=0,
             symbol_stop_cooldown_minutes=240,
             signal_cancel_stop_usd=float(os.getenv("SIGNAL_CANCEL_STOP_USD", "1.5")),
-            risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "12.5")),  # Kasaya göre boyut (stop %2.5 iken kasa x 5: $44 -> ~$220)
+            risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "7.5")),  # Kasaya göre boyut (stop %1.5 iken kasa x 5: $33 -> ~$165, $50+ -> $250)
             state_file=DEFAULT_TRADE_STATE_FILE,
             proxy_url=proxy_url,
         )
@@ -291,7 +291,7 @@ def main() -> None:
                 interval=scan_interval,
             )
             entry_window_min = int(os.getenv("ENTRY_WINDOW_MINUTES", "0"))
-            short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "10"))
+            short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "30"))
             stats = notifier.process_4h_alert_only(
                 results,
                 min_win_rate=args.min_win_rate,
@@ -304,12 +304,10 @@ def main() -> None:
             )
 
             long_now = sum(1 for r in results if (r.long_evaluation or r.evaluation).long_3_trigger)
-            if short_top_n > 0:
-                today_top = {r.symbol for r in sorted(results, key=lambda x: x.change_24h, reverse=True)[:short_top_n]}
-                prev_top = {r.symbol for r in sorted(results, key=lambda x: x.prev_change_24h, reverse=True)[:short_top_n]}
-                top_syms: set[str] | None = today_top | prev_top
-            else:
-                top_syms = None
+            top_syms = {
+                r.symbol
+                for r in sorted(results, key=lambda x: x.change_24h, reverse=True)[:short_top_n]
+            } if short_top_n > 0 else None
             short_now = sum(
                 1
                 for r in results
@@ -330,7 +328,7 @@ def main() -> None:
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
                 f"[{tf_tag}] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
-                f"LONG(4S 3/5): {long_now}, SHORT(1S Bugün+Dün Top{short_top_n}): {short_now} ({win_lbl}) | "
+                f"LONG(4S 3/5): {long_now}, SHORT(1S Top{short_top_n}): {short_now} ({win_lbl}) | "
                 f"Emir -> Açılan: {stats['orders_opened']}, Kapanan: {stats['orders_closed']}"
             )
             if stats["errors"]:
