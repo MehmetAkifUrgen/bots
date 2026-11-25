@@ -363,6 +363,9 @@ class BinanceTrader:
         tp_price: float | None = None,
         sl_price: float | None = None,
         side: Literal["LONG", "SHORT"] = "LONG",
+        use_trailing: bool = True,
+        be_trigger_pct: float = 0.0,
+        entry_bar_open_time: int = 0,
     ) -> TradeExecution | None:
         """Open a LONG or SHORT position if under max_positions, not in cooldown, and balance allows."""
         pos_side: Literal["LONG", "SHORT"] = "SHORT" if str(side).upper() == "SHORT" else "LONG"
@@ -494,7 +497,7 @@ class BinanceTrader:
                 final_sl = default_sl
             final_tp = (
                 tp_price
-                if (tp_price is not None and tp_price > exec_price * 1.01)
+                if (tp_price is not None and tp_price > exec_price * 1.005)
                 else 0.0
             )
         else:
@@ -522,6 +525,10 @@ class BinanceTrader:
             "exchange_sl_price": final_sl if algo_sl_id else 0.0,
             "peak_price": exec_price,
             "trailing_active": False,
+            "use_trailing": bool(use_trailing),
+            "be_trigger_pct": float(be_trigger_pct),
+            "be_locked": False,
+            "entry_bar_open_time": int(entry_bar_open_time),
             "opened_at": int(time.time()),
         }
         self._save_state()
@@ -703,7 +710,11 @@ class BinanceTrader:
                 if live_ep > 0 and abs(live_ep - float(tracked[sym].get("entry_price") or 0.0)) / live_ep > 0.001:
                     tracked[sym]["entry_price"] = live_ep
                     pos_side = str(tracked[sym].get("side") or "LONG").upper()
-                    if not tracked[sym].get("trailing_active") and not tracked[sym].get("signal_lost"):
+                    if (
+                        not tracked[sym].get("trailing_active")
+                        and not tracked[sym].get("be_locked")
+                        and not tracked[sym].get("signal_lost")
+                    ):
                         tracked[sym]["sl_price"] = (
                             live_ep * (1.0 - self.stop_loss_pct / 100.0)
                             if pos_side == "LONG"
@@ -738,6 +749,10 @@ class BinanceTrader:
                     "exchange_sl_price": sl_px,
                     "peak_price": ep,
                     "trailing_active": False,
+                    "use_trailing": pos_side != "LONG",
+                    "be_trigger_pct": 2.5 if pos_side == "LONG" else 0.0,
+                    "be_locked": False,
+                    "entry_bar_open_time": 0,
                     "opened_at": int(time.time()),
                 }
                 dirty = True
@@ -792,8 +807,14 @@ class BinanceTrader:
             pnl_pct = 0.0
 
         is_trailing = bool(prev.get("trailing_active"))
-        reason = "TRAILING STOP (Binance)" if is_trailing else f"STOP (Binance -%{self.stop_loss_pct:g})"
-        if pnl_usd < 0 and not is_trailing:
+        is_be = bool(prev.get("be_locked"))
+        if is_trailing:
+            reason = "TRAILING STOP (Binance)"
+        elif is_be:
+            reason = "SAT (Binance Kâr Kilidi +%0.30)"
+        else:
+            reason = f"STOP (Binance -%{self.stop_loss_pct:g})"
+        if pnl_usd < 0 and not is_trailing and not is_be:
             self._state["consecutive_stops"] = int(self._state.get("consecutive_stops", 0)) + 1
             if self.symbol_stop_cooldown_minutes > 0:
                 self._state.setdefault("symbol_cooldowns", {})[symbol] = int(
@@ -927,8 +948,9 @@ class BinanceTrader:
                         pos["peak_price"] = peak_px
                         state_dirty = True
 
+                use_trailing = bool(pos.get("use_trailing", True))
                 trailing_active = bool(pos.get("trailing_active", False))
-                if not trailing_active and pnl_pct >= self.trailing_trigger_pct:
+                if use_trailing and not trailing_active and pnl_pct >= self.trailing_trigger_pct:
                     trailing_active = True
                     pos["trailing_active"] = True
                     state_dirty = True
@@ -936,9 +958,20 @@ class BinanceTrader:
                 reason: str | None = None
                 tp_px = float(pos.get("tp_price") or 0.0)
                 if pos_side == "LONG":
+                    be_trig = float(pos.get("be_trigger_pct") or 0.0)
+                    if not use_trailing and be_trig > 0 and not pos.get("be_locked") and pnl_pct >= be_trig:
+                        be_sl = entry_px * 1.003
+                        prev_sl = float(pos.get("sl_price") or 0.0)
+                        new_sl = max(prev_sl, be_sl)
+                        pos["be_locked"] = True
+                        pos["sl_price"] = new_sl
+                        state_dirty = True
+                        if curr_price > new_sl and self.place_exchange_stop_loss(sym, new_sl, pos_side="LONG"):
+                            pos["exchange_sl_price"] = new_sl
+
                     if tp_px > 0 and curr_price >= tp_px:
                         reason = "KÂR AL (Direnç)"
-                    elif trailing_active:
+                    elif use_trailing and trailing_active:
                         floor_sl = entry_px * (1.0 + self.trailing_floor_pct / 100.0)
                         trail_sl = peak_px * (1.0 - self.trailing_callback_pct / 100.0)
                         effective_sl = max(floor_sl, trail_sl)
@@ -956,7 +989,10 @@ class BinanceTrader:
                             pos.get("sl_price")
                             or (entry_px * (1.0 - self.stop_loss_pct / 100.0))
                         )
-                        if pnl_pct <= -self.stop_loss_pct or curr_price <= sl_px:
+                        if pos.get("be_locked"):
+                            if curr_price <= sl_px:
+                                reason = "SAT (Kâr Kilidi +%0.30)"
+                        elif pnl_pct <= -self.stop_loss_pct or curr_price <= sl_px:
                             if pos.get("signal_lost") and curr_price <= sl_px:
                                 reason = f"STOP (Sinyal Bozuldu -${self.signal_cancel_stop_usd:g})"
                             else:

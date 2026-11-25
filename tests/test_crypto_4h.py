@@ -19,6 +19,7 @@ from crypto_4h_scanner.indicators import (
     evaluate_4h_system,
     fisher_transform,
     resample_15m_to_45m,
+    resample_1h_to_4h,
     stochastic_momentum_index,
     stochastic_rsi,
     wavetrend,
@@ -586,30 +587,200 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertNotIn("Fiyat < 4S", sent[0])
             self.assertIn("Fiyat &lt; 4S", sent[0])
 
-            # LONG 3/5 + EMA200 still fires immediately mid-candle (entry_window_minutes=0)
-            ev_4h_long = SystemEvaluation(
+            # 1H LONG Pine 5/5 requires total_profit_pct >= 300% AND last 5 minutes before 1H close
+            ev_1h_long_low_profit = SystemEvaluation(
                 **{
                     **ev_mid.__dict__,
+                    "bar_close_time": now_ms + 4 * 60_000,  # 4m left (inside 5m window)
                     "ema200_bear": False,
                     "all_five_sell": False,
                     "short_5_trigger": False,
-                    "ema200_bull": True,
-                    "long_3_trigger": True,
+                    "orange_trigger": True,
+                    "tp_level": 106.0,
+                    "total_profit_pct": 250.0,  # Below 300% -> must NOT enter
                 }
             )
-            res_sol = Coin4hResult("SOLUSDT", "papi", 100.0, 3.0, 100_000_000.0, ev_4h_long, timeframe="4h")
-            st3 = notifier.process_4h_alert_only([res_sol], dual_mode=True, entry_window_minutes=0, short_entry_window_minutes=10)
+            res_low = Coin4hResult("SOLUSDT", "papi", 100.0, 3.0, 100_000_000.0, ev_1h_long_low_profit, timeframe="1h")
+            st_low = notifier.process_4h_alert_only(
+                [res_low], dual_mode=True, long_entry_window_minutes=5, short_entry_window_minutes=10, long_min_profit_pct=300.0
+            )
+            self.assertEqual(st_low["long"], 0)
+
+            # Profit >= 300% (e.g. 340%), but 20m left before 1H close -> blocked by 5m window
+            ev_1h_early = SystemEvaluation(
+                **{
+                    **ev_1h_long_low_profit.__dict__,
+                    "total_profit_pct": 340.0,
+                    "bar_close_time": now_ms + 20 * 60_000,
+                }
+            )
+            res_early = Coin4hResult("SOLUSDT", "papi", 100.0, 3.0, 100_000_000.0, ev_1h_early, timeframe="1h")
+            st_early = notifier.process_4h_alert_only(
+                [res_early], dual_mode=True, long_entry_window_minutes=5, short_entry_window_minutes=10, long_min_profit_pct=300.0
+            )
+            self.assertEqual(st_early["long"], 0)
+
+            # Profit >= 300% AND 4m left before 1H close -> LONG fires!
+            ev_1h_ok = SystemEvaluation(
+                **{
+                    **ev_1h_early.__dict__,
+                    "bar_close_time": now_ms + 4 * 60_000,
+                }
+            )
+            res_sol = Coin4hResult("SOLUSDT", "papi", 100.0, 3.0, 100_000_000.0, ev_1h_ok, timeframe="1h")
+            st3 = notifier.process_4h_alert_only(
+                [res_sol], dual_mode=True, long_entry_window_minutes=5, short_entry_window_minutes=10, long_min_profit_pct=300.0
+            )
             self.assertEqual(st3["long"], 1)
-            self.assertIn("[4S ÇİFT YÖN] LONG 3/5 + EMA200", sent[-1])
+            self.assertIn("[1S SİSTEM] TURUNCU KESİN AL (5/5) — LONG", sent[-1])
+            self.assertIn("Trailing Yok", sent[-1])
 
             # Pause (/durdur) blocks new entries; Resume (/baslat) re-enables them
             notifier.set_paused(True)
-            res_ada = Coin4hResult("ADAUSDT", "papi", 1.0, 3.0, 100_000_000.0, ev_4h_long, timeframe="4h")
-            st_paused = notifier.process_4h_alert_only([res_ada], dual_mode=True, short_entry_window_minutes=10)
+            res_ada = Coin4hResult("ADAUSDT", "papi", 1.0, 3.0, 100_000_000.0, ev_1h_ok, timeframe="1h")
+            st_paused = notifier.process_4h_alert_only(
+                [res_ada], dual_mode=True, long_entry_window_minutes=5, short_entry_window_minutes=10, long_min_profit_pct=300.0
+            )
             self.assertEqual(st_paused["long"], 0)
             notifier.set_paused(False)
-            st_resumed = notifier.process_4h_alert_only([res_ada], dual_mode=True, short_entry_window_minutes=10)
+            st_resumed = notifier.process_4h_alert_only(
+                [res_ada], dual_mode=True, long_entry_window_minutes=5, short_entry_window_minutes=10, long_min_profit_pct=300.0
+            )
             self.assertEqual(st_resumed["long"], 1)
+
+    def test_1h_long_no_trailing_tp_breakeven_and_real_sell_exit(self) -> None:
+        import time as _time
+        with tempfile.TemporaryDirectory() as tmp:
+            trader = BinanceTrader(
+                api_key="k",
+                api_secret="s",
+                market="papi",
+                min_usd=150.0,
+                max_usd=250.0,
+                leverage=20,
+                max_leverage=20,
+                stop_loss_pct=1.5,
+                trailing_trigger_pct=2.0,
+                trailing_callback_pct=0.3,
+                trailing_floor_pct=1.7,
+                symbol_stop_cooldown_minutes=0,
+                state_file=Path(tmp) / "trade_state.json",
+            )
+            trader._filters_cache = {
+                "ETHUSDT": {"stepSize": 0.01, "minQty": 0.01, "minNotional": 5.0, "tickSize": 0.01},
+                "XRPUSDT": {"stepSize": 1.0, "minQty": 1.0, "minNotional": 5.0, "tickSize": 0.0001},
+            }
+            trader.get_free_usdt = lambda: 500.0  # type: ignore[method-assign]
+            trader.get_live_open_positions = lambda: {}  # type: ignore[method-assign]
+
+            last_price = {"p": 100.0}
+            placed_stops: list[tuple[str, float]] = []
+
+            def fake_signed(method: str, path: str, params=None):
+                if path == "/papi/v1/um/order":
+                    return {
+                        "orderId": 321,
+                        "avgPrice": str(last_price["p"]),
+                        "executedQty": params["quantity"],
+                    }
+                if path == "/papi/v1/um/algo/order":
+                    placed_stops.append((params["symbol"], float(params["triggerPrice"])))
+                    return {"algoId": 654}
+                return {}
+
+            trader._signed_request = fake_signed  # type: ignore[method-assign]
+            notifier = TelegramNotifier("tok", "chat", Path(tmp) / "alert.json")
+            sent: list[str] = []
+            notifier.send_text = lambda text: sent.append(text) or True  # type: ignore[method-assign]
+
+            now_ms = int(_time.time() * 1000)
+            bar1_open = 1_700_000_000_000
+            ev_entry = SystemEvaluation(
+                bar_open_time=bar1_open,
+                bar_close_time=now_ms + 3 * 60_000,
+                price=100.0,
+                cond1_buy=True, cond2_buy=True, cond3_buy=True, cond4_buy=True, cond5_buy=True,
+                trend_ok=True, first_three_buy=True, all_five_buy=True,
+                green_trigger=True, orange_trigger=True, exit_trigger=False,
+                exit_reason=None, exit_price=None, exit_trade_pct=None,
+                in_green_pos=True, in_orange_pos=True, be_locked=False,
+                entry_price=100.0, tp_level=106.0, sl_level=96.0, next_res=106.0, prev_sup=96.0,
+                total_trades=40, win_trades=28, win_rate=70.0, total_profit_pct=350.0,
+            )
+            res_eth = Coin4hResult("ETHUSDT", "papi", 100.0, 4.0, 200_000_000.0, ev_entry, timeframe="1h")
+            st_open = notifier.process_4h_alert_only(
+                [res_eth], trader=trader, dual_mode=True, long_entry_window_minutes=5, long_min_profit_pct=300.0
+            )
+            self.assertEqual(st_open["orders_opened"], 1)
+            pos = trader._state["open_positions"]["ETHUSDT"]
+            self.assertFalse(pos["use_trailing"])
+            self.assertAlmostEqual(pos["tp_price"], 106.0, places=2)
+            self.assertAlmostEqual(pos["sl_price"], 98.5, places=2)  # -1.5% normal stop
+
+            # Pullback from +2.2% (102.2) to +1.6% (101.6) must NOT close via trailing!
+            self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 102.2})), 0)
+            self.assertFalse(trader._state["open_positions"]["ETHUSDT"]["trailing_active"])
+            self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 101.6})), 0)
+            self.assertIn("ETHUSDT", trader._state["open_positions"])
+
+            # Reaching +2.6% (102.6) activates Pine +2.5% break-even lock at 100.30 (+0.30%), still open!
+            self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 102.6})), 0)
+            self.assertTrue(trader._state["open_positions"]["ETHUSDT"]["be_locked"])
+            self.assertAlmostEqual(trader._state["open_positions"]["ETHUSDT"]["sl_price"], 100.3, places=2)
+            self.assertEqual(placed_stops[-1], ("ETHUSDT", 100.3))
+
+            # Next 1H bar triggers Pine 'SAT' (real_sell_cond=True) -> closes position even if paused!
+            notifier.set_paused(True, trader)
+            last_price["p"] = 103.5
+            ev_sell = SystemEvaluation(
+                **{
+                    **ev_entry.__dict__,
+                    "bar_open_time": bar1_open + 3600_000,
+                    "price": 103.5,
+                    "green_trigger": False,
+                    "orange_trigger": False,
+                    "real_sell_cond": True,
+                }
+            )
+            res_eth_sell = Coin4hResult("ETHUSDT", "papi", 103.5, 5.0, 200_000_000.0, ev_sell, timeframe="1h")
+            st_close = notifier.process_4h_alert_only(
+                [res_eth_sell], trader=trader, dual_mode=True, long_entry_window_minutes=5, long_min_profit_pct=300.0
+            )
+            self.assertEqual(st_close["orders_closed"], 1)
+            self.assertNotIn("ETHUSDT", trader._state["open_positions"])
+            self.assertIn("SAT (1S İndikatör Çıkışı)", sent[-1])
+
+            # Resistance TP test: hits tp_price=1.06 -> closes with KÂR AL (Direnç)
+            notifier.set_paused(False, trader)
+            last_price["p"] = 1.00
+            trader.open_position(
+                "XRPUSDT", price=1.00, target_usd=200.0, tp_price=1.06, side="LONG", use_trailing=False, be_trigger_pct=2.5
+            )
+            last_price["p"] = 1.062
+            tp_evs = trader.manage_open_positions({"XRPUSDT": 1.062})
+            self.assertEqual(len(tp_evs), 1)
+            self.assertEqual(tp_evs[0]["reason"], "KÂR AL (Direnç)")
+            self.assertGreater(tp_evs[0]["pnl_usd"], 0)
+
+    def test_resample_1h_to_4h_preserves_true_4h_close_time(self) -> None:
+        h1_ms = 3600 * 1000
+        h4_ms = 4 * h1_ms
+        bucket_start = (1_700_000_000_000 // h4_ms) * h4_ms
+        # Only 1st hour of the new 4H candle exists -> close_time of 4H bar must still be bucket_start + 4h - 1
+        df_1h = pd.DataFrame(
+            {
+                "open_time": [bucket_start - h1_ms, bucket_start],
+                "open": [100.0, 101.0],
+                "high": [102.0, 103.0],
+                "low": [99.0, 100.5],
+                "close": [101.0, 102.5],
+                "volume": [1000.0, 500.0],
+                "close_time": [bucket_start - 1, bucket_start + h1_ms - 1],
+            }
+        )
+        df_4h = resample_1h_to_4h(df_1h)
+        self.assertEqual(int(df_4h["open_time"].iloc[-1]), bucket_start)
+        self.assertEqual(int(df_4h["close_time"].iloc[-1]), bucket_start + h4_ms - 1)
 
 
 if __name__ == "__main__":

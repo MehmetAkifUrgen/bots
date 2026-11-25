@@ -319,16 +319,19 @@ class Binance4hScanner:
         sym = coin["symbol"]
         if interval == "1h":
             df_1h = self.fetch_klines_cached(
-                sym, interval="1h", initial_limit=1500, pages=1, max_rows=1500
+                sym, interval="1h", initial_limit=1500, pages=4, max_rows=5000
+            )
+            df_1m = self.fetch_klines_cached(
+                sym, interval="1M", initial_limit=24, pages=1, max_rows=30
             )
             ev_1h = evaluate_4h_system(
-                df_1h, df_1m=None, pivot_len=7, be_trigger_pct=2.5, ema200_filter=False
+                df_1h, df_1m=df_1m, pivot_len=7, be_trigger_pct=2.5, ema200_filter=False
             )
             if ev_1h is None:
                 return None
             df_4h = resample_1h_to_4h(df_1h)
             ev_4h = evaluate_4h_system(
-                df_4h, df_1m=None, pivot_len=7, be_trigger_pct=2.5, ema200_filter=False
+                df_4h, df_1m=df_1m, pivot_len=7, be_trigger_pct=2.5, ema200_filter=False
             )
             prev_chg_24h = 0.0
             if len(df_1h) >= 49:

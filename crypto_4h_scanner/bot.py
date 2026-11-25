@@ -90,8 +90,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--poll-seconds",
         type=int,
-        default=int(os.getenv("POLL_SECONDS", "120")),
-        help="Taramalar arası bekleme süresi saniye (varsayılan: 120)",
+        default=int(os.getenv("POLL_SECONDS", "60")),
+        help="Taramalar arası bekleme süresi saniye (varsayılan: 60)",
     )
     p.add_argument(
         "--workers",
@@ -268,20 +268,30 @@ def main() -> None:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] İlk senkron hatası: {exc}")
         _start_position_monitor(trader, notifier, dry_run=args.dry_run, interval_sec=2)
 
+    long_window_min = int(os.getenv("LONG_ENTRY_WINDOW_MINUTES", "5"))
+    short_window_min = int(os.getenv("SHORT_ENTRY_WINDOW_MINUTES", "10"))
+    long_min_profit = float(os.getenv("LONG_MIN_PROFIT_PCT", "300.0"))
+    effective_poll = (
+        min(args.poll_seconds, 60)
+        if (0 < long_window_min <= 5)
+        else args.poll_seconds
+    )
+
     trade_mode_str = (
-        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, Pivot TP/SL, +%2.5 Kâr Kilidi)"
+        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, LONG: 1S Direnç/SAT, SHORT: 4S Trailing)"
         if trader
         else "KAPALI (Sadece Bildirim)"
     )
     print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] 4S (4H) Otomatik Al-Sat Botu başlatıldı | "
+        f"[{datetime.now().strftime('%H:%M:%S')}] Hibrit 1S-LONG / 4S-SHORT Botu başlatıldı | "
         f"Piyasa={args.market.upper()} | OtoAlım={trade_mode_str} | "
-        f"Filtre=WR>={args.min_win_rate:g}% & Getiri>={args.min_profit_pct:g}% | Periyot={args.poll_seconds}sn"
+        f"LONG=1S 5/5 (Getiri>=%{long_min_profit:g}, Son {long_window_min}dk) | "
+        f"SHORT=4S 5/5+EMA200 (Son {short_window_min}dk) | Periyot={effective_poll}sn"
     )
 
-    scan_interval = os.getenv("SCAN_INTERVAL", "4h").strip().lower()
+    scan_interval = os.getenv("SCAN_INTERVAL", "1h").strip().lower()
     if scan_interval not in ("1h", "4h"):
-        scan_interval = "4h"
+        scan_interval = "1h"
 
     while True:
         try:
@@ -293,7 +303,6 @@ def main() -> None:
                 interval=scan_interval,
             )
             entry_window_min = int(os.getenv("ENTRY_WINDOW_MINUTES", "0"))
-            short_window_min = int(os.getenv("SHORT_ENTRY_WINDOW_MINUTES", "10"))
             short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "0"))
             stats = notifier.process_4h_alert_only(
                 results,
@@ -303,11 +312,17 @@ def main() -> None:
                 trader=trader,
                 dual_mode=True,
                 entry_window_minutes=entry_window_min,
+                long_entry_window_minutes=long_window_min,
                 short_entry_window_minutes=short_window_min,
                 short_top_gainers=short_top_n,
+                long_min_profit_pct=long_min_profit,
             )
 
-            long_now = sum(1 for r in results if (r.long_evaluation or r.evaluation).long_3_trigger)
+            long_now = sum(
+                1
+                for r in results
+                if r.evaluation.orange_trigger and r.evaluation.total_profit_pct >= long_min_profit
+            )
             short_now = sum(1 for r in results if (r.long_evaluation or r.evaluation).short_5_trigger)
 
             _HEALTH_STATE.update(
@@ -322,8 +337,9 @@ def main() -> None:
             paused_tag = " [DURDURULDU]" if notifier.is_paused(trader) else ""
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
-                f"[4S ÇİFT YÖN]{paused_tag} Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
-                f"LONG(3/5 Anlık): {long_now}, SHORT(5/5 Son {short_window_min}dk): {short_now} | "
+                f"[1S-LONG / 4S-SHORT]{paused_tag} Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
+                f"LONG(1S 5/5 >=%{long_min_profit:g} Son {long_window_min}dk): {long_now}, "
+                f"SHORT(4S 5/5 Son {short_window_min}dk): {short_now} | "
                 f"Emir -> Açılan: {stats['orders_opened']}, Kapanan: {stats['orders_closed']}"
             )
             if stats["errors"]:
@@ -340,7 +356,7 @@ def main() -> None:
 
         if args.once:
             break
-        time.sleep(max(30, args.poll_seconds))
+        time.sleep(max(30, effective_poll))
 
 
 if __name__ == "__main__":

@@ -50,6 +50,7 @@ class SystemEvaluation:
     short_any4_trigger: bool = False
     long_3_trigger: bool = False
     short_rev_trigger: bool = False
+    real_sell_cond: bool = False
 
 
 def wilder_rsi(closes: pd.Series, length: int = 14) -> pd.Series:
@@ -393,6 +394,7 @@ def evaluate_4h_system(
     last_short_any2_trig = False
     last_short_any4_trig = False
     last_short_rev_trig = False
+    last_real_sell = False
     prev_all5_up_strict = False
     prev_first3_up = False
     prev_all5_dn_strict = False
@@ -587,6 +589,7 @@ def evaluate_4h_system(
             last_short_any2_trig = any2_dn and (not prev_any2_dn) and last_ema200_bear
             last_short_any4_trig = any4_dn and (not prev_any4_dn) and last_ema200_bear
             last_short_rev_trig = rev_dn and (not prev_rev_dn)
+            last_real_sell = real_sell
             last_fib_p, last_fib_r1, last_fib_r2, last_fib_s1, last_fib_s2 = (
                 fib_p,
                 fib_r1,
@@ -678,6 +681,7 @@ def evaluate_4h_system(
         short_any4_trigger=last_short_any4_trig,
         long_3_trigger=last_long_3_trig,
         short_rev_trigger=last_short_rev_trig,
+        real_sell_cond=last_real_sell,
     )
 
 
@@ -1409,20 +1413,18 @@ def resample_1h_to_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
 
     df = df_1h.sort_values("open_time").reset_index(drop=True).copy()
     df["_bucket"] = (df["open_time"].astype("int64") // _4H_MS) * _4H_MS
-    grouped = (
-        df.groupby("_bucket", sort=True, as_index=False)
-        .agg(
-            open_time=("open_time", "first"),
-            open=("open", "first"),
-            high=("high", "max"),
-            low=("low", "min"),
-            close=("close", "last"),
-            volume=("volume", "sum"),
-            close_time=("close_time", "last"),
-        )
-        .drop(columns=["_bucket"])
+    grouped = df.groupby("_bucket", sort=True, as_index=False).agg(
+        open_time=("open_time", "first"),
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+        close_time=("close_time", "last"),
     )
-    return grouped
+    grouped["open_time"] = grouped["_bucket"].astype("int64")
+    grouped["close_time"] = grouped["_bucket"].astype("int64") + _4H_MS - 1
+    return grouped.drop(columns=["_bucket"])
 
 
 def _scalp_res_45m(
