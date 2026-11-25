@@ -750,7 +750,7 @@ class BinanceTrader:
                     "peak_price": ep,
                     "trailing_active": False,
                     "use_trailing": pos_side != "LONG",
-                    "be_trigger_pct": 0.0,
+                    "be_trigger_pct": 2.5 if pos_side == "LONG" else 0.0,
                     "be_locked": False,
                     "entry_bar_open_time": 0,
                     "opened_at": int(time.time()),
