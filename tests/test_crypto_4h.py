@@ -723,23 +723,39 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 101.6})), 0)
             self.assertIn("ETHUSDT", trader._state["open_positions"])
 
-            # Reaching +2.6% (102.6) activates Pine +2.5% break-even lock at 100.30 (+0.30%), still open!
-            self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 102.6})), 0)
-            self.assertTrue(trader._state["open_positions"]["ETHUSDT"]["be_locked"])
-            self.assertAlmostEqual(trader._state["open_positions"]["ETHUSDT"]["sl_price"], 100.3, places=2)
-            self.assertEqual(placed_stops[-1], ("ETHUSDT", 100.3))
+            # Reaching +3.1% (103.1) and pulling back to +0.1% (100.1) must NOT trigger break-even or trailing!
+            self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 103.1})), 0)
+            self.assertFalse(trader._state["open_positions"]["ETHUSDT"]["be_locked"])
+            self.assertAlmostEqual(trader._state["open_positions"]["ETHUSDT"]["sl_price"], 98.5, places=2)
+            self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 100.1})), 0)
+            self.assertIn("ETHUSDT", trader._state["open_positions"])
 
-            # Next 1H bar triggers Pine 'SAT' (real_sell_cond=True) -> closes position even if paused!
-            notifier.set_paused(True, trader)
-            last_price["p"] = 103.5
-            ev_sell = SystemEvaluation(
+            # Mid-hour (35m left before 1H close) real_sell_cond wick must NOT close early
+            ev_sell_mid = SystemEvaluation(
                 **{
                     **ev_entry.__dict__,
                     "bar_open_time": bar1_open + 3600_000,
+                    "bar_close_time": now_ms + 35 * 60_000,
                     "price": 103.5,
                     "green_trigger": False,
                     "orange_trigger": False,
                     "real_sell_cond": True,
+                }
+            )
+            res_eth_mid = Coin4hResult("ETHUSDT", "papi", 103.5, 5.0, 200_000_000.0, ev_sell_mid, timeframe="1h")
+            st_mid_sell = notifier.process_4h_alert_only(
+                [res_eth_mid], trader=trader, dual_mode=True, long_entry_window_minutes=5, long_min_profit_pct=300.0
+            )
+            self.assertEqual(st_mid_sell["orders_closed"], 0)
+            self.assertIn("ETHUSDT", trader._state["open_positions"])
+
+            # Last 5m of 1H bar (3m left) with real_sell_cond=True -> closes position even if paused!
+            notifier.set_paused(True, trader)
+            last_price["p"] = 103.5
+            ev_sell = SystemEvaluation(
+                **{
+                    **ev_sell_mid.__dict__,
+                    "bar_close_time": now_ms + 3 * 60_000,
                 }
             )
             res_eth_sell = Coin4hResult("ETHUSDT", "papi", 103.5, 5.0, 200_000_000.0, ev_sell, timeframe="1h")
@@ -754,7 +770,7 @@ class TestBinanceTrader(unittest.TestCase):
             notifier.set_paused(False, trader)
             last_price["p"] = 1.00
             trader.open_position(
-                "XRPUSDT", price=1.00, target_usd=200.0, tp_price=1.06, side="LONG", use_trailing=False, be_trigger_pct=2.5
+                "XRPUSDT", price=1.00, target_usd=200.0, tp_price=1.06, side="LONG", use_trailing=False, be_trigger_pct=0.0
             )
             last_price["p"] = 1.062
             tp_evs = trader.manage_open_positions({"XRPUSDT": 1.062})

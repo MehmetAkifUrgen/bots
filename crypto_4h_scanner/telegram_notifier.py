@@ -181,7 +181,7 @@ def format_dual_4h_message(
             f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
             f"🎯 <b>Kâr Al (Direnç):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
             f"🛑 <b>Stop (-%{stop_loss_pct:g}):</b> <code>{fmt_price(sl)}</code>\n"
-            f"🔒 <b>Çıkış Kuralı:</b> Direnç Kâr Al veya İndikatör SAT (+%2.5'te +%0.30 Kâr Kilidi, Trailing Yok)\n"
+            f"🔒 <b>Çıkış Kuralı:</b> Direnç Kâr Al veya 1S Kapanışta SAT Sinyali (Kâr Kilidi / Trailing Yok)\n"
             f"📈 <b>{tf_short} Backtest:</b> <b>%{ev.win_rate:.1f} Başarı</b> ({ev.win_trades}/{ev.total_trades}) | <b>Getiri: %{ev.total_profit_pct:+.1f}</b>\n"
             f"{trade_block}"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -652,6 +652,14 @@ class TelegramNotifier:
             "errors": [],
         }
 
+        now_ms = int(time.time() * 1000)
+        eff_long_min = (
+            long_entry_window_minutes
+            if long_entry_window_minutes is not None
+            else entry_window_minutes
+        )
+        long_win_ms = max(0, eff_long_min) * 60 * 1000
+
         if trader and trader.is_configured and not dry_run:
             price_map = {r.symbol: r.price for r in results}
             try:
@@ -665,7 +673,7 @@ class TelegramNotifier:
             except Exception as exc:
                 stats["errors"].append(f"MANAGE_POS: {exc}")
 
-            # Pine Script 'SAT' (realSellCond) exit check for open 1H LONG positions (runs even when paused)
+            # Pine Script 'SAT' (realSellCond) exit check for open 1H LONG positions (last 5m of 1H bar, runs even when paused)
             for res in results:
                 pos = trader._state.get("open_positions", {}).get(res.symbol)
                 if not pos:
@@ -673,8 +681,13 @@ class TelegramNotifier:
                 if str(pos.get("side") or "LONG").upper() == "LONG" and not pos.get("use_trailing", True):
                     ev_1h = res.evaluation
                     entry_bar_ts = int(pos.get("entry_bar_open_time") or 0)
+                    in_close_win = True
+                    if long_win_ms > 0 and ev_1h.bar_close_time > 0:
+                        rem_sell_ms = ev_1h.bar_close_time - now_ms
+                        in_close_win = -60_000 <= rem_sell_ms <= long_win_ms
                     if (
-                        ev_1h.real_sell_cond
+                        in_close_win
+                        and ev_1h.real_sell_cond
                         and ev_1h.bar_open_time > entry_bar_ts
                         and not ev_1h.orange_trigger
                         and not ev_1h.green_trigger
@@ -711,13 +724,6 @@ class TelegramNotifier:
             return stats
 
         if dual_mode:
-            now_ms = int(time.time() * 1000)
-            eff_long_min = (
-                long_entry_window_minutes
-                if long_entry_window_minutes is not None
-                else entry_window_minutes
-            )
-            long_win_ms = max(0, eff_long_min) * 60 * 1000
             eff_short_min = (
                 short_entry_window_minutes
                 if short_entry_window_minutes is not None
@@ -779,7 +785,7 @@ class TelegramNotifier:
                                 sl_price=None,
                                 side="LONG",
                                 use_trailing=False,
-                                be_trigger_pct=2.5,
+                                be_trigger_pct=0.0,
                                 entry_bar_open_time=ev.bar_open_time,
                             )
                         else:
