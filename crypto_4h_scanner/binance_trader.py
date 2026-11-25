@@ -110,6 +110,7 @@ class BinanceTrader:
                     data.setdefault("consecutive_stops", 0)
                     data.setdefault("cooldown_until", 0)
                     data.setdefault("symbol_cooldowns", {})
+                    data.setdefault("paused", False)
                     return data
             except Exception:
                 pass
@@ -118,7 +119,17 @@ class BinanceTrader:
             "consecutive_stops": 0,
             "cooldown_until": 0,
             "symbol_cooldowns": {},
+            "paused": False,
         }
+
+    def is_paused(self) -> bool:
+        with self._lock:
+            return bool(self._state.get("paused", False))
+
+    def set_paused(self, paused: bool) -> None:
+        with self._lock:
+            self._state["paused"] = bool(paused)
+            self._save_state()
 
     def is_symbol_in_cooldown(self, symbol: str) -> bool:
         if self.symbol_stop_cooldown_minutes <= 0:
@@ -357,7 +368,7 @@ class BinanceTrader:
         pos_side: Literal["LONG", "SHORT"] = "SHORT" if str(side).upper() == "SHORT" else "LONG"
         if pos_side == "SHORT" and not self._is_um_futures():
             return None
-        if self.is_in_cooldown() or self.is_symbol_in_cooldown(symbol):
+        if self.is_paused() or self.is_in_cooldown() or self.is_symbol_in_cooldown(symbol):
             return None
         live_open = self.get_live_open_positions()
         tracked = self._state["open_positions"]

@@ -569,61 +569,47 @@ class TestBinanceTrader(unittest.TestCase):
                 in_green_pos=False, in_orange_pos=False, be_locked=False,
                 entry_price=None, tp_level=None, sl_level=None, next_res=105.0, prev_sup=95.0,
                 total_trades=10, win_trades=5, win_rate=50.0, total_profit_pct=10.0,
-                ema200_bear=True, first_three_sell=True, short_rev_trigger=True,
+                ema200_bear=True, all_five_sell=True, short_5_trigger=True,
             )
-            res_mid = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_mid, timeframe="1h")
-            # Immediate entry (default entry_window_minutes=0) fires right away mid-candle!
-            st1 = notifier.process_4h_alert_only([res_mid], dual_mode=True, entry_window_minutes=0)
+            res_mid = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_mid, timeframe="4h")
+            # With short_entry_window_minutes=10, mid-candle (3h left) SHORT is blocked!
+            st0 = notifier.process_4h_alert_only([res_mid], dual_mode=True, short_entry_window_minutes=10)
+            self.assertEqual(st0["short"], 0)
+
+            # Inside final 10 minutes (8m left) -> SHORT 5/5 + EMA200 fires!
+            ev_last10 = SystemEvaluation(**{**ev_mid.__dict__, "bar_close_time": now_ms + 8 * 60_000})
+            res_last10 = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_last10, timeframe="4h")
+            st1 = notifier.process_4h_alert_only([res_last10], dual_mode=True, short_entry_window_minutes=10)
             self.assertEqual(st1["short"], 1)
             self.assertEqual(len(sent), 1)
-            self.assertIn("SHORT (5/5 AL → 2/5 SAT)", sent[0])
-            self.assertNotIn("Fiyat < 1S", sent[0])
-            self.assertIn("Fiyat &lt; 1S", sent[0])
+            self.assertIn("SHORT 5/5 + EMA200", sent[0])
+            self.assertNotIn("Fiyat < 4S", sent[0])
+            self.assertIn("Fiyat &lt; 4S", sent[0])
 
-            # Optional 15m close-window gate still blocks mid-candle if explicitly enabled
-            res_eth = Coin4hResult("ETHUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_mid, timeframe="1h")
-            st2 = notifier.process_4h_alert_only([res_eth], dual_mode=True, entry_window_minutes=15)
-            self.assertEqual(st2["short"], 0)
-
-            # Hybrid mode: LONG uses 4H long_evaluation even when base timeframe is 1h
+            # LONG 3/5 + EMA200 still fires immediately mid-candle (entry_window_minutes=0)
             ev_4h_long = SystemEvaluation(
                 **{
                     **ev_mid.__dict__,
                     "ema200_bear": False,
-                    "first_three_sell": False,
-                    "short_rev_trigger": False,
+                    "all_five_sell": False,
+                    "short_5_trigger": False,
                     "ema200_bull": True,
                     "long_3_trigger": True,
                 }
             )
-            ev_1h_flat = SystemEvaluation(
-                **{
-                    **ev_mid.__dict__,
-                    "ema200_bear": False,
-                    "first_three_sell": False,
-                    "short_rev_trigger": False,
-                }
-            )
-            res_sol = Coin4hResult(
-                "SOLUSDT", "papi", 100.0, 3.0, 100_000_000.0, ev_1h_flat, timeframe="1h", long_evaluation=ev_4h_long
-            )
-            st3 = notifier.process_4h_alert_only([res_sol], dual_mode=True, entry_window_minutes=0)
+            res_sol = Coin4hResult("SOLUSDT", "papi", 100.0, 3.0, 100_000_000.0, ev_4h_long, timeframe="4h")
+            st3 = notifier.process_4h_alert_only([res_sol], dual_mode=True, entry_window_minutes=0, short_entry_window_minutes=10)
             self.assertEqual(st3["long"], 1)
             self.assertIn("[4S ÇİFT YÖN] LONG 3/5 + EMA200", sent[-1])
 
-            # Today's Top-30 gainers filter applies ONLY to SHORT (yesterday's gainers excluded)
-            gainers = [
-                Coin4hResult(f"G{i}USDT", "papi", 10.0, float(50 - i), 50_000_000.0, ev_1h_flat, timeframe="1h")
-                for i in range(30)
-            ]
-            # 31st coin outside today's Top 30 (even if prev_change_24h was huge) -> MUST be skipped
-            low_coin = Coin4hResult("LOWUSDT", "papi", 10.0, -3.0, 50_000_000.0, ev_mid, timeframe="1h", prev_change_24h=40.0)
-            st4 = notifier.process_4h_alert_only(gainers + [low_coin], dual_mode=True, short_top_gainers=30)
-            self.assertEqual(st4["short"], 0)
-            # Coin inside today's Top 30 (+35% today) -> MUST trigger SHORT
-            top_coin = Coin4hResult("TOPUSDT", "papi", 10.0, 35.0, 50_000_000.0, ev_mid, timeframe="1h")
-            st5 = notifier.process_4h_alert_only(gainers + [top_coin], dual_mode=True, short_top_gainers=30)
-            self.assertEqual(st5["short"], 1)
+            # Pause (/durdur) blocks new entries; Resume (/baslat) re-enables them
+            notifier.set_paused(True)
+            res_ada = Coin4hResult("ADAUSDT", "papi", 1.0, 3.0, 100_000_000.0, ev_4h_long, timeframe="4h")
+            st_paused = notifier.process_4h_alert_only([res_ada], dual_mode=True, short_entry_window_minutes=10)
+            self.assertEqual(st_paused["long"], 0)
+            notifier.set_paused(False)
+            st_resumed = notifier.process_4h_alert_only([res_ada], dual_mode=True, short_entry_window_minutes=10)
+            self.assertEqual(st_resumed["long"], 1)
 
 
 if __name__ == "__main__":

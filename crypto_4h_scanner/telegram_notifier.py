@@ -148,7 +148,7 @@ def format_dual_4h_message(
     header = (
         f"🟢 <b>[{tf_short} ÇİFT YÖN] LONG 3/5 + EMA200</b>"
         if is_long
-        else f"🔴 <b>[{tf_short} ÇİFT YÖN] SHORT (5/5 AL → 2/5 SAT)</b>"
+        else f"🔴 <b>[{tf_short} ÇİFT YÖN] SHORT 5/5 + EMA200</b>"
     )
     entry = trade_exec.price if trade_exec else res.price
     sl = (
@@ -172,12 +172,9 @@ def format_dual_4h_message(
     trend_line = (
         f"Fiyat &gt; {tf_short} EMA200 (Yükseliş)"
         if is_long
-        else (
-            f"Fiyat &lt; {tf_short} EMA200 (Tepe Dönüşü + Düşüş Trendi)"
-            if ev.ema200_bear
-            else f"Tepe Dönüşü ({tf_short} EMA200 Üstü)"
-        )
+        else f"Fiyat &lt; {tf_short} EMA200 (Düşüş — Son 10dk Kapanış Onayı)"
     )
+    timing_tag = "Anlık Giriş" if is_long else "Son 10dk Mum Kapanışı"
     return (
         f"{header}\n"
         f"🪙 <b>{res.symbol}</b> | <code>{tf_label}</code>\n"
@@ -189,7 +186,7 @@ def format_dual_4h_message(
         f"{trade_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💧 <b>24s Hacim:</b> {fmt_vol(res.volume_24h_usdt)} | 24s: {res.change_24h:+.2f}%\n"
-        f"🕒 <i>Mum: {bar_dt} (Anlık Giriş)</i>"
+        f"🕒 <i>Mum: {bar_dt} ({timing_tag})</i>"
     )
 
 
@@ -305,10 +302,22 @@ class TelegramNotifier:
                 if isinstance(data, dict):
                     data.setdefault("sent_alerts", {})
                     data.setdefault("tracked_positions", {})
+                    data.setdefault("paused", False)
                     return data
             except Exception:
                 pass
-        return {"sent_alerts": {}, "tracked_positions": {}}
+        return {"sent_alerts": {}, "tracked_positions": {}, "paused": False}
+
+    def is_paused(self, trader: BinanceTrader | None = None) -> bool:
+        if trader is not None and trader.is_paused():
+            return True
+        return bool(self._state.get("paused", False))
+
+    def set_paused(self, paused: bool, trader: BinanceTrader | None = None) -> None:
+        self._state["paused"] = bool(paused)
+        self._save_state()
+        if trader is not None:
+            trader.set_paused(paused)
 
     def _save_state(self) -> None:
         sent = self._state["sent_alerts"]
@@ -359,8 +368,8 @@ class TelegramNotifier:
         return any_ok
 
     def poll_commands(self, trader: BinanceTrader | None) -> None:
-        """Handle simple Telegram commands (/devam, /durum) from authorized chats."""
-        if not self.bot_token or not self.chat_ids or trader is None:
+        """Handle Telegram commands (/durdur, /baslat, /devam, /durum) from authorized chats."""
+        if not self.bot_token or not self.chat_ids:
             return
         url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
         params: dict = {"timeout": 0, "limit": 10}
@@ -381,19 +390,41 @@ class TelegramNotifier:
             chat_id = str((msg.get("chat") or {}).get("id", ""))
             if chat_id not in self.chat_ids:
                 continue
-            text = str(msg.get("text") or "").strip().lower()
-            if text in ("/devam", "/reset", "/mola_iptal"):
-                trader.reset_cooldown()
-                self.send_text("▶️ <b>Mola iptal edildi!</b> Stop sayacı sıfırlandı, yeni 5/5 sinyallerde işlem açılmaya devam edilecek.")
-            elif text == "/durum":
-                open_syms = list(trader._state.get("open_positions", {}).keys())
-                stops = int(trader._state.get("consecutive_stops", 0))
-                cd = f"Aktif ({trader.cooldown_remaining_min()} dk kaldı)" if trader.is_in_cooldown() else "Kapalı"
+            raw_text = str(msg.get("text") or "").strip().lower()
+            cmd = raw_text.split()[0].split("@")[0] if raw_text else ""
+            if cmd in ("/durdur", "/stop", "/kapat", "/duraklat", "/pause"):
+                self.set_paused(True, trader)
                 self.send_text(
-                    f"📊 <b>Bot Durumu</b>\n"
+                    "⏸️ <b>Bot DURDURULDU!</b>\n"
+                    "• Yeni LONG/SHORT pozisyon ve sinyal açılmayacak.\n"
+                    "• Açık pozisyon varsa stop ve trailing koruması çalışmaya devam eder.\n"
+                    "▶️ Tekrar açmak için: <code>/baslat</code>"
+                )
+            elif cmd in ("/baslat", "/başlat", "/ac", "/aç", "/aktif", "/calistir", "/devam", "/reset", "/mola_iptal"):
+                self.set_paused(False, trader)
+                if trader is not None:
+                    trader.reset_cooldown()
+                self.send_text(
+                    "▶️ <b>Bot AKTİF edildi!</b>\n"
+                    "• Yeni sinyallerde otomatik işlem ve bildirim devam ediyor.\n"
+                    "⏸️ Durdurmak için: <code>/durdur</code>"
+                )
+            elif cmd in ("/durum", "/status", "/komutlar", "/yardim", "/help"):
+                paused = self.is_paused(trader)
+                state_badge = "⏸️ DURDURULDU" if paused else "🟢 AKTİF"
+                open_syms = list(trader._state.get("open_positions", {}).keys()) if trader else []
+                stops = int(trader._state.get("consecutive_stops", 0)) if trader else 0
+                max_s = trader.max_consecutive_stops if trader else 3
+                cd = (
+                    f"Aktif ({trader.cooldown_remaining_min()} dk kaldı)"
+                    if (trader and trader.is_in_cooldown())
+                    else "Kapalı"
+                )
+                self.send_text(
+                    f"📊 <b>Bot Durumu:</b> <b>{state_badge}</b>\n"
                     f"• Açık Pozisyonlar: <code>{', '.join(open_syms) if open_syms else 'YOK'}</code>\n"
-                    f"• Art Arda Stop Sayacı: <b>{stops}/{trader.max_consecutive_stops}</b>\n"
-                    f"• Mola: <b>{cd}</b>"
+                    f"• Art Arda Stop Sayacı: <b>{stops}/{max_s}</b> | Mola: <b>{cd}</b>\n"
+                    f"• Komutlar: <code>/durdur</code> | <code>/baslat</code> | <code>/durum</code>"
                 )
 
     def _try_open_trade(
@@ -589,7 +620,8 @@ class TelegramNotifier:
         trader: BinanceTrader | None = None,
         dual_mode: bool = True,
         entry_window_minutes: int = 0,
-        short_top_gainers: int = 30,
+        short_entry_window_minutes: int | None = None,
+        short_top_gainers: int = 0,
     ) -> dict:
         """Process 4H signals: LONG on 5/5 + EMA200, SHORT on 3/5 + EMA200 (immediate entry)."""
         sent_alerts: dict[str, int] = self._state["sent_alerts"]
@@ -616,9 +648,14 @@ class TelegramNotifier:
             except Exception as exc:
                 stats["errors"].append(f"MANAGE_POS: {exc}")
 
+        if self.is_paused(trader):
+            return stats
+
         if dual_mode:
             now_ms = int(time.time() * 1000)
-            window_ms = max(0, entry_window_minutes) * 60 * 1000
+            long_win_ms = max(0, entry_window_minutes) * 60 * 1000
+            eff_short_min = short_entry_window_minutes if short_entry_window_minutes is not None else entry_window_minutes
+            short_win_ms = max(0, eff_short_min) * 60 * 1000
             top_gainers: set[str] | None = None
             if short_top_gainers > 0:
                 top_gainers = {
@@ -627,26 +664,32 @@ class TelegramNotifier:
                 }
             for res in results:
                 long_ev = res.long_evaluation or res.evaluation
-                short_ev = res.evaluation
+                short_ev = res.long_evaluation or res.evaluation
                 side: str | None = None
                 ev = short_ev
-                tf_used = res.timeframe
+                tf_used = "4h" if res.long_evaluation is not None else res.timeframe
                 if long_ev.long_3_trigger:
-                    side = "LONG"
-                    ev = long_ev
-                    tf_used = "4h" if res.long_evaluation is not None else res.timeframe
-                elif short_ev.short_rev_trigger and (top_gainers is None or res.symbol in top_gainers):
-                    side = "SHORT"
-                    ev = short_ev
-                    tf_used = res.timeframe
+                    if long_win_ms > 0 and long_ev.bar_close_time > 0:
+                        rem_ms = long_ev.bar_close_time - now_ms
+                        if rem_ms > long_win_ms or rem_ms < -60_000:
+                            pass
+                        else:
+                            side = "LONG"
+                            ev = long_ev
+                    else:
+                        side = "LONG"
+                        ev = long_ev
+                if side is None and short_ev.short_5_trigger and (top_gainers is None or res.symbol in top_gainers):
+                    if short_win_ms > 0 and short_ev.bar_close_time > 0:
+                        rem_ms = short_ev.bar_close_time - now_ms
+                        if -60_000 <= rem_ms <= short_win_ms:
+                            side = "SHORT"
+                            ev = short_ev
+                    else:
+                        side = "SHORT"
+                        ev = short_ev
                 if not side:
                     continue
-
-                # Only enter in the final `entry_window_minutes` of the candle if configured
-                if window_ms > 0 and ev.bar_close_time > 0:
-                    rem_ms = ev.bar_close_time - now_ms
-                    if rem_ms > window_ms or rem_ms < -60_000:
-                        continue
 
                 alert_key = f"4h_dual:{tf_used}:{res.symbol}:{side}:{ev.bar_open_time}"
                 if alert_key in sent_alerts:

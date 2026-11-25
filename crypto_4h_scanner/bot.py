@@ -90,8 +90,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--poll-seconds",
         type=int,
-        default=int(os.getenv("POLL_SECONDS", "180")),
-        help="Taramalar arası bekleme süresi saniye (varsayılan: 180)",
+        default=int(os.getenv("POLL_SECONDS", "120")),
+        help="Taramalar arası bekleme süresi saniye (varsayılan: 120)",
     )
     p.add_argument(
         "--workers",
@@ -279,19 +279,22 @@ def main() -> None:
         f"Filtre=WR>={args.min_win_rate:g}% & Getiri>={args.min_profit_pct:g}% | Periyot={args.poll_seconds}sn"
     )
 
-    scan_interval = os.getenv("SCAN_INTERVAL", "1h").strip().lower()
+    scan_interval = os.getenv("SCAN_INTERVAL", "4h").strip().lower()
     if scan_interval not in ("1h", "4h"):
-        scan_interval = "1h"
+        scan_interval = "4h"
 
     while True:
         try:
+            if trader is None:
+                notifier.poll_commands(None)
             results, errors, duration = scanner.scan_4h_bist_alerts(
                 min_volume_usdt=args.min_volume,
                 limit=args.limit,
                 interval=scan_interval,
             )
             entry_window_min = int(os.getenv("ENTRY_WINDOW_MINUTES", "0"))
-            short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "30"))
+            short_window_min = int(os.getenv("SHORT_ENTRY_WINDOW_MINUTES", "10"))
+            short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "0"))
             stats = notifier.process_4h_alert_only(
                 results,
                 min_win_rate=args.min_win_rate,
@@ -300,35 +303,27 @@ def main() -> None:
                 trader=trader,
                 dual_mode=True,
                 entry_window_minutes=entry_window_min,
+                short_entry_window_minutes=short_window_min,
                 short_top_gainers=short_top_n,
             )
 
             long_now = sum(1 for r in results if (r.long_evaluation or r.evaluation).long_3_trigger)
-            top_syms = {
-                r.symbol
-                for r in sorted(results, key=lambda x: x.change_24h, reverse=True)[:short_top_n]
-            } if short_top_n > 0 else None
-            short_now = sum(
-                1
-                for r in results
-                if r.evaluation.short_rev_trigger and (top_syms is None or r.symbol in top_syms)
-            )
+            short_now = sum(1 for r in results if (r.long_evaluation or r.evaluation).short_5_trigger)
 
             _HEALTH_STATE.update(
                 {
-                    "status": "ok",
+                    "status": "paused" if notifier.is_paused(trader) else "ok",
                     "last_scan_at": datetime.now(timezone.utc).isoformat(),
                     "total_scanned": len(results),
                     "qualifying_coins": long_now + short_now,
                     "last_error": None,
                 }
             )
-            win_lbl = f"Son {entry_window_min}dk" if entry_window_min > 0 else "Anlık Giriş"
-            tf_tag = "HİBRİT 4S-L / 1S-S" if scan_interval == "1h" else "4S ÇİFT YÖN"
+            paused_tag = " [DURDURULDU]" if notifier.is_paused(trader) else ""
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
-                f"[{tf_tag}] Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
-                f"LONG(4S 3/5): {long_now}, SHORT(1S Top{short_top_n}): {short_now} ({win_lbl}) | "
+                f"[4S ÇİFT YÖN]{paused_tag} Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
+                f"LONG(3/5 Anlık): {long_now}, SHORT(5/5 Son {short_window_min}dk): {short_now} | "
                 f"Emir -> Açılan: {stats['orders_opened']}, Kapanan: {stats['orders_closed']}"
             )
             if stats["errors"]:
