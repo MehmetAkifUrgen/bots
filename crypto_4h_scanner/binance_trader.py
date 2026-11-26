@@ -745,12 +745,12 @@ class BinanceTrader:
                     "qty": qty,
                     "notional_usd": round(qty * ep, 2),
                     "sl_price": sl_px,
-                    "tp_price": 0.0,
+                    "tp_price": ep * 0.955 if pos_side == "SHORT" else 0.0,
                     "exchange_sl_price": sl_px,
                     "peak_price": ep,
                     "trailing_active": False,
-                    "use_trailing": pos_side != "LONG",
-                    "be_trigger_pct": 0.0,
+                    "use_trailing": False,
+                    "be_trigger_pct": 1.5 if pos_side == "SHORT" else 0.0,
                     "be_locked": False,
                     "entry_bar_open_time": 0,
                     "opened_at": int(time.time()),
@@ -811,7 +811,11 @@ class BinanceTrader:
         if is_trailing:
             reason = "TRAILING STOP (Binance)"
         elif is_be:
-            reason = "SAT (Binance Kâr Kilidi +%0.30)"
+            reason = (
+                "KAPAT (Binance Kâr Kilidi +%0.40)"
+                if pos_side == "SHORT"
+                else "SAT (Binance Kâr Kilidi +%0.30)"
+            )
         else:
             reason = f"STOP (Binance -%{self.stop_loss_pct:g})"
         if pnl_usd < 0 and not is_trailing and not is_be:
@@ -998,9 +1002,20 @@ class BinanceTrader:
                             else:
                                 reason = f"STOP (-%{self.stop_loss_pct:g})"
                 else:
+                    be_trig = float(pos.get("be_trigger_pct") or 0.0)
+                    if not use_trailing and be_trig > 0 and not pos.get("be_locked") and pnl_pct >= be_trig:
+                        be_sl = entry_px * 0.996
+                        prev_sl = float(pos.get("sl_price") or 0.0)
+                        new_sl = min(prev_sl, be_sl) if prev_sl > 0 else be_sl
+                        pos["be_locked"] = True
+                        pos["sl_price"] = new_sl
+                        state_dirty = True
+                        if curr_price < new_sl and self.place_exchange_stop_loss(sym, new_sl, pos_side="SHORT"):
+                            pos["exchange_sl_price"] = new_sl
+
                     if tp_px > 0 and curr_price <= tp_px:
-                        reason = "KÂR AL (Destek)"
-                    elif trailing_active:
+                        reason = "KÂR AL (-%4.5 Hedef)"
+                    elif use_trailing and trailing_active:
                         floor_sl = entry_px * (1.0 - self.trailing_floor_pct / 100.0)
                         trail_sl = peak_px * (1.0 + self.trailing_callback_pct / 100.0)
                         effective_sl = min(floor_sl, trail_sl)
@@ -1019,7 +1034,10 @@ class BinanceTrader:
                             pos.get("sl_price")
                             or (entry_px * (1.0 + self.stop_loss_pct / 100.0))
                         )
-                        if pnl_pct <= -self.stop_loss_pct or curr_price >= sl_px:
+                        if pos.get("be_locked"):
+                            if curr_price >= sl_px:
+                                reason = "KAPAT (Kâr Kilidi +%0.40)"
+                        elif pnl_pct <= -self.stop_loss_pct or curr_price >= sl_px:
                             reason = f"STOP (-%{self.stop_loss_pct:g})"
 
                 if reason:

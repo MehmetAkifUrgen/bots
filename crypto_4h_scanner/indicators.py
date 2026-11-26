@@ -53,6 +53,36 @@ class SystemEvaluation:
     real_sell_cond: bool = False
 
 
+@dataclass(frozen=True)
+class ShortPeakEvaluation:
+    bar_open_time: int
+    bar_close_time: int
+    prev_bar_open_time: int
+    price: float
+    ema200: float
+    recent_high4: float
+    cond1_dn: bool
+    cond2_dn: bool
+    cond3_dn: bool
+    cond4_dn: bool
+    cond5_dn: bool
+    ema200_reject: bool
+    sharp_peak_reject: bool
+    early_short_cond: bool
+    full_short_cond: bool
+    early_fired: bool
+    full_fired: bool
+    in_short_pos: bool
+    in_full_short_pos: bool
+    be_locked: bool
+    entry_price: float | None
+    tp_level: float | None
+    sl_level: float | None
+    cover_confirmed_prev_bar: bool
+    in_1h_zone: bool = True
+    htf_reason: str = ""
+
+
 def wilder_rsi(closes: pd.Series, length: int = 14) -> pd.Series:
     """Compute RSI using Wilder's Smoothing (RMA), matching TradingView ta.rsi."""
     if len(closes) < length + 1:
@@ -682,6 +712,264 @@ def evaluate_4h_system(
         long_3_trigger=last_long_3_trig,
         short_rev_trigger=last_short_rev_trig,
         real_sell_cond=last_real_sell,
+    )
+
+
+def check_1h_short_zone(
+    df_1h: pd.DataFrame,
+    ema_touch_buffer: float = 2.5,
+    pivot_len: int = 7,
+) -> tuple[bool, str]:
+    """
+    Stage 1 (1H Screening): Check if coin on 1H chart is rejecting from EMA200,
+    7-bar Pivot Resistance, or 1H overbought peak (RSI >= 68 or WT >= 40).
+    """
+    if len(df_1h) < 60:
+        return False, ""
+
+    highs = df_1h["high"].astype(float).reset_index(drop=True)
+    lows = df_1h["low"].astype(float).reset_index(drop=True)
+    closes = df_1h["close"].astype(float).reset_index(drop=True)
+
+    ema200 = pine_ema(closes, 200)
+    rsi_main = wilder_rsi(closes, length=14)
+    wt1, _ = wavetrend(highs, lows, closes, n1=10, n2=21)
+    piv_h, _ = compute_pivots(highs, lows, left=pivot_len, right=pivot_len)
+
+    valid_pivs = piv_h[~np.isnan(piv_h)]
+    last_res = float(valid_pivs[-1]) if len(valid_pivs) > 0 else None
+
+    recent_high4 = float(highs.iloc[-4:].max())
+    curr_close = float(closes.iloc[-1])
+    ema200_val = float(ema200.iloc[-1])
+
+    reasons: list[str] = []
+    if (
+        not np.isnan(ema200_val)
+        and recent_high4 >= ema200_val * (1.0 - ema_touch_buffer / 100.0)
+        and curr_close < ema200_val
+    ):
+        reasons.append("1S EMA200 Reddi")
+
+    if (
+        last_res is not None
+        and recent_high4 >= last_res * 0.99
+        and curr_close <= last_res * 1.005
+    ):
+        reasons.append("1S Direnç Reddi")
+
+    max_rsi5 = float(rsi_main.iloc[-5:].max())
+    max_wt5 = float(wt1.iloc[-5:].max())
+    if (not np.isnan(max_rsi5) and max_rsi5 >= 68.0) or (not np.isnan(max_wt5) and max_wt5 >= 40.0):
+        reasons.append("1S Tepe Şişkinliği (RSI/WT)")
+
+    if reasons:
+        return True, " + ".join(reasons)
+    return False, ""
+
+
+def evaluate_short_15m_system(
+    df_15m: pd.DataFrame,
+    in_1h_zone: bool = True,
+    htf_reason: str = "",
+    ema_len: int = 200,
+    ema_touch_buffer: float = 2.5,
+    max_stop_pct: float = 1.5,
+    be_trigger_pct: float = 1.5,
+) -> ShortPeakEvaluation | None:
+    """
+    Pine Script v5 'Kripto Erken Tepe & EMA200 Reddi SHORT (1S & 15dk)' state machine on 15m.
+    - Fires `early_fired` on the very first reversal label (ERKEN SHORT / direct KESİN SHORT).
+    - Tracks TP (-4.5%), SL (min(recentHigh4*1.002, +max_stop_pct%)), BE lock (+1.5% -> +0.4%),
+      and confirmed-bar `KAPAT (Dönüş)` (`smi > smiEma9 and wt1 > wt2` on closed 15m bar).
+    """
+    if len(df_15m) < 60:
+        return None
+
+    highs = df_15m["high"].astype(float).reset_index(drop=True)
+    lows = df_15m["low"].astype(float).reset_index(drop=True)
+    closes = df_15m["close"].astype(float).reset_index(drop=True)
+    open_times = df_15m["open_time"].astype("int64").reset_index(drop=True)
+
+    k, d = stochastic_rsi(closes, smooth_k=3, smooth_d=3, rsi_length=14, stoch_length=14)
+    rsi_main = wilder_rsi(closes, length=14)
+    rsi_ma = rsi_main.rolling(window=14, min_periods=14).mean()
+    fisher, fisher_trigger = fisher_transform(highs, lows, length=9)
+    wt1, wt2 = wavetrend(highs, lows, closes, n1=10, n2=21)
+    smi, smi_sig, smi_ema9 = stochastic_momentum_index(
+        highs, lows, closes, k_len=10, d_len=3, ema_len=3, ema9_len=9
+    )
+    ema200 = pine_ema(closes, ema_len)
+
+    high4_s = highs.rolling(window=4, min_periods=1).max()
+    rsi5_s = rsi_main.rolling(window=5, min_periods=1).max()
+    wt5_s = wt1.rolling(window=5, min_periods=1).max()
+
+    in_short_pos = False
+    in_full_short_pos = False
+    be_locked = False
+    entry_price: float | None = None
+    tp_level: float | None = None
+    sl_level: float | None = None
+    entry_bar_idx: int | None = None
+
+    last_c1 = last_c2 = last_c3 = last_c4 = last_c5 = False
+    last_ema_rej = last_peak_rej = False
+    last_early_cond = last_full_cond = False
+    last_early_fired = last_full_fired = False
+
+    n = len(df_15m)
+    for i in range(n):
+        if any(
+            np.isnan(x)
+            for x in (
+                k.iloc[i],
+                d.iloc[i],
+                rsi_main.iloc[i],
+                rsi_ma.iloc[i],
+                wt1.iloc[i],
+                wt2.iloc[i],
+                smi.iloc[i],
+                smi_sig.iloc[i],
+                smi_ema9.iloc[i],
+            )
+        ):
+            continue
+
+        c1 = bool(k.iloc[i] < d.iloc[i])
+        c2 = bool(rsi_main.iloc[i] < rsi_ma.iloc[i])
+        c3 = bool(fisher.iloc[i] < fisher_trigger.iloc[i])
+        c4 = bool(wt1.iloc[i] < wt2.iloc[i])
+        c5 = bool((smi.iloc[i] < smi_sig.iloc[i]) and (smi.iloc[i] < smi_ema9.iloc[i]))
+
+        bar_h = float(highs.iloc[i])
+        bar_l = float(lows.iloc[i])
+        bar_c = float(closes.iloc[i])
+        rh4 = float(high4_s.iloc[i])
+        ema_val = float(ema200.iloc[i])
+
+        ema_reject = (
+            not np.isnan(ema_val)
+            and (rh4 >= ema_val * (1.0 - ema_touch_buffer / 100.0))
+            and (bar_c < ema_val)
+        )
+        max_r5 = float(rsi5_s.iloc[i])
+        max_w5 = float(wt5_s.iloc[i])
+        peak_reject = (not np.isnan(max_r5) and max_r5 >= 68.0) or (
+            not np.isnan(max_w5) and max_w5 >= 40.0
+        )
+
+        early_cond = c1 and c2 and c3 and (ema_reject or peak_reject)
+        full_cond = early_cond and c4 and c5
+
+        early_fired = False
+        full_fired = False
+
+        if early_cond and not in_short_pos:
+            in_short_pos = True
+            early_fired = True
+            be_locked = False
+            entry_price = bar_c
+            entry_bar_idx = i
+            sl_level = min(rh4 * 1.002, entry_price * (1.0 + max_stop_pct / 100.0))
+            tp_level = entry_price * 0.955
+
+        if full_cond and not in_full_short_pos:
+            in_full_short_pos = True
+            in_short_pos = True
+            full_fired = True
+            be_locked = False
+            if entry_price is None:
+                entry_price = bar_c
+                entry_bar_idx = i
+                sl_level = min(rh4 * 1.002, entry_price * (1.0 + max_stop_pct / 100.0))
+                tp_level = entry_price * 0.955
+
+        if in_short_pos and entry_bar_idx is not None and i > entry_bar_idx:
+            assert entry_price is not None and tp_level is not None and sl_level is not None
+            if not be_locked and bar_l <= entry_price * (1.0 - be_trigger_pct / 100.0):
+                be_locked = True
+                sl_level = entry_price * 0.996
+
+            hit_stop = bar_h >= sl_level
+            hit_tp = bar_l <= tp_level
+            is_confirmed = i < n - 1
+            hit_cover = (
+                is_confirmed
+                and bool(smi.iloc[i] > smi_ema9.iloc[i])
+                and bool(wt1.iloc[i] > wt2.iloc[i])
+            )
+            if hit_tp or hit_stop or hit_cover:
+                in_short_pos = False
+                in_full_short_pos = False
+                be_locked = False
+                entry_price = None
+                tp_level = None
+                sl_level = None
+                entry_bar_idx = None
+
+        if i == n - 1:
+            last_c1, last_c2, last_c3, last_c4, last_c5 = c1, c2, c3, c4, c5
+            last_ema_rej = ema_reject
+            last_peak_rej = peak_reject
+            last_early_cond = early_cond
+            last_full_cond = full_cond
+            last_early_fired = early_fired
+            last_full_fired = full_fired
+
+    prev_idx = n - 2
+    prev_bar_ts = int(open_times.iloc[prev_idx])
+    cover_prev = bool(
+        not np.isnan(smi.iloc[prev_idx])
+        and not np.isnan(smi_ema9.iloc[prev_idx])
+        and not np.isnan(wt1.iloc[prev_idx])
+        and not np.isnan(wt2.iloc[prev_idx])
+        and (smi.iloc[prev_idx] > smi_ema9.iloc[prev_idx])
+        and (wt1.iloc[prev_idx] > wt2.iloc[prev_idx])
+    )
+    bar_close_ts = (
+        int(df_15m["close_time"].iloc[-1])
+        if "close_time" in df_15m.columns
+        else int(open_times.iloc[-1]) + 15 * 60 * 1000 - 1
+    )
+    last_close = float(closes.iloc[-1])
+    last_rh4 = float(high4_s.iloc[-1])
+    last_ema = float(ema200.iloc[-1]) if not np.isnan(ema200.iloc[-1]) else last_close
+
+    eff_sl = (
+        sl_level
+        if sl_level is not None
+        else min(last_rh4 * 1.002, last_close * (1.0 + max_stop_pct / 100.0))
+    )
+    eff_tp = tp_level if tp_level is not None else last_close * 0.955
+
+    return ShortPeakEvaluation(
+        bar_open_time=int(open_times.iloc[-1]),
+        bar_close_time=bar_close_ts,
+        prev_bar_open_time=prev_bar_ts,
+        price=last_close,
+        ema200=last_ema,
+        recent_high4=last_rh4,
+        cond1_dn=last_c1,
+        cond2_dn=last_c2,
+        cond3_dn=last_c3,
+        cond4_dn=last_c4,
+        cond5_dn=last_c5,
+        ema200_reject=last_ema_rej,
+        sharp_peak_reject=last_peak_rej,
+        early_short_cond=last_early_cond,
+        full_short_cond=last_full_cond,
+        early_fired=last_early_fired,
+        full_fired=last_full_fired,
+        in_short_pos=in_short_pos,
+        in_full_short_pos=in_full_short_pos,
+        be_locked=be_locked,
+        entry_price=entry_price,
+        tp_level=eff_tp,
+        sl_level=eff_sl,
+        cover_confirmed_prev_bar=cover_prev,
+        in_1h_zone=in_1h_zone,
+        htf_reason=htf_reason,
     )
 
 

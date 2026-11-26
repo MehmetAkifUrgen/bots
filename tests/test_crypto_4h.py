@@ -12,11 +12,14 @@ import pandas as pd
 from crypto_4h_scanner.binance_scanner import Coin4hResult
 from crypto_4h_scanner.binance_trader import BinanceTrader
 from crypto_4h_scanner.indicators import (
+    ShortPeakEvaluation,
     SystemEvaluation,
+    check_1h_short_zone,
     compute_pivots,
     evaluate_1h_15m_system,
     evaluate_45m_scalp_system,
     evaluate_4h_system,
+    evaluate_short_15m_system,
     fisher_transform,
     resample_15m_to_45m,
     resample_1h_to_4h,
@@ -794,6 +797,166 @@ class TestBinanceTrader(unittest.TestCase):
         df_4h = resample_1h_to_4h(df_1h)
         self.assertEqual(int(df_4h["open_time"].iloc[-1]), bucket_start)
         self.assertEqual(int(df_4h["close_time"].iloc[-1]), bucket_start + h4_ms - 1)
+
+    def test_1h_zone_and_15m_early_short_full_lifecycle(self) -> None:
+        # 1) Indicator test: rally then rollover triggers check_1h_short_zone and evaluate_short_15m_system
+        x = np.linspace(0, 6 * np.pi, 260)
+        closes = 100.0 + 14.0 * np.sin(x)
+        df_wave = _make_ohlcv(closes)
+        in_zone, reason = check_1h_short_zone(df_wave)
+        self.assertIsInstance(in_zone, bool)
+        self.assertIsInstance(reason, str)
+
+        seen_early = False
+        for end in range(90, len(df_wave) + 1):
+            sev = evaluate_short_15m_system(df_wave.iloc[:end].copy(), in_1h_zone=True, htf_reason="1S EMA200 Reddi")
+            self.assertIsNotNone(sev)
+            assert sev is not None
+            if sev.early_fired:
+                seen_early = True
+                self.assertAlmostEqual(sev.tp_level or 0.0, sev.price * 0.955, places=4)
+        self.assertTrue(seen_early, "Expected at least one 15m ERKEN SHORT trigger on wave")
+
+        # 2) Trader + Notifier lifecycle test for 1S -> 15dk SHORT
+        with tempfile.TemporaryDirectory() as tmp:
+            trader = BinanceTrader(
+                api_key="k",
+                api_secret="s",
+                market="papi",
+                min_usd=150.0,
+                max_usd=250.0,
+                leverage=20,
+                max_leverage=20,
+                stop_loss_pct=1.5,
+                symbol_stop_cooldown_minutes=0,
+                state_file=Path(tmp) / "trade_state.json",
+            )
+            trader._filters_cache = {
+                "EVAAUSDT": {"stepSize": 0.1, "minQty": 0.1, "minNotional": 5.0, "tickSize": 0.01},
+                "ZECUSDT": {"stepSize": 0.1, "minQty": 0.1, "minNotional": 5.0, "tickSize": 0.01},
+            }
+            trader.get_free_usdt = lambda: 500.0  # type: ignore[method-assign]
+            trader.get_live_open_positions = lambda: {}  # type: ignore[method-assign]
+
+            last_price = {"p": 100.0}
+            placed_stops: list[tuple[str, str, float]] = []
+
+            def fake_signed(method: str, path: str, params=None):
+                if path == "/papi/v1/um/order":
+                    return {
+                        "orderId": 789,
+                        "avgPrice": str(last_price["p"]),
+                        "executedQty": params["quantity"],
+                    }
+                if path == "/papi/v1/um/algo/order":
+                    placed_stops.append((params["symbol"], params["side"], float(params["triggerPrice"])))
+                    return {"algoId": 987}
+                return {}
+
+            trader._signed_request = fake_signed  # type: ignore[method-assign]
+            notifier = TelegramNotifier("tok", "chat", Path(tmp) / "alert.json")
+            sent: list[str] = []
+            notifier.send_text = lambda text: sent.append(text) or True  # type: ignore[method-assign]
+
+            base_4h_ev = SystemEvaluation(
+                bar_open_time=1_700_000_000_000,
+                bar_close_time=1_700_014_399_999,
+                price=100.0,
+                cond1_buy=False, cond2_buy=False, cond3_buy=False, cond4_buy=False, cond5_buy=False,
+                trend_ok=False, first_three_buy=False, all_five_buy=False,
+                green_trigger=False, orange_trigger=False, exit_trigger=False,
+                exit_reason=None, exit_price=None, exit_trade_pct=None,
+                in_green_pos=False, in_orange_pos=False, be_locked=False,
+                entry_price=None, tp_level=None, sl_level=None, next_res=105.0, prev_sup=95.0,
+                total_trades=20, win_trades=10, win_rate=50.0, total_profit_pct=120.0,
+            )
+
+            bar15_open = 1_700_003_600_000
+            sev_no_zone = ShortPeakEvaluation(
+                bar_open_time=bar15_open,
+                bar_close_time=bar15_open + 900_000 - 1,
+                prev_bar_open_time=bar15_open - 900_000,
+                price=100.0,
+                ema200=101.0,
+                recent_high4=100.9,
+                cond1_dn=True, cond2_dn=True, cond3_dn=True, cond4_dn=False, cond5_dn=False,
+                ema200_reject=True, sharp_peak_reject=False,
+                early_short_cond=True, full_short_cond=False,
+                early_fired=True, full_fired=False,
+                in_short_pos=True, in_full_short_pos=False, be_locked=False,
+                entry_price=100.0, tp_level=95.5, sl_level=101.1,
+                cover_confirmed_prev_bar=False,
+                in_1h_zone=False,  # Not in 1H resistance/EMA200 zone -> blocked!
+                htf_reason="",
+            )
+            res_blocked = Coin4hResult(
+                "EVAAUSDT", "papi", 100.0, 6.0, 80_000_000.0, base_4h_ev, timeframe="4h",
+                short_15m_evaluation=sev_no_zone,
+            )
+            st_blk = notifier.process_4h_alert_only([res_blocked], trader=trader, dual_mode=True)
+            self.assertEqual(st_blk["orders_opened"], 0)
+
+            # In 1H zone + 15m early_fired -> opens SHORT immediately with TP=95.5 and tight SL=101.1!
+            sev_ok = ShortPeakEvaluation(
+                **{**sev_no_zone.__dict__, "in_1h_zone": True, "htf_reason": "1S EMA200 Reddi"}
+            )
+            res_ok = Coin4hResult(
+                "EVAAUSDT", "papi", 100.0, 6.0, 80_000_000.0, base_4h_ev, timeframe="4h",
+                short_15m_evaluation=sev_ok,
+            )
+            st_open = notifier.process_4h_alert_only([res_ok], trader=trader, dual_mode=True)
+            self.assertEqual(st_open["orders_opened"], 1)
+            self.assertIn("[1S→15dk] ERKEN SHORT", sent[-1])
+            self.assertIn("1S EMA200 Reddi", sent[-1])
+
+            spos = trader._state["open_positions"]["EVAAUSDT"]
+            self.assertEqual(spos["side"], "SHORT")
+            self.assertFalse(spos["use_trailing"])
+            self.assertEqual(spos["be_trigger_pct"], 1.5)
+            self.assertAlmostEqual(spos["tp_price"], 95.5, places=2)
+            self.assertAlmostEqual(spos["sl_price"], 101.1, places=2)
+            self.assertEqual(placed_stops[-1], ("EVAAUSDT", "BUY", 101.1))
+
+            # Price drops +1.6% (to 98.4 <= 98.5) -> locks BE at 99.60 (+0.40%), stays open!
+            self.assertEqual(len(trader.manage_open_positions({"EVAAUSDT": 98.4})), 0)
+            self.assertTrue(trader._state["open_positions"]["EVAAUSDT"]["be_locked"])
+            self.assertAlmostEqual(trader._state["open_positions"]["EVAAUSDT"]["sl_price"], 99.6, places=2)
+            self.assertEqual(placed_stops[-1], ("EVAAUSDT", "BUY", 99.6))
+
+            # Subsequent confirmed 15m bar triggers KAPAT (Dönüş) -> closes SHORT even when paused!
+            notifier.set_paused(True, trader)
+            last_price["p"] = 98.0
+            sev_cover = ShortPeakEvaluation(
+                **{
+                    **sev_ok.__dict__,
+                    "bar_open_time": bar15_open + 2 * 900_000,
+                    "prev_bar_open_time": bar15_open + 900_000,  # > entry_bar_open_time!
+                    "price": 98.0,
+                    "early_fired": False,
+                    "cover_confirmed_prev_bar": True,
+                }
+            )
+            res_cover = Coin4hResult(
+                "EVAAUSDT", "papi", 98.0, 4.0, 80_000_000.0, base_4h_ev, timeframe="4h",
+                short_15m_evaluation=sev_cover,
+            )
+            st_cov = notifier.process_4h_alert_only([res_cover], trader=trader, dual_mode=True)
+            self.assertEqual(st_cov["orders_closed"], 1)
+            self.assertNotIn("EVAAUSDT", trader._state["open_positions"])
+            self.assertIn("KAPAT (15dk Dönüş Sinyali)", sent[-1])
+
+            # Direct -4.5% TP hit test on SHORT
+            notifier.set_paused(False, trader)
+            last_price["p"] = 100.0
+            trader.open_position(
+                "ZECUSDT", price=100.0, target_usd=200.0, tp_price=95.5, sl_price=101.2,
+                side="SHORT", use_trailing=False, be_trigger_pct=1.5
+            )
+            last_price["p"] = 95.4
+            tp_evs = trader.manage_open_positions({"ZECUSDT": 95.4})
+            self.assertEqual(len(tp_evs), 1)
+            self.assertEqual(tp_evs[0]["reason"], "KÂR AL (-%4.5 Hedef)")
+            self.assertGreater(tp_evs[0]["pnl_usd"], 0)
 
 
 if __name__ == "__main__":

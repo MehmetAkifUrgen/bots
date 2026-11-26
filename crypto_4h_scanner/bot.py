@@ -275,15 +275,15 @@ def main() -> None:
     effective_poll = min(args.poll_seconds, 60)
 
     trade_mode_str = (
-        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, LONG: 4S Direnç/SAT, SHORT: 4S Trailing)"
+        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, LONG: 4S Direnç/SAT, SHORT: 1S→15dk Erken Dönüş)"
         if trader
         else "KAPALI (Sadece Bildirim)"
     )
     print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] 4S (4H) Çift Yön Otomatik Bot başlatıldı | "
+        f"[{datetime.now().strftime('%H:%M:%S')}] Hibrit 4S-LONG / 1S→15dk-SHORT Bot başlatıldı | "
         f"Piyasa={args.market.upper()} | OtoAlım={trade_mode_str} | "
         f"LONG=4S 5/5 (WR>=%{long_min_wr:g}, Getiri>=%{long_min_profit:g}, Anlık) | "
-        f"SHORT=4S 5/5+EMA200 (Son {short_window_min}dk) | Periyot={effective_poll}sn"
+        f"SHORT=1S Bölge -> 15dk İlk Dönüş (TP -%4.5, +%1.5 Kâr Kilidi, Max -%1.5 SL) | Periyot={effective_poll}sn"
     )
 
     scan_interval = os.getenv("SCAN_INTERVAL", "4h").strip().lower()
@@ -294,10 +294,18 @@ def main() -> None:
         try:
             if trader is None:
                 notifier.poll_commands(None)
+            open_short_syms: set[str] = set()
+            if trader is not None:
+                open_short_syms = {
+                    s
+                    for s, p in trader._state.get("open_positions", {}).items()
+                    if str(p.get("side") or "").upper() == "SHORT"
+                }
             results, errors, duration = scanner.scan_4h_bist_alerts(
                 min_volume_usdt=args.min_volume,
                 limit=args.limit,
                 interval=scan_interval,
+                extra_15m_symbols=open_short_syms,
             )
             entry_window_min = int(os.getenv("ENTRY_WINDOW_MINUTES", "0"))
             short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "0"))
@@ -323,7 +331,18 @@ def main() -> None:
                 and r.evaluation.win_rate >= long_min_wr
                 and r.evaluation.total_profit_pct >= long_min_profit
             )
-            short_now = sum(1 for r in results if (r.long_evaluation or r.evaluation).short_5_trigger)
+            zone_1h_now = sum(
+                1
+                for r in results
+                if r.short_15m_evaluation is not None and r.short_15m_evaluation.in_1h_zone
+            )
+            short_now = sum(
+                1
+                for r in results
+                if r.short_15m_evaluation is not None
+                and r.short_15m_evaluation.in_1h_zone
+                and r.short_15m_evaluation.early_fired
+            )
 
             _HEALTH_STATE.update(
                 {
@@ -337,9 +356,8 @@ def main() -> None:
             paused_tag = " [DURDURULDU]" if notifier.is_paused(trader) else ""
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
-                f"[4S ÇİFT YÖN]{paused_tag} Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
-                f"LONG(4S 5/5 WR>=%{long_min_wr:g} >=%{long_min_profit:g} Anlık): {long_now}, "
-                f"SHORT(4S 5/5 Son {short_window_min}dk): {short_now} | "
+                f"[4S-LONG / 1S→15dk-SHORT]{paused_tag} Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
+                f"LONG(4S 5/5): {long_now}, 1S-Bölge: {zone_1h_now}, SHORT(15dk İlk Dönüş): {short_now} | "
                 f"Emir -> Açılan: {stats['orders_opened']}, Kapanan: {stats['orders_closed']}"
             )
             if stats["errors"]:

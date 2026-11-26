@@ -12,9 +12,12 @@ import pandas as pd
 import requests
 
 from .indicators import (
+    ShortPeakEvaluation,
     SystemEvaluation,
+    check_1h_short_zone,
     evaluate_1h_15m_system,
     evaluate_4h_system,
+    evaluate_short_15m_system,
     resample_15m_to_45m,
     resample_1h_to_4h,
 )
@@ -37,6 +40,7 @@ class Coin4hResult:
     timeframe: TimeframeType = "45m"
     long_evaluation: SystemEvaluation | None = None
     prev_change_24h: float = 0.0
+    short_15m_evaluation: ShortPeakEvaluation | None = None
 
 
 def _klines_to_df(raw: list[list]) -> pd.DataFrame:
@@ -315,7 +319,9 @@ class Binance4hScanner:
         duration = round(time.time() - started, 2)
         return results, errors, duration
 
-    def _scan_one_4h_bist(self, coin: dict, interval: str = "1h") -> Coin4hResult | None:
+    def _scan_one_4h_bist(
+        self, coin: dict, interval: str = "1h", force_15m: bool = False
+    ) -> Coin4hResult | None:
         sym = coin["symbol"]
         if interval == "1h":
             df_1h = self.fetch_klines_cached(
@@ -362,14 +368,34 @@ class Binance4hScanner:
         )
         if ev is None:
             return None
+
+        # 2-Stage SHORT: 1H Zone Screening -> 15m Early Reversal Entry
+        df_1h_short = self.fetch_klines_cached(
+            sym, interval="1h", initial_limit=350, pages=1, max_rows=450
+        )
+        in_1h_zone, htf_reason = check_1h_short_zone(df_1h_short)
+        short_15m_ev: ShortPeakEvaluation | None = None
+        if in_1h_zone or force_15m:
+            df_15m_short = self.fetch_klines_cached(
+                sym, interval="15m", initial_limit=450, pages=1, max_rows=550
+            )
+            short_15m_ev = evaluate_short_15m_system(
+                df_15m_short,
+                in_1h_zone=in_1h_zone,
+                htf_reason=htf_reason,
+                max_stop_pct=1.5,
+                be_trigger_pct=1.5,
+            )
+
         return Coin4hResult(
             symbol=sym,
             market=self.market,
-            price=ev.price,
+            price=short_15m_ev.price if short_15m_ev is not None else ev.price,
             change_24h=round(coin["change_24h"], 2),
             volume_24h_usdt=round(coin["volume_24h_usdt"], 0),
             evaluation=ev,
             timeframe="4h",
+            short_15m_evaluation=short_15m_ev,
         )
 
     def scan_4h_bist_alerts(
@@ -377,18 +403,25 @@ class Binance4hScanner:
         min_volume_usdt: float = 5_000_000.0,
         limit: int = 0,
         interval: str = "1h",
+        extra_15m_symbols: set[str] | None = None,
     ) -> tuple[list[Coin4hResult], list[str], float]:
-        """Scan Binance USDT pairs on 1H or 4H chart."""
+        """Scan Binance USDT pairs on 1H or 4H chart (+ 1H->15m SHORT zone screening)."""
         started = time.time()
         coins = self.get_active_usdt_symbols(
             min_volume_usdt=min_volume_usdt, limit=limit
         )
+        extra_syms = extra_15m_symbols or set()
         results: list[Coin4hResult] = []
         errors: list[str] = []
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             future_map = {
-                pool.submit(self._scan_one_4h_bist, coin, interval): coin["symbol"]
+                pool.submit(
+                    self._scan_one_4h_bist,
+                    coin,
+                    interval,
+                    coin["symbol"] in extra_syms,
+                ): coin["symbol"]
                 for coin in coins
             }
             for fut in as_completed(future_map):

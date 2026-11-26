@@ -203,6 +203,58 @@ def format_dual_4h_message(
     )
 
 
+def format_short_15m_message(
+    res: Coin4hResult,
+    trade_exec: TradeExecution | None = None,
+    trade_note: str | None = None,
+    stop_loss_pct: float = 1.5,
+) -> str:
+    sev = res.short_15m_evaluation
+    assert sev is not None
+    header = (
+        "🟣 <b>[1S→15dk] KESİN SHORT (5/5)</b>"
+        if sev.full_fired
+        else "🔴 <b>[1S→15dk] ERKEN SHORT (İlk Dönüş)</b>"
+    )
+    entry = trade_exec.price if trade_exec else res.price
+    tp = entry * 0.955
+    default_sl = entry * (1.0 + stop_loss_pct / 100.0)
+    raw_sl = sev.sl_level or default_sl
+    sl = raw_sl if (entry * 1.005 < raw_sl <= default_sl) else default_sl
+    sl_pct = ((sl - entry) / entry * 100.0) if entry > 0 else stop_loss_pct
+
+    bar_dt = datetime.fromtimestamp(sev.bar_open_time / 1000, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
+    trade_block = ""
+    if trade_exec:
+        trade_block = (
+            f"\n⚡ <b>OTOMATİK SHORT EMİR AÇILDI</b>\n"
+            f"• Büyüklük: <b>${trade_exec.notional_usd:.2f}</b> | Miktar: <code>{trade_exec.qty:g}</code>\n"
+            f"• Emir ID: <code>{trade_exec.order_id}</code>\n"
+        )
+    elif trade_note:
+        trade_block = f"\nℹ️ <i>{html.escape(str(trade_note))}</i>\n"
+
+    htf_info = html.escape(sev.htf_reason or "1S Direnç / EMA200 Bölgesi")
+    ltf_reason = "15dk EMA200 Reddi" if sev.ema200_reject else "15dk Tepe Şişkinliği Dönüşü"
+    return (
+        f"{header}\n"
+        f"🪙 <b>{res.symbol}</b> | <code>1S → 15dk</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧭 <b>1S Bölge:</b> {htf_info}\n"
+        f"⚡ <b>15dk Tetik:</b> {ltf_reason} (Anlık Giriş)\n"
+        f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
+        f"🎯 <b>Kâr Al (-%4.5):</b> <code>{fmt_price(tp)}</code>\n"
+        f"🛑 <b>Stop (+%{sl_pct:.2f}):</b> <code>{fmt_price(sl)}</code> (Max -%{stop_loss_pct:g})\n"
+        f"🔒 <b>Çıkış Kuralı:</b> -%4.5 TP | +%1.5'te +%0.40 Kâr Kilidi | 15dk Dönüşte KAPAT\n"
+        f"{trade_block}"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💧 <b>24s Hacim:</b> {fmt_vol(res.volume_24h_usdt)} | 24s: {res.change_24h:+.2f}%\n"
+        f"🕒 <i>15dk Mum: {bar_dt}</i>"
+    )
+
+
 def format_4h_alert_only_message(
     res: Coin4hResult,
     kind: str,
@@ -664,14 +716,15 @@ class TelegramNotifier:
             except Exception as exc:
                 stats["errors"].append(f"MANAGE_POS: {exc}")
 
-            # Pine Script 'SAT' (realSellCond) exit check for open LONG positions (runs even when paused)
+            # Pine Script 'SAT' / 'KAPAT (Dönüş)' exit checks for open positions (runs even when paused)
             for res in results:
                 pos = trader._state.get("open_positions", {}).get(res.symbol)
                 if not pos:
                     continue
-                if str(pos.get("side") or "LONG").upper() == "LONG" and not pos.get("use_trailing", True):
+                pos_side = str(pos.get("side") or "LONG").upper()
+                entry_bar_ts = int(pos.get("entry_bar_open_time") or 0)
+                if pos_side == "LONG" and not pos.get("use_trailing", True):
                     ev_curr = res.evaluation
-                    entry_bar_ts = int(pos.get("entry_bar_open_time") or 0)
                     if (
                         ev_curr.real_sell_cond
                         and ev_curr.bar_open_time > entry_bar_ts
@@ -706,6 +759,40 @@ class TelegramNotifier:
                                 self.send_text(format_managed_close_message(ev_close))
                         except Exception as exc:
                             stats["errors"].append(f"{res.symbol} REAL_SELL_CLOSE: {exc}")
+                elif (
+                    pos_side == "SHORT"
+                    and not pos.get("use_trailing", True)
+                    and res.short_15m_evaluation is not None
+                ):
+                    sev = res.short_15m_evaluation
+                    if sev.cover_confirmed_prev_bar and sev.prev_bar_open_time > entry_bar_ts:
+                        try:
+                            closed = trader.close_position(
+                                res.symbol, fallback_price=res.price, is_stop_loss=False
+                            )
+                            if closed:
+                                entry_px = float(pos.get("entry_price") or closed.price)
+                                pnl_usd = (entry_px - closed.price) * closed.qty
+                                pnl_pct = (
+                                    ((entry_px - closed.price) / entry_px) * 100.0
+                                    if entry_px > 0
+                                    else 0.0
+                                )
+                                stats["orders_closed"] += 1
+                                ev_close = {
+                                    "symbol": res.symbol,
+                                    "side": "SHORT",
+                                    "tf_label": "15dk (15M)",
+                                    "reason": "KAPAT (15dk Dönüş Sinyali)",
+                                    "entry_price": entry_px,
+                                    "exit_price": closed.price,
+                                    "pnl_usd": round(pnl_usd, 2),
+                                    "pnl_pct": round(pnl_pct, 2),
+                                    "order_id": closed.order_id,
+                                }
+                                self.send_text(format_managed_close_message(ev_close))
+                        except Exception as exc:
+                            stats["errors"].append(f"{res.symbol} SHORT_COVER_CLOSE: {exc}")
 
         if self.is_paused(trader):
             return stats
@@ -733,7 +820,9 @@ class TelegramNotifier:
             for res in results:
                 long_ev = res.evaluation
                 short_ev = res.long_evaluation or res.evaluation
+                sev_15m = res.short_15m_evaluation
                 side: str | None = None
+                use_short_15m_mode = False
                 ev = short_ev
                 tf_used = res.timeframe
                 if (
@@ -751,7 +840,14 @@ class TelegramNotifier:
                         side = "LONG"
                         ev = long_ev
                         tf_used = res.timeframe
-                if side is None and short_ev.short_5_trigger and (top_gainers is None or res.symbol in top_gainers):
+                if side is None and sev_15m is not None:
+                    if sev_15m.in_1h_zone and sev_15m.early_fired and (
+                        top_gainers is None or res.symbol in top_gainers
+                    ):
+                        side = "SHORT"
+                        use_short_15m_mode = True
+                        tf_used = "15m"
+                elif side is None and short_ev.short_5_trigger and (top_gainers is None or res.symbol in top_gainers):
                     if short_win_ms > 0 and short_ev.bar_close_time > 0:
                         rem_ms = short_ev.bar_close_time - now_ms
                         if -60_000 <= rem_ms <= short_win_ms:
@@ -765,7 +861,8 @@ class TelegramNotifier:
                 if not side:
                     continue
 
-                alert_key = f"4h_dual:{tf_used}:{res.symbol}:{side}:{ev.bar_open_time}"
+                sig_bar_ts = sev_15m.bar_open_time if (use_short_15m_mode and sev_15m is not None) else ev.bar_open_time
+                alert_key = f"4h_dual:{tf_used}:{res.symbol}:{side}:{sig_bar_ts}"
                 if alert_key in sent_alerts:
                     continue
 
@@ -786,6 +883,18 @@ class TelegramNotifier:
                                 be_trigger_pct=0.0,
                                 entry_bar_open_time=ev.bar_open_time,
                             )
+                        elif use_short_15m_mode and sev_15m is not None:
+                            trade_exec = trader.open_position(
+                                res.symbol,
+                                res.price,
+                                trader.max_usd,
+                                tp_price=sev_15m.tp_level,
+                                sl_price=sev_15m.sl_level,
+                                side="SHORT",
+                                use_trailing=False,
+                                be_trigger_pct=1.5,
+                                entry_bar_open_time=sev_15m.bar_open_time,
+                            )
                         else:
                             trade_exec = trader.open_position(
                                 res.symbol,
@@ -805,6 +914,15 @@ class TelegramNotifier:
                 try:
                     if dry_run:
                         print(f"[DRY-RUN DUAL {tf_used.upper()} {side}] {res.symbol} @ {res.price}")
+                    elif use_short_15m_mode:
+                        self.send_text(
+                            format_short_15m_message(
+                                res,
+                                trade_exec=trade_exec,
+                                trade_note=trade_note,
+                                stop_loss_pct=trader.stop_loss_pct if trader else 1.5,
+                            )
+                        )
                     else:
                         self.send_text(
                             format_dual_4h_message(
