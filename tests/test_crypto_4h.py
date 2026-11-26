@@ -577,19 +577,19 @@ class TestBinanceTrader(unittest.TestCase):
             )
             res_mid = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_mid, timeframe="4h")
             # With short_entry_window_minutes=15, mid-candle (3h left) SHORT is blocked!
-            st0 = notifier.process_4h_alert_only([res_mid], dual_mode=True, short_entry_window_minutes=15)
+            st0 = notifier.process_4h_alert_only([res_mid], dual_mode=True, short_entry_window_minutes=15, short_top_gainers=0)
             self.assertEqual(st0["short"], 0)
 
             # 30m left is also outside last-15m SHORT window
             ev_30m = SystemEvaluation(**{**ev_mid.__dict__, "bar_close_time": now_ms + 30 * 60_000})
             res_30m = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_30m, timeframe="4h")
-            st_30m = notifier.process_4h_alert_only([res_30m], dual_mode=True, short_entry_window_minutes=15)
+            st_30m = notifier.process_4h_alert_only([res_30m], dual_mode=True, short_entry_window_minutes=15, short_top_gainers=0)
             self.assertEqual(st_30m["short"], 0)
 
             # Inside final 15 minutes (12m left) -> SHORT 5/5 + EMA200 fires!
             ev_last15 = SystemEvaluation(**{**ev_mid.__dict__, "bar_close_time": now_ms + 12 * 60_000})
             res_last15 = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_last15, timeframe="4h")
-            st1 = notifier.process_4h_alert_only([res_last15], dual_mode=True, short_entry_window_minutes=15)
+            st1 = notifier.process_4h_alert_only([res_last15], dual_mode=True, short_entry_window_minutes=15, short_top_gainers=0)
             self.assertEqual(st1["short"], 1)
             self.assertEqual(len(sent), 1)
             self.assertIn("SHORT 5/5 + EMA200", sent[0])
@@ -896,17 +896,30 @@ class TestBinanceTrader(unittest.TestCase):
             st_blk = notifier.process_4h_alert_only([res_blocked], trader=trader, dual_mode=True)
             self.assertEqual(st_blk["orders_opened"], 0)
 
-            # In 1H zone + 15m early_fired -> opens SHORT immediately with TP=95.5 and tight SL=101.1!
+            # In 1H zone + 15m early_fired, but if ranked #11 outside Top 10 Gainers -> MUST BE BLOCKED!
             sev_ok = ShortPeakEvaluation(
                 **{**sev_no_zone.__dict__, "in_1h_zone": True, "htf_reason": "1S EMA200 Reddi"}
             )
-            res_ok = Coin4hResult(
-                "EVAAUSDT", "papi", 100.0, 6.0, 80_000_000.0, base_4h_ev, timeframe="4h",
+            top10_dummies = [
+                Coin4hResult(f"GAIN{i}USDT", "papi", 10.0, 50.0 - i, 50_000_000.0, base_4h_ev, timeframe="4h")
+                for i in range(10)
+            ]
+            res_rank11 = Coin4hResult(
+                "BORINGUSDT", "papi", 100.0, 3.0, 80_000_000.0, base_4h_ev, timeframe="4h",
                 short_15m_evaluation=sev_ok,
             )
-            st_open = notifier.process_4h_alert_only([res_ok], trader=trader, dual_mode=True)
+            st_rank11 = notifier.process_4h_alert_only(top10_dummies + [res_rank11], trader=trader, dual_mode=True, short_top_gainers=10)
+            self.assertEqual(st_rank11["orders_opened"], 0)
+
+            # Ranked #1 in Top 10 Gainers (+65% 24h) + 1H zone + 15m early_fired -> opens SHORT immediately!
+            res_ok = Coin4hResult(
+                "EVAAUSDT", "papi", 100.0, 65.0, 80_000_000.0, base_4h_ev, timeframe="4h",
+                short_15m_evaluation=sev_ok,
+            )
+            st_open = notifier.process_4h_alert_only(top10_dummies + [res_ok], trader=trader, dual_mode=True, short_top_gainers=10)
             self.assertEqual(st_open["orders_opened"], 1)
             self.assertIn("[1S→15dk] ERKEN SHORT", sent[-1])
+            self.assertIn("Top 10 Gainer (+65.00%)", sent[-1])
             self.assertIn("1S EMA200 Reddi", sent[-1])
 
             spos = trader._state["open_positions"]["EVAAUSDT"]

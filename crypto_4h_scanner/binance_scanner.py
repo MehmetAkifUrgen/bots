@@ -320,7 +320,11 @@ class Binance4hScanner:
         return results, errors, duration
 
     def _scan_one_4h_bist(
-        self, coin: dict, interval: str = "1h", force_15m: bool = False
+        self,
+        coin: dict,
+        interval: str = "1h",
+        allow_short_scan: bool = True,
+        force_15m: bool = False,
     ) -> Coin4hResult | None:
         sym = coin["symbol"]
         if interval == "1h":
@@ -369,19 +373,23 @@ class Binance4hScanner:
         if ev is None:
             return None
 
-        # 2-Stage SHORT: 1H Zone Screening -> 15m Early Reversal Entry
-        df_1h_short = self.fetch_klines_cached(
-            sym, interval="1h", initial_limit=350, pages=1, max_rows=450
-        )
-        in_1h_zone, htf_reason = check_1h_short_zone(df_1h_short)
+        # 2-Stage SHORT (ONLY Top 10 Gainers): 1H Zone Screening -> 15m Early Reversal Entry
+        in_1h_zone = False
+        htf_reason = ""
+        if allow_short_scan:
+            df_1h_short = self.fetch_klines_cached(
+                sym, interval="1h", initial_limit=350, pages=1, max_rows=450
+            )
+            in_1h_zone, htf_reason = check_1h_short_zone(df_1h_short)
+
         short_15m_ev: ShortPeakEvaluation | None = None
-        if in_1h_zone or force_15m:
+        if (allow_short_scan and in_1h_zone) or force_15m:
             df_15m_short = self.fetch_klines_cached(
                 sym, interval="15m", initial_limit=450, pages=1, max_rows=550
             )
             short_15m_ev = evaluate_short_15m_system(
                 df_15m_short,
-                in_1h_zone=in_1h_zone,
+                in_1h_zone=(allow_short_scan and in_1h_zone),
                 htf_reason=htf_reason,
                 max_stop_pct=1.5,
                 be_trigger_pct=1.5,
@@ -403,14 +411,23 @@ class Binance4hScanner:
         min_volume_usdt: float = 5_000_000.0,
         limit: int = 0,
         interval: str = "1h",
+        short_top_gainers: int = 10,
         extra_15m_symbols: set[str] | None = None,
     ) -> tuple[list[Coin4hResult], list[str], float]:
-        """Scan Binance USDT pairs on 1H or 4H chart (+ 1H->15m SHORT zone screening)."""
+        """Scan Binance USDT pairs on 4H (+ Top N Gainers 1H->15m SHORT zone screening)."""
         started = time.time()
         coins = self.get_active_usdt_symbols(
             min_volume_usdt=min_volume_usdt, limit=limit
         )
         extra_syms = extra_15m_symbols or set()
+        if short_top_gainers > 0:
+            gainer_syms = {
+                c["symbol"]
+                for c in sorted(coins, key=lambda x: x["change_24h"], reverse=True)[:short_top_gainers]
+                if c["change_24h"] > 0
+            }
+        else:
+            gainer_syms = {c["symbol"] for c in coins}
         results: list[Coin4hResult] = []
         errors: list[str] = []
 
@@ -420,6 +437,7 @@ class Binance4hScanner:
                     self._scan_one_4h_bist,
                     coin,
                     interval,
+                    coin["symbol"] in gainer_syms,
                     coin["symbol"] in extra_syms,
                 ): coin["symbol"]
                 for coin in coins

@@ -240,7 +240,7 @@ def format_short_15m_message(
     ltf_reason = "15dk EMA200 Reddi" if sev.ema200_reject else "15dk Tepe Şişkinliği Dönüşü"
     return (
         f"{header}\n"
-        f"🪙 <b>{res.symbol}</b> | <code>1S → 15dk</code>\n"
+        f"🪙 <b>{res.symbol}</b> | <code>1S → 15dk</code> | 🔥 <b>Top 10 Gainer ({res.change_24h:+.2f}%)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🧭 <b>1S Bölge:</b> {htf_info}\n"
         f"⚡ <b>15dk Tetik:</b> {ltf_reason} (Anlık Giriş)\n"
@@ -687,7 +687,7 @@ class TelegramNotifier:
         entry_window_minutes: int = 0,
         long_entry_window_minutes: int | None = None,
         short_entry_window_minutes: int | None = None,
-        short_top_gainers: int = 0,
+        short_top_gainers: int = 10,
         long_min_win_rate: float = 65.0,
         long_min_profit_pct: float = 300.0,
     ) -> dict:
@@ -816,6 +816,7 @@ class TelegramNotifier:
                 top_gainers = {
                     r.symbol
                     for r in sorted(results, key=lambda x: x.change_24h, reverse=True)[:short_top_gainers]
+                    if r.change_24h > 0
                 }
             for res in results:
                 long_ev = res.evaluation
