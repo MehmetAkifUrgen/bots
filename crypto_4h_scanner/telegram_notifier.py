@@ -119,9 +119,7 @@ def format_managed_close_message(ev_dict: dict) -> str:
             f"<b>{ev_dict.get('cooldown_minutes', 240)} dk</b> yeni işlem açılmayacak."
         )
     side_tag = f" | <b>{ev_dict['side']}</b>" if ev_dict.get("side") else ""
-    tf_badge = ev_dict.get("tf_label") or (
-        "1S (1H)" if str(ev_dict.get("side") or "").upper() == "LONG" else "4S (4H)"
-    )
+    tf_badge = ev_dict.get("tf_label") or "4S (4H)"
     return (
         f"{icon} <b>POZİSYON KAPATILDI — {ev_dict['reason']}</b>\n"
         f"🪙 <b>{ev_dict['symbol']}</b>{side_tag} | <code>{tf_badge}</code>\n"
@@ -143,12 +141,12 @@ def format_dual_4h_message(
     trailing_floor_pct: float = 1.7,
     tf_override: str | None = None,
     ev_override=None,
-    long_window_min: int = 5,
-    short_window_min: int = 10,
+    long_window_min: int = 0,
+    short_window_min: int = 15,
 ) -> str:
     is_long = side.upper() == "LONG"
-    tf_raw = tf_override or ("1h" if is_long and getattr(res, "timeframe", "4h") == "1h" else "4h")
-    ev = ev_override or (res.evaluation if (is_long and tf_raw == "1h") else (res.long_evaluation or res.evaluation))
+    tf_raw = tf_override or getattr(res, "timeframe", "4h")
+    ev = ev_override or (res.evaluation if is_long else (res.long_evaluation or res.evaluation))
     tf_label = "1S (1H)" if tf_raw == "1h" else "4S (4H)"
     tf_short = "1S" if tf_raw == "1h" else "4S"
     entry = trade_exec.price if trade_exec else res.price
@@ -181,7 +179,7 @@ def format_dual_4h_message(
             f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
             f"🎯 <b>Kâr Al (Direnç):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
             f"🛑 <b>Stop (-%{stop_loss_pct:g}):</b> <code>{fmt_price(sl)}</code>\n"
-            f"🔒 <b>Çıkış Kuralı:</b> Direnç Kâr Al veya İndikatör SAT (+%2.5'te +%0.30 Kâr Kilidi, Trailing Yok)\n"
+            f"🔒 <b>Çıkış Kuralı:</b> Direnç Kâr Al veya İndikatör SAT (Başabaş Kilidi ve Trailing Yok)\n"
             f"📈 <b>{tf_short} Backtest:</b> <b>%{ev.win_rate:.1f} Başarı</b> ({ev.win_trades}/{ev.total_trades}) | <b>Getiri: %{ev.total_profit_pct:+.1f}</b>\n"
             f"{trade_block}"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -629,8 +627,8 @@ class TelegramNotifier:
     def process_4h_alert_only(
         self,
         results: list[Coin4hResult],
-        min_win_rate: float = 60.0,
-        min_profit_pct: float = 250.0,
+        min_win_rate: float = 65.0,
+        min_profit_pct: float = 300.0,
         dry_run: bool = False,
         trader: BinanceTrader | None = None,
         dual_mode: bool = True,
@@ -638,9 +636,10 @@ class TelegramNotifier:
         long_entry_window_minutes: int | None = None,
         short_entry_window_minutes: int | None = None,
         short_top_gainers: int = 0,
+        long_min_win_rate: float = 65.0,
         long_min_profit_pct: float = 300.0,
     ) -> dict:
-        """Process hybrid signals: LONG on 1H Pine 5/5 (>=300% profit, last 5m), SHORT on 4H 5/5 + EMA200 (last 10m)."""
+        """Process 4H signals: LONG on 4H Pine 5/5 (WR>=65%, Profit>=300%, instant), SHORT on 4H 5/5 + EMA200 (last 15m)."""
         sent_alerts: dict[str, int] = self._state["sent_alerts"]
         stats = {
             "green": 0,
@@ -665,19 +664,19 @@ class TelegramNotifier:
             except Exception as exc:
                 stats["errors"].append(f"MANAGE_POS: {exc}")
 
-            # Pine Script 'SAT' (realSellCond) exit check for open 1H LONG positions (runs even when paused)
+            # Pine Script 'SAT' (realSellCond) exit check for open LONG positions (runs even when paused)
             for res in results:
                 pos = trader._state.get("open_positions", {}).get(res.symbol)
                 if not pos:
                     continue
                 if str(pos.get("side") or "LONG").upper() == "LONG" and not pos.get("use_trailing", True):
-                    ev_1h = res.evaluation
+                    ev_curr = res.evaluation
                     entry_bar_ts = int(pos.get("entry_bar_open_time") or 0)
                     if (
-                        ev_1h.real_sell_cond
-                        and ev_1h.bar_open_time > entry_bar_ts
-                        and not ev_1h.orange_trigger
-                        and not ev_1h.green_trigger
+                        ev_curr.real_sell_cond
+                        and ev_curr.bar_open_time > entry_bar_ts
+                        and not ev_curr.orange_trigger
+                        and not ev_curr.green_trigger
                     ):
                         try:
                             closed = trader.close_position(
@@ -692,11 +691,12 @@ class TelegramNotifier:
                                     else 0.0
                                 )
                                 stats["orders_closed"] += 1
+                                is_1h = getattr(res, "timeframe", "4h") == "1h"
                                 ev_close = {
                                     "symbol": res.symbol,
                                     "side": "LONG",
-                                    "tf_label": "1S (1H)",
-                                    "reason": "SAT (1S İndikatör Çıkışı)",
+                                    "tf_label": "1S (1H)" if is_1h else "4S (4H)",
+                                    "reason": "SAT (1S İndikatör Çıkışı)" if is_1h else "SAT (4S İndikatör Çıkışı)",
                                     "entry_price": entry_px,
                                     "exit_price": closed.price,
                                     "pnl_usd": round(pnl_usd, 2),
@@ -721,7 +721,7 @@ class TelegramNotifier:
             eff_short_min = (
                 short_entry_window_minutes
                 if short_entry_window_minutes is not None
-                else entry_window_minutes
+                else 15
             )
             short_win_ms = max(0, eff_short_min) * 60 * 1000
             top_gainers: set[str] | None = None
@@ -736,7 +736,11 @@ class TelegramNotifier:
                 side: str | None = None
                 ev = short_ev
                 tf_used = res.timeframe
-                if long_ev.orange_trigger and long_ev.total_profit_pct >= long_min_profit_pct:
+                if (
+                    long_ev.orange_trigger
+                    and long_ev.win_rate >= long_min_win_rate
+                    and long_ev.total_profit_pct >= long_min_profit_pct
+                ):
                     if long_win_ms > 0 and long_ev.bar_close_time > 0:
                         rem_ms = long_ev.bar_close_time - now_ms
                         if -60_000 <= rem_ms <= long_win_ms:
@@ -779,7 +783,7 @@ class TelegramNotifier:
                                 sl_price=None,
                                 side="LONG",
                                 use_trailing=False,
-                                be_trigger_pct=2.5,
+                                be_trigger_pct=0.0,
                                 entry_bar_open_time=ev.bar_open_time,
                             )
                         else:

@@ -573,82 +573,96 @@ class TestBinanceTrader(unittest.TestCase):
                 ema200_bear=True, all_five_sell=True, short_5_trigger=True,
             )
             res_mid = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_mid, timeframe="4h")
-            # With short_entry_window_minutes=10, mid-candle (3h left) SHORT is blocked!
-            st0 = notifier.process_4h_alert_only([res_mid], dual_mode=True, short_entry_window_minutes=10)
+            # With short_entry_window_minutes=15, mid-candle (3h left) SHORT is blocked!
+            st0 = notifier.process_4h_alert_only([res_mid], dual_mode=True, short_entry_window_minutes=15)
             self.assertEqual(st0["short"], 0)
 
-            # Inside final 10 minutes (8m left) -> SHORT 5/5 + EMA200 fires!
-            ev_last10 = SystemEvaluation(**{**ev_mid.__dict__, "bar_close_time": now_ms + 8 * 60_000})
-            res_last10 = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_last10, timeframe="4h")
-            st1 = notifier.process_4h_alert_only([res_last10], dual_mode=True, short_entry_window_minutes=10)
+            # 30m left is also outside last-15m SHORT window
+            ev_30m = SystemEvaluation(**{**ev_mid.__dict__, "bar_close_time": now_ms + 30 * 60_000})
+            res_30m = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_30m, timeframe="4h")
+            st_30m = notifier.process_4h_alert_only([res_30m], dual_mode=True, short_entry_window_minutes=15)
+            self.assertEqual(st_30m["short"], 0)
+
+            # Inside final 15 minutes (12m left) -> SHORT 5/5 + EMA200 fires!
+            ev_last15 = SystemEvaluation(**{**ev_mid.__dict__, "bar_close_time": now_ms + 12 * 60_000})
+            res_last15 = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_last15, timeframe="4h")
+            st1 = notifier.process_4h_alert_only([res_last15], dual_mode=True, short_entry_window_minutes=15)
             self.assertEqual(st1["short"], 1)
             self.assertEqual(len(sent), 1)
             self.assertIn("SHORT 5/5 + EMA200", sent[0])
             self.assertNotIn("Fiyat < 4S", sent[0])
             self.assertIn("Fiyat &lt; 4S", sent[0])
+            self.assertIn("Son 15dk", sent[0])
 
-            # 1H LONG Pine 5/5 requires total_profit_pct >= 300% AND last 5 minutes before 1H close
-            ev_1h_long_low_profit = SystemEvaluation(
+            # 4H LONG Pine 5/5 requires win_rate >= 65% AND total_profit_pct >= 300% (instant entry, no close wait)
+            ev_4h_low_profit = SystemEvaluation(
                 **{
-                    **ev_mid.__dict__,
-                    "bar_close_time": now_ms + 4 * 60_000,  # 4m left (inside 5m window)
+                    **ev_mid.__dict__,  # 3 hours left in 4H bar!
                     "ema200_bear": False,
                     "all_five_sell": False,
                     "short_5_trigger": False,
                     "orange_trigger": True,
                     "tp_level": 106.0,
+                    "win_rate": 70.0,
                     "total_profit_pct": 250.0,  # Below 300% -> must NOT enter
                 }
             )
-            res_low = Coin4hResult("SOLUSDT", "papi", 100.0, 3.0, 100_000_000.0, ev_1h_long_low_profit, timeframe="1h")
-            st_low = notifier.process_4h_alert_only(
-                [res_low], dual_mode=True, long_entry_window_minutes=5, short_entry_window_minutes=10, long_min_profit_pct=300.0
+            res_low_p = Coin4hResult("SOLUSDT", "papi", 100.0, 3.0, 100_000_000.0, ev_4h_low_profit, timeframe="4h")
+            st_low_p = notifier.process_4h_alert_only(
+                [res_low_p], dual_mode=True, long_entry_window_minutes=0, short_entry_window_minutes=15,
+                long_min_win_rate=65.0, long_min_profit_pct=300.0
             )
-            self.assertEqual(st_low["long"], 0)
+            self.assertEqual(st_low_p["long"], 0)
 
-            # Profit >= 300% (e.g. 340%), but 20m left before 1H close -> blocked by 5m window
-            ev_1h_early = SystemEvaluation(
+            # Profit >= 300% (350%), but win_rate = 62% (< 65%) -> must NOT enter
+            ev_4h_low_wr = SystemEvaluation(
                 **{
-                    **ev_1h_long_low_profit.__dict__,
-                    "total_profit_pct": 340.0,
-                    "bar_close_time": now_ms + 20 * 60_000,
+                    **ev_4h_low_profit.__dict__,
+                    "win_rate": 62.0,
+                    "total_profit_pct": 350.0,
                 }
             )
-            res_early = Coin4hResult("SOLUSDT", "papi", 100.0, 3.0, 100_000_000.0, ev_1h_early, timeframe="1h")
-            st_early = notifier.process_4h_alert_only(
-                [res_early], dual_mode=True, long_entry_window_minutes=5, short_entry_window_minutes=10, long_min_profit_pct=300.0
+            res_low_wr = Coin4hResult("SOLUSDT", "papi", 100.0, 3.0, 100_000_000.0, ev_4h_low_wr, timeframe="4h")
+            st_low_wr = notifier.process_4h_alert_only(
+                [res_low_wr], dual_mode=True, long_entry_window_minutes=0, short_entry_window_minutes=15,
+                long_min_win_rate=65.0, long_min_profit_pct=300.0
             )
-            self.assertEqual(st_early["long"], 0)
+            self.assertEqual(st_low_wr["long"], 0)
 
-            # Profit >= 300% AND 4m left before 1H close -> LONG fires!
-            ev_1h_ok = SystemEvaluation(
+            # Win Rate >= 65% (68%) AND Profit >= 300% (350%) -> fires immediately mid-candle (3h left)!
+            ev_4h_ok = SystemEvaluation(
                 **{
-                    **ev_1h_early.__dict__,
-                    "bar_close_time": now_ms + 4 * 60_000,
+                    **ev_4h_low_profit.__dict__,
+                    "win_rate": 68.0,
+                    "total_profit_pct": 350.0,
                 }
             )
-            res_sol = Coin4hResult("SOLUSDT", "papi", 100.0, 3.0, 100_000_000.0, ev_1h_ok, timeframe="1h")
+            res_sol = Coin4hResult("SOLUSDT", "papi", 100.0, 3.0, 100_000_000.0, ev_4h_ok, timeframe="4h")
             st3 = notifier.process_4h_alert_only(
-                [res_sol], dual_mode=True, long_entry_window_minutes=5, short_entry_window_minutes=10, long_min_profit_pct=300.0
+                [res_sol], dual_mode=True, long_entry_window_minutes=0, short_entry_window_minutes=15,
+                long_min_win_rate=65.0, long_min_profit_pct=300.0
             )
             self.assertEqual(st3["long"], 1)
-            self.assertIn("[1S SİSTEM] TURUNCU KESİN AL (5/5) — LONG", sent[-1])
-            self.assertIn("Trailing Yok", sent[-1])
+            self.assertIn("[4S SİSTEM] TURUNCU KESİN AL (5/5) — LONG", sent[-1])
+            self.assertIn("Başabaş Kilidi ve Trailing Yok", sent[-1])
+            self.assertIn("Anlık Giriş", sent[-1])
 
             # Pause (/durdur) blocks new entries; Resume (/baslat) re-enables them
             notifier.set_paused(True)
-            res_ada = Coin4hResult("ADAUSDT", "papi", 1.0, 3.0, 100_000_000.0, ev_1h_ok, timeframe="1h")
+            res_ada = Coin4hResult("ADAUSDT", "papi", 1.0, 3.0, 100_000_000.0, ev_4h_ok, timeframe="4h")
             st_paused = notifier.process_4h_alert_only(
-                [res_ada], dual_mode=True, long_entry_window_minutes=5, short_entry_window_minutes=10, long_min_profit_pct=300.0
+                [res_ada], dual_mode=True, long_entry_window_minutes=0, short_entry_window_minutes=15,
+                long_min_win_rate=65.0, long_min_profit_pct=300.0
             )
             self.assertEqual(st_paused["long"], 0)
             notifier.set_paused(False)
             st_resumed = notifier.process_4h_alert_only(
-                [res_ada], dual_mode=True, long_entry_window_minutes=5, short_entry_window_minutes=10, long_min_profit_pct=300.0
+                [res_ada], dual_mode=True, long_entry_window_minutes=0, short_entry_window_minutes=15,
+                long_min_win_rate=65.0, long_min_profit_pct=300.0
             )
             self.assertEqual(st_resumed["long"], 1)
 
-    def test_1h_long_no_trailing_tp_breakeven_and_real_sell_exit(self) -> None:
+    def test_4h_long_no_trailing_no_breakeven_tp_and_real_sell_exit(self) -> None:
         import time as _time
         with tempfile.TemporaryDirectory() as tmp:
             trader = BinanceTrader(
@@ -697,7 +711,7 @@ class TestBinanceTrader(unittest.TestCase):
             bar1_open = 1_700_000_000_000
             ev_entry = SystemEvaluation(
                 bar_open_time=bar1_open,
-                bar_close_time=now_ms + 3 * 60_000,
+                bar_close_time=now_ms + 180 * 60_000,  # 3h left -> still opens immediately!
                 price=100.0,
                 cond1_buy=True, cond2_buy=True, cond3_buy=True, cond4_buy=True, cond5_buy=True,
                 trend_ok=True, first_three_buy=True, all_five_buy=True,
@@ -707,54 +721,53 @@ class TestBinanceTrader(unittest.TestCase):
                 entry_price=100.0, tp_level=106.0, sl_level=96.0, next_res=106.0, prev_sup=96.0,
                 total_trades=40, win_trades=28, win_rate=70.0, total_profit_pct=350.0,
             )
-            res_eth = Coin4hResult("ETHUSDT", "papi", 100.0, 4.0, 200_000_000.0, ev_entry, timeframe="1h")
+            res_eth = Coin4hResult("ETHUSDT", "papi", 100.0, 4.0, 200_000_000.0, ev_entry, timeframe="4h")
             st_open = notifier.process_4h_alert_only(
-                [res_eth], trader=trader, dual_mode=True, long_entry_window_minutes=5, long_min_profit_pct=300.0
+                [res_eth], trader=trader, dual_mode=True, long_entry_window_minutes=0,
+                long_min_win_rate=65.0, long_min_profit_pct=300.0
             )
             self.assertEqual(st_open["orders_opened"], 1)
             pos = trader._state["open_positions"]["ETHUSDT"]
             self.assertFalse(pos["use_trailing"])
+            self.assertEqual(pos["be_trigger_pct"], 0.0)
             self.assertAlmostEqual(pos["tp_price"], 106.0, places=2)
             self.assertAlmostEqual(pos["sl_price"], 98.5, places=2)  # -1.5% normal stop
 
-            # Pullback from +2.2% (102.2) to +1.6% (101.6) must NOT close via trailing!
-            self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 102.2})), 0)
+            # Pullback from +3.2% (103.2) down to +0.1% (100.1) must NOT trigger trailing OR break-even lock!
+            self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 103.2})), 0)
             self.assertFalse(trader._state["open_positions"]["ETHUSDT"]["trailing_active"])
-            self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 101.6})), 0)
+            self.assertFalse(trader._state["open_positions"]["ETHUSDT"]["be_locked"])
+            self.assertAlmostEqual(trader._state["open_positions"]["ETHUSDT"]["sl_price"], 98.5, places=2)
+            self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 100.1})), 0)
             self.assertIn("ETHUSDT", trader._state["open_positions"])
 
-            # Reaching +2.6% (102.6) activates Pine +2.5% break-even lock at 100.30 (+0.30%), still open!
-            self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 102.6})), 0)
-            self.assertTrue(trader._state["open_positions"]["ETHUSDT"]["be_locked"])
-            self.assertAlmostEqual(trader._state["open_positions"]["ETHUSDT"]["sl_price"], 100.3, places=2)
-            self.assertEqual(placed_stops[-1], ("ETHUSDT", 100.3))
-
-            # Next 1H bar triggers Pine 'SAT' (real_sell_cond=True) -> closes position even if paused!
+            # Next 4H bar triggers Pine 'SAT' (real_sell_cond=True) -> closes position even if paused!
             notifier.set_paused(True, trader)
             last_price["p"] = 103.5
             ev_sell = SystemEvaluation(
                 **{
                     **ev_entry.__dict__,
-                    "bar_open_time": bar1_open + 3600_000,
+                    "bar_open_time": bar1_open + 4 * 3600_000,
                     "price": 103.5,
                     "green_trigger": False,
                     "orange_trigger": False,
                     "real_sell_cond": True,
                 }
             )
-            res_eth_sell = Coin4hResult("ETHUSDT", "papi", 103.5, 5.0, 200_000_000.0, ev_sell, timeframe="1h")
+            res_eth_sell = Coin4hResult("ETHUSDT", "papi", 103.5, 5.0, 200_000_000.0, ev_sell, timeframe="4h")
             st_close = notifier.process_4h_alert_only(
-                [res_eth_sell], trader=trader, dual_mode=True, long_entry_window_minutes=5, long_min_profit_pct=300.0
+                [res_eth_sell], trader=trader, dual_mode=True, long_entry_window_minutes=0,
+                long_min_win_rate=65.0, long_min_profit_pct=300.0
             )
             self.assertEqual(st_close["orders_closed"], 1)
             self.assertNotIn("ETHUSDT", trader._state["open_positions"])
-            self.assertIn("SAT (1S İndikatör Çıkışı)", sent[-1])
+            self.assertIn("SAT (4S İndikatör Çıkışı)", sent[-1])
 
             # Resistance TP test: hits tp_price=1.06 -> closes with KÂR AL (Direnç)
             notifier.set_paused(False, trader)
             last_price["p"] = 1.00
             trader.open_position(
-                "XRPUSDT", price=1.00, target_usd=200.0, tp_price=1.06, side="LONG", use_trailing=False, be_trigger_pct=2.5
+                "XRPUSDT", price=1.00, target_usd=200.0, tp_price=1.06, side="LONG", use_trailing=False, be_trigger_pct=0.0
             )
             last_price["p"] = 1.062
             tp_evs = trader.manage_open_positions({"XRPUSDT": 1.062})

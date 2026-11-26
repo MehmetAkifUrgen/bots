@@ -352,10 +352,10 @@ class Binance4hScanner:
             )
 
         df_ohlcv = self.fetch_klines_cached(
-            sym, interval="4h", initial_limit=1500, pages=2, max_rows=3000
+            sym, interval="4h", initial_limit=1500, pages=4, max_rows=5000
         )
         df_1m = self.fetch_klines_cached(
-            sym, interval="1M", initial_limit=24, pages=1, max_rows=30
+            sym, interval="1M", initial_limit=36, pages=1, max_rows=48
         )
         ev = evaluate_4h_system(
             df_ohlcv, df_1m=df_1m, pivot_len=7, be_trigger_pct=2.5, ema200_filter=False
