@@ -717,54 +717,92 @@ def evaluate_4h_system(
 
 def check_1h_short_zone(
     df_1h: pd.DataFrame,
-    ema_touch_buffer: float = 2.5,
+    df_4h: pd.DataFrame | None = None,
+    df_1m: pd.DataFrame | None = None,
+    ema_touch_buffer: float = 2.0,
     pivot_len: int = 7,
 ) -> tuple[bool, str]:
     """
-    Stage 1 (1H Screening): Check if coin on 1H chart is rejecting from EMA200,
-    7-bar Pivot Resistance, or 1H overbought peak (RSI >= 68 or WT >= 40).
+    Stage 1 (HTF Wall + Red Candle Screening for Top Gainers):
+    Never short a Top Gainer just because RSI/WT is overbought ('çok yükselmiş diye değil').
+    Require:
+      1) Price hit/wicked a real 1H or 4H Major Wall (1H EMA200, 4H EMA200, 1H Pivot Resistance,
+         or 4H Pivot / Monthly Fib Resistance) and rejected back below it, AND
+      2) Lit a red rejection candle on 1H (current 1H close < open, or previous 1H closed red
+         and current price remains below that rejection high).
     """
     if len(df_1h) < 60:
         return False, ""
 
-    highs = df_1h["high"].astype(float).reset_index(drop=True)
-    lows = df_1h["low"].astype(float).reset_index(drop=True)
-    closes = df_1h["close"].astype(float).reset_index(drop=True)
+    opens_1h = df_1h["open"].astype(float).reset_index(drop=True)
+    highs_1h = df_1h["high"].astype(float).reset_index(drop=True)
+    lows_1h = df_1h["low"].astype(float).reset_index(drop=True)
+    closes_1h = df_1h["close"].astype(float).reset_index(drop=True)
 
-    ema200 = pine_ema(closes, 200)
-    rsi_main = wilder_rsi(closes, length=14)
-    wt1, _ = wavetrend(highs, lows, closes, n1=10, n2=21)
-    piv_h, _ = compute_pivots(highs, lows, left=pivot_len, right=pivot_len)
+    curr_open = float(opens_1h.iloc[-1])
+    curr_close = float(closes_1h.iloc[-1])
+    prev_red_1h = len(df_1h) >= 2 and (
+        float(closes_1h.iloc[-2]) < float(opens_1h.iloc[-2])
+        and curr_close <= float(highs_1h.iloc[-2])
+    )
+    curr_red_1h = curr_close < curr_open
+    if not (curr_red_1h or prev_red_1h):
+        return False, ""
 
-    valid_pivs = piv_h[~np.isnan(piv_h)]
-    last_res = float(valid_pivs[-1]) if len(valid_pivs) > 0 else None
+    ema200_1h = pine_ema(closes_1h, 200)
+    piv_h_1h, _ = compute_pivots(highs_1h, lows_1h, left=pivot_len, right=pivot_len)
+    valid_pivs_1h = [float(x) for x in piv_h_1h[~np.isnan(piv_h_1h)][-8:]]
 
-    recent_high4 = float(highs.iloc[-4:].max())
-    curr_close = float(closes.iloc[-1])
-    ema200_val = float(ema200.iloc[-1])
+    recent_high4_1h = float(highs_1h.iloc[-4:].max())
+    ema200_1h_val = float(ema200_1h.iloc[-1])
 
     reasons: list[str] = []
+    # 1) 1H EMA 200 Wall Rejection
     if (
-        not np.isnan(ema200_val)
-        and recent_high4 >= ema200_val * (1.0 - ema_touch_buffer / 100.0)
-        and curr_close < ema200_val
+        not np.isnan(ema200_1h_val)
+        and ema200_1h_val * (1.0 - ema_touch_buffer / 100.0) <= recent_high4_1h <= ema200_1h_val * 1.035
+        and curr_close < ema200_1h_val
     ):
         reasons.append("1S EMA200 Reddi")
 
-    if (
-        last_res is not None
-        and recent_high4 >= last_res * 0.99
-        and curr_close <= last_res * 1.005
-    ):
-        reasons.append("1S Direnç Reddi")
+    # 2) 1H Major Pivot Resistance Rejection
+    for res_1h in reversed(valid_pivs_1h):
+        if res_1h * 0.988 <= recent_high4_1h <= res_1h * 1.03 and curr_close < res_1h:
+            reasons.append("1S Ana Direnç Reddi")
+            break
 
-    max_rsi5 = float(rsi_main.iloc[-5:].max())
-    max_wt5 = float(wt1.iloc[-5:].max())
-    if (not np.isnan(max_rsi5) and max_rsi5 >= 68.0) or (not np.isnan(max_wt5) and max_wt5 >= 40.0):
-        reasons.append("1S Tepe Şişkinliği (RSI/WT)")
+    # 3) 4H EMA 200 & 4H Major Pivot / Monthly Fib Resistance Rejection
+    if df_4h is not None and len(df_4h) >= 60:
+        highs_4h = df_4h["high"].astype(float).reset_index(drop=True)
+        lows_4h = df_4h["low"].astype(float).reset_index(drop=True)
+        closes_4h = df_4h["close"].astype(float).reset_index(drop=True)
+        ema200_4h = pine_ema(closes_4h, 200)
+        ema200_4h_val = float(ema200_4h.iloc[-1])
+        recent_high2_4h = float(highs_4h.iloc[-2:].max())
+
+        if (
+            not np.isnan(ema200_4h_val)
+            and ema200_4h_val * (1.0 - ema_touch_buffer / 100.0) <= recent_high2_4h <= ema200_4h_val * 1.035
+            and curr_close < ema200_4h_val
+        ):
+            reasons.append("4S EMA200 Reddi")
+
+        piv_h_4h, _ = compute_pivots(highs_4h, lows_4h, left=pivot_len, right=pivot_len)
+        levels_4h = [float(x) for x in piv_h_4h[~np.isnan(piv_h_4h)][-8:]]
+        if df_1m is not None and not df_1m.empty and "open_time" in df_4h.columns:
+            fp, fr1, fr2, _, _ = _monthly_fib_for_bar(int(df_4h["open_time"].iloc[-1]), df_1m)
+            for fl in (fp, fr1, fr2):
+                if fl is not None:
+                    levels_4h.append(float(fl))
+
+        for res_4h in reversed(levels_4h):
+            if res_4h * 0.988 <= recent_high2_4h <= res_4h * 1.03 and curr_close < res_4h:
+                reasons.append("4S Ana Direnç Reddi")
+                break
 
     if reasons:
-        return True, " + ".join(reasons)
+        candle_tag = "1S Kırmızı Mum" if curr_red_1h else "1S Red Mumu Onayı"
+        return True, f"{' + '.join(reasons)} ({candle_tag})"
     return False, ""
 
 
@@ -786,6 +824,7 @@ def evaluate_short_15m_system(
     if len(df_15m) < 60:
         return None
 
+    opens = df_15m["open"].astype(float).reset_index(drop=True)
     highs = df_15m["high"].astype(float).reset_index(drop=True)
     lows = df_15m["low"].astype(float).reset_index(drop=True)
     closes = df_15m["close"].astype(float).reset_index(drop=True)
@@ -842,6 +881,7 @@ def evaluate_short_15m_system(
         c4 = bool(wt1.iloc[i] < wt2.iloc[i])
         c5 = bool((smi.iloc[i] < smi_sig.iloc[i]) and (smi.iloc[i] < smi_ema9.iloc[i]))
 
+        bar_o = float(opens.iloc[i])
         bar_h = float(highs.iloc[i])
         bar_l = float(lows.iloc[i])
         bar_c = float(closes.iloc[i])
@@ -859,7 +899,9 @@ def evaluate_short_15m_system(
             not np.isnan(max_w5) and max_w5 >= 40.0
         )
 
-        early_cond = c1 and c2 and c3 and (ema_reject or peak_reject)
+        # On live bar (i == n - 1), also require 15m candle to be red (close < open) so we never short into a green push
+        red_ok = True if i < n - 1 else (bar_c < bar_o)
+        early_cond = c1 and c2 and c3 and (ema_reject or peak_reject) and red_ok
         full_cond = early_cond and c4 and c5
 
         early_fired = False

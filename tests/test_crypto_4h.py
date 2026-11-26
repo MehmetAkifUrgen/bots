@@ -799,14 +799,34 @@ class TestBinanceTrader(unittest.TestCase):
         self.assertEqual(int(df_4h["close_time"].iloc[-1]), bucket_start + h4_ms - 1)
 
     def test_1h_zone_and_15m_early_short_full_lifecycle(self) -> None:
-        # 1) Indicator test: rally then rollover triggers check_1h_short_zone and evaluate_short_15m_system
+        # 1) Pure parabolic uptrend with NO overhead resistance/EMA200 wall must NOT pass check_1h_short_zone!
+        parabolic_closes = np.linspace(50.0, 150.0, 250)  # Pure bull run, high RSI/WT, way above EMA200 & old pivots
+        df_parabolic = _make_ohlcv(parabolic_closes)
+        in_parabolic_zone, _ = check_1h_short_zone(df_parabolic, df_4h=df_parabolic)
+        self.assertFalse(in_parabolic_zone, "Parabolic runner in price discovery must NOT be shorted!")
+
+        # Rally up to EMA200 wall + first red rejection candle MUST pass check_1h_short_zone!
+        downtrend_then_bounce = np.concatenate([
+            np.linspace(140.0, 90.0, 210),
+            np.linspace(90.0, 106.0, 39),
+            np.array([104.5]),  # Red candle rejecting right below EMA200!
+        ])
+        df_wall = _make_ohlcv(downtrend_then_bounce)
+        # Ensure high of penultimate bar touched EMA200 (~106-107) and last bar closed red below it
+        ema_approx = float(df_wall["close"].ewm(span=200, adjust=False).mean().iloc[-1])
+        df_wall.loc[df_wall.index[-2], "high"] = ema_approx * 1.005
+        df_wall.loc[df_wall.index[-1], "open"] = ema_approx * 0.998
+        df_wall.loc[df_wall.index[-1], "high"] = ema_approx * 1.001
+        df_wall.loc[df_wall.index[-1], "close"] = ema_approx * 0.985
+        in_wall_zone, wall_reason = check_1h_short_zone(df_wall, df_4h=df_wall)
+        self.assertTrue(in_wall_zone)
+        self.assertIn("EMA200 Reddi", wall_reason)
+        self.assertIn("Kırmızı Mum", wall_reason)
+
+        # Oscillating wave triggers evaluate_short_15m_system on red reversal bars
         x = np.linspace(0, 6 * np.pi, 260)
         closes = 100.0 + 14.0 * np.sin(x)
         df_wave = _make_ohlcv(closes)
-        in_zone, reason = check_1h_short_zone(df_wave)
-        self.assertIsInstance(in_zone, bool)
-        self.assertIsInstance(reason, str)
-
         seen_early = False
         for end in range(90, len(df_wave) + 1):
             sev = evaluate_short_15m_system(df_wave.iloc[:end].copy(), in_1h_zone=True, htf_reason="1S EMA200 Reddi")

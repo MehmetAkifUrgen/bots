@@ -373,14 +373,16 @@ class Binance4hScanner:
         if ev is None:
             return None
 
-        # 2-Stage SHORT (ONLY Top 10 Gainers): 1H Zone Screening -> 15m Early Reversal Entry
+        # 2-Stage SHORT (ONLY Top 10 Gainers): 1H/4H Resistance or EMA200 Wall + Red Candle -> 15m Early Reversal
         in_1h_zone = False
         htf_reason = ""
         if allow_short_scan:
             df_1h_short = self.fetch_klines_cached(
                 sym, interval="1h", initial_limit=350, pages=1, max_rows=450
             )
-            in_1h_zone, htf_reason = check_1h_short_zone(df_1h_short)
+            in_1h_zone, htf_reason = check_1h_short_zone(
+                df_1h_short, df_4h=df_ohlcv, df_1m=df_1m
+            )
 
         short_15m_ev: ShortPeakEvaluation | None = None
         if (allow_short_scan and in_1h_zone) or force_15m:
