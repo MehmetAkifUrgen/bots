@@ -413,7 +413,7 @@ class Binance4hScanner:
         min_volume_usdt: float = 5_000_000.0,
         limit: int = 0,
         interval: str = "1h",
-        short_top_gainers: int = 10,
+        short_top_gainers: int = 20,
         extra_15m_symbols: set[str] | None = None,
     ) -> tuple[list[Coin4hResult], list[str], float]:
         """Scan Binance USDT pairs on 4H (+ Top N Gainers 1H->15m SHORT zone screening)."""

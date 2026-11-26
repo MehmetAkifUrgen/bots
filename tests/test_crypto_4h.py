@@ -916,30 +916,30 @@ class TestBinanceTrader(unittest.TestCase):
             st_blk = notifier.process_4h_alert_only([res_blocked], trader=trader, dual_mode=True)
             self.assertEqual(st_blk["orders_opened"], 0)
 
-            # In 1H zone + 15m early_fired, but if ranked #11 outside Top 10 Gainers -> MUST BE BLOCKED!
+            # In 1H zone + 15m early_fired, but if ranked #21 outside Top 20 Gainers -> MUST BE BLOCKED!
             sev_ok = ShortPeakEvaluation(
                 **{**sev_no_zone.__dict__, "in_1h_zone": True, "htf_reason": "1S EMA200 Reddi"}
             )
-            top10_dummies = [
+            top20_dummies = [
                 Coin4hResult(f"GAIN{i}USDT", "papi", 10.0, 50.0 - i, 50_000_000.0, base_4h_ev, timeframe="4h")
-                for i in range(10)
+                for i in range(20)
             ]
-            res_rank11 = Coin4hResult(
+            res_rank21 = Coin4hResult(
                 "BORINGUSDT", "papi", 100.0, 3.0, 80_000_000.0, base_4h_ev, timeframe="4h",
                 short_15m_evaluation=sev_ok,
             )
-            st_rank11 = notifier.process_4h_alert_only(top10_dummies + [res_rank11], trader=trader, dual_mode=True, short_top_gainers=10)
-            self.assertEqual(st_rank11["orders_opened"], 0)
+            st_rank21 = notifier.process_4h_alert_only(top20_dummies + [res_rank21], trader=trader, dual_mode=True, short_top_gainers=20)
+            self.assertEqual(st_rank21["orders_opened"], 0)
 
-            # Ranked #1 in Top 10 Gainers (+65% 24h) + 1H zone + 15m early_fired -> opens SHORT immediately!
+            # Ranked #1 in Top 20 Gainers (+65% 24h) + 1H zone + 15m early_fired -> opens SHORT immediately!
             res_ok = Coin4hResult(
                 "EVAAUSDT", "papi", 100.0, 65.0, 80_000_000.0, base_4h_ev, timeframe="4h",
                 short_15m_evaluation=sev_ok,
             )
-            st_open = notifier.process_4h_alert_only(top10_dummies + [res_ok], trader=trader, dual_mode=True, short_top_gainers=10)
+            st_open = notifier.process_4h_alert_only(top20_dummies + [res_ok], trader=trader, dual_mode=True, short_top_gainers=20)
             self.assertEqual(st_open["orders_opened"], 1)
             self.assertIn("[1S→15dk] ERKEN SHORT", sent[-1])
-            self.assertIn("Top 10 Gainer (+65.00%)", sent[-1])
+            self.assertIn("Top 20 Gainer (+65.00%)", sent[-1])
             self.assertIn("1S EMA200 Reddi", sent[-1])
 
             spos = trader._state["open_positions"]["EVAAUSDT"]

@@ -274,7 +274,7 @@ def main() -> None:
     long_min_profit = float(os.getenv("LONG_MIN_PROFIT_PCT", "300.0"))
     effective_poll = min(args.poll_seconds, 60)
 
-    short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "10")) or 10
+    short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "20")) or 20
     trade_mode_str = (
         f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, LONG: 4S Direnç/SAT, SHORT: Top{short_top_n} 1S→15dk)"
         if trader

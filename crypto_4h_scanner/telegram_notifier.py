@@ -208,6 +208,7 @@ def format_short_15m_message(
     trade_exec: TradeExecution | None = None,
     trade_note: str | None = None,
     stop_loss_pct: float = 1.5,
+    top_n: int = 20,
 ) -> str:
     sev = res.short_15m_evaluation
     assert sev is not None
@@ -240,7 +241,7 @@ def format_short_15m_message(
     ltf_reason = "15dk EMA200 Reddi" if sev.ema200_reject else "15dk Tepe Şişkinliği Dönüşü"
     return (
         f"{header}\n"
-        f"🪙 <b>{res.symbol}</b> | <code>1S → 15dk</code> | 🔥 <b>Top 10 Gainer ({res.change_24h:+.2f}%)</b>\n"
+        f"🪙 <b>{res.symbol}</b> | <code>1S → 15dk</code> | 🔥 <b>Top {top_n} Gainer ({res.change_24h:+.2f}%)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🧭 <b>1S Bölge:</b> {htf_info}\n"
         f"⚡ <b>15dk Tetik:</b> {ltf_reason} (Anlık Giriş)\n"
@@ -687,7 +688,7 @@ class TelegramNotifier:
         entry_window_minutes: int = 0,
         long_entry_window_minutes: int | None = None,
         short_entry_window_minutes: int | None = None,
-        short_top_gainers: int = 10,
+        short_top_gainers: int = 20,
         long_min_win_rate: float = 65.0,
         long_min_profit_pct: float = 300.0,
     ) -> dict:
@@ -922,6 +923,7 @@ class TelegramNotifier:
                                 trade_exec=trade_exec,
                                 trade_note=trade_note,
                                 stop_loss_pct=trader.stop_loss_pct if trader else 1.5,
+                                top_n=short_top_gainers or 20,
                             )
                         )
                     else:
