@@ -120,11 +120,26 @@ def format_managed_close_message(ev_dict: dict) -> str:
         )
     side_tag = f" | <b>{ev_dict['side']}</b>" if ev_dict.get("side") else ""
     tf_badge = ev_dict.get("tf_label") or "4S (4H)"
+    is_paper = bool(ev_dict.get("is_paper"))
+    title_prefix = "🧪 [SANAL TEST] " if is_paper else ""
+    paper_block = ""
+    if is_paper:
+        fee_usd = float(ev_dict.get("fee_usd") or 0.0)
+        bal = float(ev_dict.get("paper_balance") or 0.0)
+        init_bal = float(ev_dict.get("paper_initial") or 100.0)
+        bal_pct = ((bal - init_bal) / init_bal * 100.0) if init_bal > 0 else 0.0
+        trades = int(ev_dict.get("paper_trades") or 0)
+        wins = int(ev_dict.get("paper_wins") or 0)
+        paper_block = (
+            f"\n💸 <b>Binance Komisyon:</b> <code>-${fee_usd:.3f}</code> (Giriş+Çıkış %0.10)\n"
+            f"🏦 <b>Güncel Sanal Kasa:</b> <b>${bal:.2f}</b> (<b>{bal_pct:+.2f}%</b>) | <b>İşlem:</b> {wins}/{trades}"
+        )
     return (
-        f"{icon} <b>POZİSYON KAPATILDI — {ev_dict['reason']}</b>\n"
+        f"{icon} <b>{title_prefix}POZİSYON KAPATILDI — {ev_dict['reason']}</b>\n"
         f"🪙 <b>{ev_dict['symbol']}</b>{side_tag} | <code>{tf_badge}</code>\n"
         f"💵 <b>Giriş:</b> <code>{fmt_price(ev_dict['entry_price'])}</code> → <b>Çıkış:</b> <code>{fmt_price(ev_dict['exit_price'])}</code>\n"
-        f"📊 <b>Net Kâr/Zarar:</b> <b>${pnl_usd:+.2f} ({pnl_pct:+.2f}%)</b>\n"
+        f"📊 <b>Net Kâr/Zarar:</b> <b>${pnl_usd:+.2f} ({pnl_pct:+.2f}%)</b>"
+        f"{paper_block}\n"
         f"🧾 <b>Emir ID:</b> <code>{ev_dict['order_id']}</code>"
         f"{cooldown_line}"
     )
@@ -160,11 +175,19 @@ def format_dual_4h_message(
     )
     trade_block = ""
     if trade_exec:
-        trade_block = (
-            f"\n⚡ <b>OTOMATİK {side.upper()} EMİR AÇILDI</b>\n"
-            f"• Büyüklük: <b>${trade_exec.notional_usd:.2f}</b> | Miktar: <code>{trade_exec.qty:g}</code>\n"
-            f"• Emir ID: <code>{trade_exec.order_id}</code>\n"
-        )
+        if trade_exec.is_paper:
+            trade_block = (
+                f"\n🧪 <b>SANAL {side.upper()} EMİR AÇILDI (TEST MODU)</b>\n"
+                f"• Büyüklük: <b>${trade_exec.notional_usd:.2f}</b> | Miktar: <code>{trade_exec.qty:g}</code>\n"
+                f"• Giriş Komisyonu (%0.05): <code>-${trade_exec.fee_usd:.3f}</code> | Sanal Kasa: <b>${trade_exec.paper_balance:.2f}</b>\n"
+                f"• Emir ID: <code>{trade_exec.order_id}</code>\n"
+            )
+        else:
+            trade_block = (
+                f"\n⚡ <b>OTOMATİK {side.upper()} EMİR AÇILDI</b>\n"
+                f"• Büyüklük: <b>${trade_exec.notional_usd:.2f}</b> | Miktar: <code>{trade_exec.qty:g}</code>\n"
+                f"• Emir ID: <code>{trade_exec.order_id}</code>\n"
+            )
     elif trade_note:
         trade_block = f"\nℹ️ <i>{html.escape(str(trade_note))}</i>\n"
 
@@ -485,6 +508,14 @@ class TelegramNotifier:
                     "• Yeni sinyallerde otomatik işlem ve bildirim devam ediyor.\n"
                     "⏸️ Durdurmak için: <code>/durdur</code>"
                 )
+            elif cmd in ("/sifirla", "/sıfırla", "/paper_reset"):
+                if trader is not None and trader.paper_mode:
+                    ps = trader.reset_paper_account()
+                    self.send_text(
+                        f"🔄 <b>Sanal Kasa Sıfırlandı!</b>\n"
+                        f"• Yeni Başlangıç Bakiyesi: <b>${ps['balance']:.2f}</b>\n"
+                        f"• Tüm sanal pozisyonlar ve istatistikler temizlendi."
+                    )
             elif cmd in ("/durum", "/status", "/komutlar", "/yardim", "/help"):
                 paused = self.is_paused(trader)
                 state_badge = "⏸️ DURDURULDU" if paused else "🟢 AKTİF"
@@ -496,11 +527,20 @@ class TelegramNotifier:
                     if (trader and trader.is_in_cooldown())
                     else "Kapalı"
                 )
+                paper_lines = ""
+                if trader is not None and trader.paper_mode:
+                    ps = trader.get_paper_summary()
+                    paper_lines = (
+                        f"• 🧪 <b>Mod:</b> SANAL TEST (Komisyon: %{ps['taker_fee_pct']:g}x2)\n"
+                        f"• 🏦 <b>Sanal Kasa:</b> <b>${ps['balance']:.2f}</b> (Başlangıç: ${ps['initial_balance']:.2f} | Net: <b>${ps['net_usd']:+.2f} / {ps['net_pct']:+.2f}%</b>)\n"
+                        f"• 💸 <b>Toplam Komisyon:</b> <code>-${ps['total_fees']:.3f}</code> | <b>İşlem:</b> {ps['win_trades']}/{ps['total_trades']}\n"
+                    )
                 self.send_text(
                     f"📊 <b>Bot Durumu:</b> <b>{state_badge}</b>\n"
+                    f"{paper_lines}"
                     f"• Açık Pozisyonlar: <code>{', '.join(open_syms) if open_syms else 'YOK'}</code>\n"
                     f"• Art Arda Stop Sayacı: <b>{stops}/{max_s}</b> | Mola: <b>{cd}</b>\n"
-                    f"• Komutlar: <code>/durdur</code> | <code>/baslat</code> | <code>/durum</code>"
+                    f"• Komutlar: <code>/durdur</code> | <code>/baslat</code> | <code>/durum</code> | <code>/sifirla</code>"
                 )
 
     def _try_open_trade(
@@ -749,11 +789,17 @@ class TelegramNotifier:
                             )
                             if closed:
                                 entry_px = float(pos.get("entry_price") or closed.price)
-                                pnl_usd = (closed.price - entry_px) * closed.qty
-                                pnl_pct = (
+                                gross_usd = (closed.price - entry_px) * closed.qty
+                                gross_pct = (
                                     ((closed.price - entry_px) / entry_px) * 100.0
                                     if entry_px > 0
                                     else 0.0
+                                )
+                                net_usd = gross_usd - closed.fee_usd if closed.is_paper else gross_usd
+                                net_pct = (
+                                    gross_pct - (2.0 * trader.taker_fee_pct)
+                                    if closed.is_paper
+                                    else gross_pct
                                 )
                                 stats["orders_closed"] += 1
                                 is_1h = getattr(res, "timeframe", "4h") == "1h"
@@ -764,8 +810,14 @@ class TelegramNotifier:
                                     "reason": "SAT (1S İndikatör Çıkışı)" if is_1h else "SAT (4S İndikatör Çıkışı)",
                                     "entry_price": entry_px,
                                     "exit_price": closed.price,
-                                    "pnl_usd": round(pnl_usd, 2),
-                                    "pnl_pct": round(pnl_pct, 2),
+                                    "pnl_usd": round(net_usd, 2),
+                                    "pnl_pct": round(net_pct, 2),
+                                    "fee_usd": round(closed.fee_usd, 3),
+                                    "is_paper": closed.is_paper,
+                                    "paper_balance": closed.paper_balance,
+                                    "paper_initial": float(trader._state.get("paper_initial_balance", trader.paper_balance_usd)),
+                                    "paper_trades": int(trader._state.get("paper_total_trades", 0)),
+                                    "paper_wins": int(trader._state.get("paper_win_trades", 0)),
                                     "order_id": closed.order_id,
                                 }
                                 self.send_text(format_managed_close_message(ev_close))

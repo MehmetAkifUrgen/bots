@@ -31,6 +31,9 @@ class TradeExecution:
     price: float
     qty: float
     notional_usd: float
+    fee_usd: float = 0.0
+    paper_balance: float = 0.0
+    is_paper: bool = False
 
 
 def _round_step(value: float, step: float) -> float:
@@ -64,6 +67,9 @@ class BinanceTrader:
         state_file: Path | None = None,
         timeout: float = 10.0,
         proxy_url: str = "",
+        paper_mode: bool = False,
+        paper_balance_usd: float = 100.0,
+        taker_fee_pct: float = 0.05,
     ) -> None:
         self.api_key = api_key.strip()
         self.api_secret = api_secret.strip()
@@ -82,6 +88,9 @@ class BinanceTrader:
         self.symbol_stop_cooldown_minutes = max(0, symbol_stop_cooldown_minutes)
         self.signal_cancel_stop_usd = max(0.1, float(signal_cancel_stop_usd))
         self.risk_per_trade_pct = max(0.0, float(risk_per_trade_pct))
+        self.paper_mode = bool(paper_mode)
+        self.paper_balance_usd = max(1.0, float(paper_balance_usd))
+        self.taker_fee_pct = max(0.0, float(taker_fee_pct))
         self.state_file = state_file or (
             Path(__file__).resolve().parent / "trade_state.json"
         )
@@ -94,7 +103,7 @@ class BinanceTrader:
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.api_key and self.api_secret)
+        return True if self.paper_mode else bool(self.api_key and self.api_secret)
 
     def _base_url(self) -> str:
         if self.market == "papi":
@@ -111,6 +120,12 @@ class BinanceTrader:
                     data.setdefault("cooldown_until", 0)
                     data.setdefault("symbol_cooldowns", {})
                     data.setdefault("paused", False)
+                    data.setdefault("paper_balance", self.paper_balance_usd)
+                    data.setdefault("paper_initial_balance", self.paper_balance_usd)
+                    data.setdefault("paper_total_trades", 0)
+                    data.setdefault("paper_win_trades", 0)
+                    data.setdefault("paper_total_fees", 0.0)
+                    data.setdefault("paper_realized_pnl", 0.0)
                     return data
             except Exception:
                 pass
@@ -120,7 +135,46 @@ class BinanceTrader:
             "cooldown_until": 0,
             "symbol_cooldowns": {},
             "paused": False,
+            "paper_balance": self.paper_balance_usd,
+            "paper_initial_balance": self.paper_balance_usd,
+            "paper_total_trades": 0,
+            "paper_win_trades": 0,
+            "paper_total_fees": 0.0,
+            "paper_realized_pnl": 0.0,
         }
+
+    def get_paper_summary(self) -> dict:
+        with self._lock:
+            bal = float(self._state.get("paper_balance", self.paper_balance_usd))
+            init_bal = float(self._state.get("paper_initial_balance", self.paper_balance_usd))
+            net_usd = bal - init_bal
+            net_pct = (net_usd / init_bal * 100.0) if init_bal > 0 else 0.0
+            return {
+                "balance": round(bal, 2),
+                "initial_balance": round(init_bal, 2),
+                "net_usd": round(net_usd, 2),
+                "net_pct": round(net_pct, 2),
+                "total_trades": int(self._state.get("paper_total_trades", 0)),
+                "win_trades": int(self._state.get("paper_win_trades", 0)),
+                "total_fees": round(float(self._state.get("paper_total_fees", 0.0)), 3),
+                "taker_fee_pct": self.taker_fee_pct,
+            }
+
+    def reset_paper_account(self, balance: float | None = None) -> dict:
+        new_bal = float(balance) if balance is not None else self.paper_balance_usd
+        with self._lock:
+            self._state["open_positions"] = {}
+            self._state["consecutive_stops"] = 0
+            self._state["cooldown_until"] = 0
+            self._state["symbol_cooldowns"] = {}
+            self._state["paper_balance"] = new_bal
+            self._state["paper_initial_balance"] = new_bal
+            self._state["paper_total_trades"] = 0
+            self._state["paper_win_trades"] = 0
+            self._state["paper_total_fees"] = 0.0
+            self._state["paper_realized_pnl"] = 0.0
+            self._save_state()
+        return self.get_paper_summary()
 
     def is_paused(self) -> bool:
         with self._lock:
@@ -245,7 +299,7 @@ class BinanceTrader:
 
     def cancel_exchange_stop_losses(self, symbol: str) -> None:
         """Cancel all open algo/stop orders for a symbol on Binance."""
-        if not self._is_um_futures() or not self.is_configured:
+        if self.paper_mode or not self._is_um_futures() or not self.is_configured:
             return
         try:
             if self.market == "papi":
@@ -263,6 +317,8 @@ class BinanceTrader:
         self, symbol: str, sl_price: float, pos_side: str = "LONG"
     ) -> str | None:
         """Place a real exchange-side STOP_MARKET order on Binance (millisecond execution)."""
+        if self.paper_mode:
+            return "PAPER_SL"
         if not self._is_um_futures() or not self.is_configured or sl_price <= 0:
             return None
         self._ensure_filters()
@@ -308,6 +364,8 @@ class BinanceTrader:
 
     def get_account_equity(self) -> float:
         """Return total account equity in USDT (used for dynamic small-account risk sizing)."""
+        if self.paper_mode:
+            return float(self._state.get("paper_balance", self.paper_balance_usd))
         try:
             if self.market == "papi":
                 acct = self._signed_request("GET", "/papi/v1/account")
@@ -321,6 +379,13 @@ class BinanceTrader:
         return self.get_free_usdt()
 
     def get_free_usdt(self) -> float:
+        if self.paper_mode:
+            bal = float(self._state.get("paper_balance", self.paper_balance_usd))
+            used_margin = sum(
+                float(p.get("notional_usd", 0.0)) / max(1, int(p.get("leverage", self.leverage)))
+                for p in self._state.get("open_positions", {}).values()
+            )
+            return max(0.0, bal - used_margin)
         if self.market == "papi":
             acct = self._signed_request("GET", "/papi/v1/account")
             return float(acct.get("virtualMaxWithdrawAmount") or acct.get("accountEquity") or 0.0)
@@ -337,7 +402,9 @@ class BinanceTrader:
         return 0.0
 
     def get_live_open_positions(self) -> dict[str, dict]:
-        """Return currently open positions (from Binance on futures/papi, or state on spot)."""
+        """Return currently open positions (from Binance on futures/papi, or state on spot/paper)."""
+        if self.paper_mode:
+            return dict(self._state["open_positions"])
         if self._is_um_futures():
             path = "/papi/v1/um/positionRisk" if self.market == "papi" else "/fapi/v2/positionRisk"
             rows = self._signed_request("GET", path)
@@ -436,7 +503,20 @@ class BinanceTrader:
             return None
 
         order_side: Literal["BUY", "SELL"] = "BUY" if pos_side == "LONG" else "SELL"
-        if self._is_um_futures():
+        entry_fee = 0.0
+        if self.paper_mode:
+            exec_price = price
+            exec_qty = qty
+            order_id = f"PAPER_{symbol}_{int(time.time())}"
+            actual_not = round(exec_qty * exec_price, 2)
+            entry_fee = round(actual_not * (self.taker_fee_pct / 100.0), 4)
+            self._state["paper_balance"] = round(
+                float(self._state.get("paper_balance", self.paper_balance_usd)) - entry_fee, 4
+            )
+            self._state["paper_total_fees"] = round(
+                float(self._state.get("paper_total_fees", 0.0)) + entry_fee, 4
+            )
+        elif self._is_um_futures():
             lev_path = "/papi/v1/um/leverage" if self.market == "papi" else "/fapi/v1/leverage"
             ord_path = "/papi/v1/um/order" if self.market == "papi" else "/fapi/v1/order"
             for try_lev in dict.fromkeys([effective_lev, min(15, effective_lev), 10, 5]):
@@ -474,6 +554,8 @@ class BinanceTrader:
                     pass
             if exec_price <= 0:
                 exec_price = self.fetch_public_price(symbol) or price
+            order_id = str(res.get("orderId", ""))
+            actual_not = round(exec_qty * exec_price, 2)
         else:
             res = self._signed_request(
                 "POST",
@@ -498,9 +580,8 @@ class BinanceTrader:
             else:
                 exec_qty = float(res.get("executedQty") or qty)
                 exec_price = price
-
-        order_id = str(res.get("orderId", ""))
-        actual_not = round(exec_qty * exec_price, 2)
+            order_id = str(res.get("orderId", ""))
+            actual_not = round(exec_qty * exec_price, 2)
         if pos_side == "LONG":
             default_sl = exec_price * (1.0 - self.stop_loss_pct / 100.0)
             if allow_wide_sl and sl_price is not None and 0 < sl_price < exec_price * 0.995:
@@ -546,6 +627,9 @@ class BinanceTrader:
             "be_locked": False,
             "allow_wide_sl": bool(allow_wide_sl),
             "entry_bar_open_time": int(entry_bar_open_time),
+            "entry_fee_usd": entry_fee,
+            "leverage": effective_lev,
+            "is_paper": self.paper_mode,
             "opened_at": int(time.time()),
         }
         self._save_state()
@@ -557,6 +641,9 @@ class BinanceTrader:
             price=exec_price,
             qty=exec_qty,
             notional_usd=actual_not,
+            fee_usd=entry_fee,
+            paper_balance=round(float(self._state.get("paper_balance", self.paper_balance_usd)), 2) if self.paper_mode else 0.0,
+            is_paper=self.paper_mode,
         )
 
     def close_position(
@@ -581,7 +668,11 @@ class BinanceTrader:
         if qty < rules["minQty"]:
             qty = float(pos["qty"])
 
-        if self._is_um_futures():
+        if self.paper_mode:
+            exec_price = fallback_price
+            exec_qty = qty
+            close_order_id = f"PAPER_CLOSE_{symbol}_{int(time.time())}"
+        elif self._is_um_futures():
             ord_path = "/papi/v1/um/order" if self.market == "papi" else "/fapi/v1/order"
             res = self._signed_request(
                 "POST",
@@ -596,6 +687,7 @@ class BinanceTrader:
             )
             exec_price = float(res.get("avgPrice") or 0.0) or fallback_price
             exec_qty = float(res.get("executedQty") or 0.0) or qty
+            close_order_id = str(res.get("orderId", ""))
         else:
             res = self._signed_request(
                 "POST",
@@ -620,15 +712,37 @@ class BinanceTrader:
             else:
                 exec_qty = float(res.get("executedQty") or qty)
                 exec_price = fallback_price
+            close_order_id = str(res.get("orderId", ""))
 
         self.cancel_exchange_stop_losses(symbol)
         prev_pos = self._state["open_positions"].pop(symbol, None)
         entry_px = float((prev_pos or pos).get("entry_price") or exec_price)
-        pnl_usd = (
+        gross_pnl = (
             (exec_price - entry_px) * exec_qty
             if pos_side == "LONG"
             else (entry_px - exec_price) * exec_qty
         )
+
+        total_fee = 0.0
+        if self.paper_mode:
+            entry_fee = float((prev_pos or {}).get("entry_fee_usd") or 0.0)
+            exit_fee = round((exec_qty * exec_price) * (self.taker_fee_pct / 100.0), 4)
+            total_fee = round(entry_fee + exit_fee, 4)
+            pnl_usd = gross_pnl - total_fee
+            self._state["paper_balance"] = round(
+                float(self._state.get("paper_balance", self.paper_balance_usd)) + gross_pnl - exit_fee, 4
+            )
+            self._state["paper_total_fees"] = round(
+                float(self._state.get("paper_total_fees", 0.0)) + exit_fee, 4
+            )
+            self._state["paper_total_trades"] = int(self._state.get("paper_total_trades", 0)) + 1
+            if pnl_usd > 0:
+                self._state["paper_win_trades"] = int(self._state.get("paper_win_trades", 0)) + 1
+            self._state["paper_realized_pnl"] = round(
+                float(self._state.get("paper_realized_pnl", 0.0)) + pnl_usd, 4
+            )
+        else:
+            pnl_usd = gross_pnl
 
         if is_stop_loss:
             self._state["consecutive_stops"] = int(self._state.get("consecutive_stops", 0)) + 1
@@ -650,10 +764,13 @@ class BinanceTrader:
         return TradeExecution(
             symbol=symbol,
             side=close_side,
-            order_id=str(res.get("orderId", "")),
+            order_id=close_order_id,
             price=exec_price,
             qty=exec_qty,
             notional_usd=round(exec_qty * exec_price, 2),
+            fee_usd=total_fee,
+            paper_balance=round(float(self._state.get("paper_balance", self.paper_balance_usd)), 2) if self.paper_mode else 0.0,
+            is_paper=self.paper_mode,
         )
 
     def has_open_positions(self) -> bool:
@@ -702,12 +819,13 @@ class BinanceTrader:
     def sync_live_positions(self) -> dict[str, dict]:
         """
         Sync ONLY bot-opened positions against Binance:
+        - In paper_mode, returns tracked paper positions without touching Binance.
         - Re-adopt bot positions tagged with BOT4H_ after a restart/redeploy.
         - NEVER adopt or touch positions opened manually by the user!
         - Keep entry_price accurate for bot-opened positions.
         - Remove bot-opened positions that were already closed on Binance.
         """
-        if not self._is_um_futures() or not self.is_configured:
+        if self.paper_mode or not self._is_um_futures() or not self.is_configured:
             with self._lock:
                 return dict(self._state["open_positions"])
 
@@ -1083,6 +1201,12 @@ class BinanceTrader:
                                 if entry_px > 0
                                 else 0.0
                             )
+                        net_usd = realized_usd - closed.fee_usd if closed.is_paper else realized_usd
+                        net_pct = (
+                            realized_pct - (2.0 * self.taker_fee_pct)
+                            if closed.is_paper
+                            else realized_pct
+                        )
                         events.append(
                             {
                                 "symbol": sym,
@@ -1090,8 +1214,14 @@ class BinanceTrader:
                                 "reason": reason,
                                 "entry_price": entry_px,
                                 "exit_price": closed.price,
-                                "pnl_usd": round(realized_usd, 2),
-                                "pnl_pct": round(realized_pct, 2),
+                                "pnl_usd": round(net_usd, 2),
+                                "pnl_pct": round(net_pct, 2),
+                                "fee_usd": round(closed.fee_usd, 3),
+                                "is_paper": closed.is_paper,
+                                "paper_balance": closed.paper_balance,
+                                "paper_initial": float(self._state.get("paper_initial_balance", self.paper_balance_usd)),
+                                "paper_trades": int(self._state.get("paper_total_trades", 0)),
+                                "paper_wins": int(self._state.get("paper_win_trades", 0)),
                                 "order_id": closed.order_id,
                                 "cooldown_triggered": self.is_in_cooldown(),
                                 "cooldown_minutes": self.cooldown_minutes,

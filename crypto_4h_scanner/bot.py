@@ -220,6 +220,9 @@ def main() -> None:
         print("Telegram test:", "OK" if ok else "FAILED")
         return
 
+    paper_mode = os.getenv("PAPER_TRADE", "true").strip().lower() not in ("0", "false", "no")
+    paper_balance = float(os.getenv("PAPER_BALANCE_USD", "100.0"))
+    taker_fee_pct = float(os.getenv("TAKER_FEE_PCT", "0.05"))
     auto_trade_env = os.getenv("AUTO_TRADE", "true").strip().lower() not in ("0", "false", "no")
     api_key = os.getenv("BINANCE_API_KEY", "")
     api_secret = os.getenv("BINANCE_API_SECRET", "")
@@ -230,7 +233,12 @@ def main() -> None:
         or ""
     )
     trader: BinanceTrader | None = None
-    if auto_trade_env and not args.no_auto_trade and api_key and api_secret:
+    if auto_trade_env and not args.no_auto_trade and (paper_mode or (api_key and api_secret)):
+        trade_state_path = (
+            Path(__file__).resolve().parent / "paper_trade_state.json"
+            if paper_mode
+            else DEFAULT_TRADE_STATE_FILE
+        )
         trader = BinanceTrader(
             api_key=api_key,
             api_secret=api_secret,
@@ -240,16 +248,19 @@ def main() -> None:
             max_positions=args.max_positions,
             leverage=args.leverage,
             max_leverage=args.max_leverage,
-            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "1.5")),            # Hibrit Çift Yön Stop: -%1.50
-            trailing_trigger_pct=float(os.getenv("TRAILING_TRIGGER_PCT", "2.0")),  # +%2.00 görünce trailing başlar
-            trailing_callback_pct=float(os.getenv("TRAILING_CALLBACK_PCT", "0.3")),  # %0.30 zirve takibi
-            trailing_floor_pct=float(os.getenv("TRAILING_FLOOR_PCT", "1.7")),  # En kötü +%1.70 kâr tabanı
+            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "1.5")),
+            trailing_trigger_pct=float(os.getenv("TRAILING_TRIGGER_PCT", "2.0")),
+            trailing_callback_pct=float(os.getenv("TRAILING_CALLBACK_PCT", "0.3")),
+            trailing_floor_pct=float(os.getenv("TRAILING_FLOOR_PCT", "1.7")),
             cooldown_minutes=0,
             symbol_stop_cooldown_minutes=240,
             signal_cancel_stop_usd=float(os.getenv("SIGNAL_CANCEL_STOP_USD", "1.5")),
-            risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "7.5")),  # Kasaya göre boyut (stop %1.5 iken kasa x 5: $33 -> ~$165, $50+ -> $250)
-            state_file=DEFAULT_TRADE_STATE_FILE,
+            risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "7.5")),
+            state_file=trade_state_path,
             proxy_url=proxy_url,
+            paper_mode=paper_mode,
+            paper_balance_usd=paper_balance,
+            taker_fee_pct=taker_fee_pct,
         )
 
     scanner = Binance4hScanner(market=args.market, max_workers=args.workers)
@@ -276,8 +287,9 @@ def main() -> None:
 
     enable_short = os.getenv("ENABLE_SHORT", "false").strip().lower() in ("1", "true", "yes")
     short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "20")) or 20
+    mode_badge = f"SANAL TEST (${paper_balance:g}, Komisyon %{taker_fee_pct:g}x2)" if paper_mode else "GERÇEK BİNANCE"
     trade_mode_str = (
-        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, SADECE LONG: 4S Pine ATR+%2-%3 TP)"
+        f"{mode_badge} (Max {args.max_positions} poz, SADECE LONG: 4S Pine ATR+%2-%3 TP)"
         if trader
         else "KAPALI (Sadece Bildirim)"
     )

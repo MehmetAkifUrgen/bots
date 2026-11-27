@@ -1011,6 +1011,79 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertEqual(tp_evs[0]["reason"], "KÂR AL (-%4.5 Hedef)")
             self.assertGreater(tp_evs[0]["pnl_usd"], 0)
 
+    def test_paper_trading_100_usd_with_binance_commission(self) -> None:
+        import time as _time
+        with tempfile.TemporaryDirectory() as tmp:
+            # Works with empty API keys in paper_mode=True and never calls _signed_request!
+            trader = BinanceTrader(
+                api_key="",
+                api_secret="",
+                market="papi",
+                min_usd=150.0,
+                max_usd=250.0,
+                leverage=20,
+                max_leverage=20,
+                stop_loss_pct=1.5,
+                risk_per_trade_pct=7.5,
+                paper_mode=True,
+                paper_balance_usd=100.0,
+                taker_fee_pct=0.05,
+                state_file=Path(tmp) / "paper_state.json",
+            )
+            self.assertTrue(trader.is_configured)
+            trader._filters_cache = {
+                "SOLUSDT": {"stepSize": 0.1, "minQty": 0.1, "minNotional": 5.0, "tickSize": 0.01},
+            }
+
+            def forbid_signed(*args, **kwargs):
+                raise AssertionError("Paper mode must NEVER call real Binance _signed_request!")
+
+            trader._signed_request = forbid_signed  # type: ignore[method-assign]
+            notifier = TelegramNotifier("tok", "chat", Path(tmp) / "alert.json")
+            sent: list[str] = []
+            notifier.send_text = lambda text: sent.append(text) or True  # type: ignore[method-assign]
+
+            now_ms = int(_time.time() * 1000)
+            ev_long = SystemEvaluation(
+                bar_open_time=now_ms - 3600_000,
+                bar_close_time=now_ms + 3 * 3600_000,
+                price=100.0,
+                cond1_buy=True, cond2_buy=True, cond3_buy=True, cond4_buy=True, cond5_buy=True,
+                trend_ok=True, first_three_buy=True, all_five_buy=True,
+                green_trigger=True, orange_trigger=True, exit_trigger=False,
+                exit_reason=None, exit_price=None, exit_trade_pct=None,
+                in_green_pos=True, in_orange_pos=True, be_locked=False,
+                entry_price=100.0, tp_level=102.5, sl_level=94.0, next_res=102.5, prev_sup=94.0,
+                total_trades=20, win_trades=14, win_rate=70.0, total_profit_pct=200.0,
+            )
+            res = Coin4hResult("SOLUSDT", "papi", 100.0, 2.0, 200_000_000.0, ev_long, timeframe="4h")
+            st = notifier.process_4h_alert_only([res], trader=trader, dual_mode=True)
+            self.assertEqual(st["orders_opened"], 1)
+            self.assertIn("SANAL LONG EMİR AÇILDI", sent[-1])
+            self.assertIn("Giriş Komisyonu (%0.05)", sent[-1])
+
+            pos = trader._state["open_positions"]["SOLUSDT"]
+            # With $100 equity, 7.5% risk, 6% ATR stop -> notional = 100 * (7.5/6.0) = $125 -> qty = 1.2 -> $120
+            self.assertAlmostEqual(pos["notional_usd"], 120.0, places=1)
+            # Entry fee = $120 * 0.05% = $0.06 deducted from $100.00 -> $99.94
+            self.assertAlmostEqual(pos["entry_fee_usd"], 0.06, places=4)
+            self.assertAlmostEqual(trader.get_account_equity(), 99.94, places=2)
+
+            # Hit +2.5% TP at 102.5 -> gross profit = 1.2 * 2.5 = $3.00, exit fee = 123.0 * 0.05% = $0.0615
+            # Total fee = $0.1215 -> Net profit = $2.8785 -> Final paper balance = $102.88!
+            evs = trader.manage_open_positions({"SOLUSDT": 102.5})
+            self.assertEqual(len(evs), 1)
+            self.assertTrue(evs[0]["is_paper"])
+            self.assertEqual(evs[0]["reason"], "KÂR AL (%2-%3)")
+            self.assertAlmostEqual(evs[0]["fee_usd"], 0.1215, places=2)
+            self.assertAlmostEqual(evs[0]["pnl_usd"], 2.88, places=2)
+            self.assertAlmostEqual(evs[0]["paper_balance"], 102.88, places=2)
+
+            # Reset paper wallet back to $100.00
+            ps = trader.reset_paper_account()
+            self.assertEqual(ps["balance"], 100.0)
+            self.assertEqual(ps["total_trades"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
