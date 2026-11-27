@@ -65,11 +65,13 @@ class Binance4hScanner:
         timeframe: TimeframeType = "45m",
         max_workers: int = 4,
         timeout: float = 10.0,
+        contract_type: str = "PERPETUAL",
     ) -> None:
         self.market = market
         self.timeframe = timeframe
         self.max_workers = max_workers
         self.timeout = timeout
+        self.contract_type = contract_type
         self._session_local = threading.local()
         self._cache_lock = threading.Lock()
         self._active_symbols: set[str] = set()
@@ -120,7 +122,7 @@ class Binance4hScanner:
                 self._active_symbols = {
                     s["symbol"]
                     for s in info_data.get("symbols", [])
-                    if s.get("contractType") == "PERPETUAL"
+                    if s.get("contractType") == self.contract_type
                     and s.get("quoteAsset") == "USDT"
                     and s.get("status") == "TRADING"
                 }

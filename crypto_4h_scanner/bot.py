@@ -158,45 +158,50 @@ def _start_health_server(port: int) -> None:
 
 
 def _start_position_monitor(
-    trader: BinanceTrader,
+    traders: list[BinanceTrader],
     notifier: TelegramNotifier,
     dry_run: bool = False,
     interval_sec: int = 2,
 ) -> None:
-    """Fast 2-second monitor for Pivot TP, +2.5% Break-Even Lock (+0.3%), and Stop-Loss."""
+    """Fast 2-second monitor for TP, Break-Even Lock, and Stop-Loss across all wallets."""
+    primary = traders[0] if traders else None
+    extras = traders[1:] if len(traders) > 1 else []
 
     def _loop() -> None:
         last_sync = 0.0
         while True:
             try:
-                notifier.poll_commands(trader)
+                notifier.poll_commands(primary, extra_traders=extras)
                 now = time.time()
                 if now - last_sync >= 15.0:
-                    synced = trader.sync_live_positions()
+                    for t in traders:
+                        synced = t.sync_live_positions()
+                        if synced:
+                            print(
+                                f"[{datetime.now().strftime('%H:%M:%S')}] "
+                                f"[{t.wallet_name}] Açık pozisyon: {list(synced.keys())}"
+                            )
                     last_sync = now
-                    if synced:
-                        print(
-                            f"[{datetime.now().strftime('%H:%M:%S')}] "
-                            f"Açık pozisyon senkronu: {list(synced.keys())}"
-                        )
-                if (trader.has_open_positions() or trader.has_pending_close_events()) and not dry_run:
-                    closed_events = trader.manage_open_positions()
-                    for ev in closed_events:
-                        print(
-                            f"[{datetime.now().strftime('%H:%M:%S')}] "
-                            f"KAPANIŞ: {ev['symbol']} {ev['reason']} "
-                            f"({ev['pnl_usd']:+.2f}$ / {ev['pnl_pct']:+.2f}%)"
-                        )
-                        try:
-                            notifier.send_text(format_managed_close_message(ev))
-                        except Exception as exc:
-                            print(f"  Telegram kapanış bildirim hatası: {exc}")
+                if not dry_run:
+                    for t in traders:
+                        if t.has_open_positions() or t.has_pending_close_events():
+                            closed_events = t.manage_open_positions()
+                            for ev in closed_events:
+                                print(
+                                    f"[{datetime.now().strftime('%H:%M:%S')}] "
+                                    f"[{t.wallet_name}] KAPANIŞ: {ev['symbol']} {ev['reason']} "
+                                    f"({ev['pnl_usd']:+.2f}$ / {ev['pnl_pct']:+.2f}%)"
+                                )
+                                try:
+                                    notifier.send_text(format_managed_close_message(ev))
+                                except Exception as exc:
+                                    print(f"  Telegram kapanış bildirim hatası: {exc}")
             except Exception as exc:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Pozisyon takip hatası: {exc}")
             time.sleep(interval_sec)
 
-    t = threading.Thread(target=_loop, daemon=True)
-    t.start()
+    t_thread = threading.Thread(target=_loop, daemon=True)
+    t_thread.start()
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Hızlı TP / Kâr Kilidi / Stop takipçisi aktif (her {interval_sec}sn)")
 
 
@@ -222,6 +227,7 @@ def main() -> None:
 
     paper_mode = os.getenv("PAPER_TRADE", "true").strip().lower() not in ("0", "false", "no")
     paper_balance = float(os.getenv("PAPER_BALANCE_USD", "100.0"))
+    paper_max_pos = int(os.getenv("PAPER_MAX_POSITIONS", "5"))
     taker_fee_pct = float(os.getenv("TAKER_FEE_PCT", "0.05"))
     auto_trade_env = os.getenv("AUTO_TRADE", "true").strip().lower() not in ("0", "false", "no")
     api_key = os.getenv("BINANCE_API_KEY", "")
@@ -233,19 +239,21 @@ def main() -> None:
         or ""
     )
     trader: BinanceTrader | None = None
+    tradifi_trader: BinanceTrader | None = None
     if auto_trade_env and not args.no_auto_trade and (paper_mode or (api_key and api_secret)):
         trade_state_path = (
             Path(__file__).resolve().parent / "paper_trade_state.json"
             if paper_mode
             else DEFAULT_TRADE_STATE_FILE
         )
+        eff_max_pos = paper_max_pos if paper_mode else args.max_positions
         trader = BinanceTrader(
             api_key=api_key,
             api_secret=api_secret,
             market=args.market,
             min_usd=args.min_usd,
             max_usd=args.max_usd,
-            max_positions=args.max_positions,
+            max_positions=eff_max_pos,
             leverage=args.leverage,
             max_leverage=args.max_leverage,
             stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "1.5")),
@@ -261,23 +269,48 @@ def main() -> None:
             paper_mode=paper_mode,
             paper_balance_usd=paper_balance,
             taker_fee_pct=taker_fee_pct,
+            wallet_name="KRİPTO",
+        )
+        # Second independent $100 virtual wallet for Binance US Stock Futures (TRADIFI_PERPETUAL)
+        tradifi_trader = BinanceTrader(
+            api_key="",
+            api_secret="",
+            market=args.market,
+            min_usd=args.min_usd,
+            max_usd=args.max_usd,
+            max_positions=paper_max_pos,
+            leverage=args.leverage,
+            max_leverage=args.max_leverage,
+            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "1.5")),
+            cooldown_minutes=0,
+            symbol_stop_cooldown_minutes=240,
+            risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "7.5")),
+            state_file=Path(__file__).resolve().parent / "paper_tradifi_state.json",
+            proxy_url=proxy_url,
+            paper_mode=True,
+            paper_balance_usd=paper_balance,
+            taker_fee_pct=taker_fee_pct,
+            wallet_name="ABD BORSA",
         )
 
-    scanner = Binance4hScanner(market=args.market, max_workers=args.workers)
+    scanner = Binance4hScanner(market=args.market, max_workers=args.workers, contract_type="PERPETUAL")
+    tradifi_scanner = Binance4hScanner(market=args.market, max_workers=args.workers, contract_type="TRADIFI_PERPETUAL")
 
     if args.port > 0 and not args.once:
         _start_health_server(args.port)
 
-    if trader and not args.once:
-        try:
-            synced = trader.sync_live_positions()
-            print(
-                f"[{datetime.now().strftime('%H:%M:%S')}] "
-                f"Binance canlı pozisyon senkronu: {list(synced.keys()) or 'YOK'}"
-            )
-        except Exception as exc:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] İlk senkron hatası: {exc}")
-        _start_position_monitor(trader, notifier, dry_run=args.dry_run, interval_sec=2)
+    active_traders = [t for t in (trader, tradifi_trader) if t is not None]
+    if active_traders and not args.once:
+        for t in active_traders:
+            try:
+                synced = t.sync_live_positions()
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] "
+                    f"[{t.wallet_name}] Pozisyon senkronu: {list(synced.keys()) or 'YOK'}"
+                )
+            except Exception as exc:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [{t.wallet_name}] İlk senkron hatası: {exc}")
+        _start_position_monitor(active_traders, notifier, dry_run=args.dry_run, interval_sec=2)
 
     long_window_min = int(os.getenv("LONG_ENTRY_WINDOW_MINUTES", "0"))
     short_window_min = int(os.getenv("SHORT_ENTRY_WINDOW_MINUTES", "15"))
@@ -340,9 +373,39 @@ def main() -> None:
                 enable_short=enable_short,
             )
 
+            # 2) Binance US Stock Futures (TRADIFI_PERPETUAL) on its own $100 virtual wallet
+            tradifi_results, tradifi_errors, tradifi_dur = tradifi_scanner.scan_4h_bist_alerts(
+                min_volume_usdt=float(os.getenv("TRADIFI_MIN_VOLUME_USDT", "500000")),
+                limit=args.limit,
+                interval=scan_interval,
+                enable_short=False,
+            )
+            tradifi_stats = notifier.process_4h_alert_only(
+                tradifi_results,
+                min_win_rate=long_min_wr,
+                min_profit_pct=long_min_profit,
+                dry_run=args.dry_run,
+                trader=tradifi_trader,
+                dual_mode=True,
+                entry_window_minutes=entry_window_min,
+                long_entry_window_minutes=long_window_min,
+                short_entry_window_minutes=short_window_min,
+                short_top_gainers=short_top_n,
+                long_min_win_rate=long_min_wr,
+                long_min_profit_pct=long_min_profit,
+                enable_short=False,
+            )
+
             long_now = sum(
                 1
                 for r in results
+                if r.evaluation.orange_trigger
+                and r.evaluation.win_rate >= long_min_wr
+                and r.evaluation.total_profit_pct >= long_min_profit
+            )
+            tradifi_long_now = sum(
+                1
+                for r in tradifi_results
                 if r.evaluation.orange_trigger
                 and r.evaluation.win_rate >= long_min_wr
                 and r.evaluation.total_profit_pct >= long_min_profit
@@ -352,17 +415,20 @@ def main() -> None:
                 {
                     "status": "paused" if notifier.is_paused(trader) else "ok",
                     "last_scan_at": datetime.now(timezone.utc).isoformat(),
-                    "total_scanned": len(results),
-                    "qualifying_coins": long_now,
+                    "total_scanned": len(results) + len(tradifi_results),
+                    "qualifying_coins": long_now + tradifi_long_now,
                     "last_error": None,
                 }
             )
             paused_tag = " [DURDURULDU]" if notifier.is_paused(trader) else ""
+            c_bal = f"${trader.get_account_equity():.2f}" if trader else "-"
+            t_bal = f"${tradifi_trader.get_account_equity():.2f}" if tradifi_trader else "-"
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
-                f"[4S SADECE LONG]{paused_tag} Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
-                f"LONG(4S 5/5): {long_now} | SHORT: KAPALI | "
-                f"Emir -> Açılan: {stats['orders_opened']}, Kapanan: {stats['orders_closed']}"
+                f"[4S SADECE LONG]{paused_tag} Kripto: {len(results)} ({duration}s, LONG:{long_now}, Kasa:{c_bal}) | "
+                f"ABD Borsa: {len(tradifi_results)} ({tradifi_dur}s, LONG:{tradifi_long_now}, Kasa:{t_bal}) | "
+                f"Açılan: {stats['orders_opened'] + tradifi_stats['orders_opened']}, "
+                f"Kapanan: {stats['orders_closed'] + tradifi_stats['orders_closed']}"
             )
             if stats["errors"]:
                 print("  Hatalar:", stats["errors"][:5])

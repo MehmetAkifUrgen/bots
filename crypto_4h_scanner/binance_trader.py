@@ -34,6 +34,7 @@ class TradeExecution:
     fee_usd: float = 0.0
     paper_balance: float = 0.0
     is_paper: bool = False
+    wallet_name: str = "KRİPTO"
 
 
 def _round_step(value: float, step: float) -> float:
@@ -70,6 +71,7 @@ class BinanceTrader:
         paper_mode: bool = False,
         paper_balance_usd: float = 100.0,
         taker_fee_pct: float = 0.05,
+        wallet_name: str = "KRİPTO",
     ) -> None:
         self.api_key = api_key.strip()
         self.api_secret = api_secret.strip()
@@ -91,6 +93,8 @@ class BinanceTrader:
         self.paper_mode = bool(paper_mode)
         self.paper_balance_usd = max(1.0, float(paper_balance_usd))
         self.taker_fee_pct = max(0.0, float(taker_fee_pct))
+        self.wallet_name = wallet_name.strip() or "KRİPTO"
+        self.last_reject_reason: str = ""
         self.state_file = state_file or (
             Path(__file__).resolve().parent / "trade_state.json"
         )
@@ -436,10 +440,19 @@ class BinanceTrader:
         allow_wide_sl: bool = False,
     ) -> TradeExecution | None:
         """Open a LONG or SHORT position if under max_positions, not in cooldown, and balance allows."""
+        self.last_reject_reason = ""
         pos_side: Literal["LONG", "SHORT"] = "SHORT" if str(side).upper() == "SHORT" else "LONG"
         if pos_side == "SHORT" and not self._is_um_futures():
+            self.last_reject_reason = "Spot piyasada SHORT açılamaz."
             return None
-        if self.is_paused() or self.is_in_cooldown() or self.is_symbol_in_cooldown(symbol):
+        if self.is_paused():
+            self.last_reject_reason = "Bot /durdur ile durduruldu."
+            return None
+        if self.is_in_cooldown():
+            self.last_reject_reason = f"Genel mola aktif ({self.cooldown_remaining_min()} dk kaldı)."
+            return None
+        if self.is_symbol_in_cooldown(symbol):
+            self.last_reject_reason = f"{symbol} stop bekleme süresinde."
             return None
         live_open = self.get_live_open_positions()
         tracked = self._state["open_positions"]
@@ -447,8 +460,13 @@ class BinanceTrader:
         # Count unique open symbols across Binance live + local state
         all_open_syms = set(live_open.keys()) | set(tracked.keys())
         if symbol in all_open_syms:
+            self.last_reject_reason = f"{symbol} zaten açık pozisyonda."
             return None
         if len(all_open_syms) >= self.max_positions:
+            self.last_reject_reason = (
+                f"{self.wallet_name} Max {self.max_positions} pozisyon dolu "
+                f"(Açık: {', '.join(sorted(all_open_syms))})."
+            )
             return None
 
         effective_min_usd = self.min_usd
@@ -488,19 +506,28 @@ class BinanceTrader:
                 else free_usdt * 0.98
             )
             if max_affordable_notional < effective_min_usd:
+                self.last_reject_reason = f"{self.wallet_name} yetersiz serbest marj (${free_usdt:.2f})."
                 return None
             notional = max(effective_min_usd, min(self.max_usd, max_affordable_notional))
 
-        self._ensure_filters()
-        rules = self._filters_cache.get(
-            symbol, {"stepSize": 0.001, "minQty": 0.001, "minNotional": 5.0}
-        )
-        qty = _round_step(notional / price, rules["stepSize"])
-        if qty < rules["minQty"]:
-            return None
-        actual_notional = qty * price
-        if actual_notional < effective_min_usd * 0.90 or actual_notional < rules["minNotional"]:
-            return None
+        if self.paper_mode:
+            qty = round(notional / price, 6) if price > 0 else 0.0
+            if qty <= 0:
+                self.last_reject_reason = "Geçersiz fiyat/miktar."
+                return None
+        else:
+            self._ensure_filters()
+            rules = self._filters_cache.get(
+                symbol, {"stepSize": 0.001, "minQty": 0.001, "minNotional": 5.0}
+            )
+            qty = _round_step(notional / price, rules["stepSize"])
+            if qty < rules["minQty"]:
+                self.last_reject_reason = f"Miktar minQty altında ({qty:g} < {rules['minQty']:g})."
+                return None
+            actual_notional = qty * price
+            if actual_notional < effective_min_usd * 0.90 or actual_notional < rules["minNotional"]:
+                self.last_reject_reason = f"Pozisyon tutarı minNotional altında (${actual_notional:.2f})."
+                return None
 
         order_side: Literal["BUY", "SELL"] = "BUY" if pos_side == "LONG" else "SELL"
         entry_fee = 0.0
@@ -644,6 +671,7 @@ class BinanceTrader:
             fee_usd=entry_fee,
             paper_balance=round(float(self._state.get("paper_balance", self.paper_balance_usd)), 2) if self.paper_mode else 0.0,
             is_paper=self.paper_mode,
+            wallet_name=self.wallet_name,
         )
 
     def close_position(
@@ -662,11 +690,14 @@ class BinanceTrader:
         pos_side = str((tracked_pos or pos).get("side") or "LONG").upper()
         close_side: Literal["BUY", "SELL"] = "SELL" if pos_side == "LONG" else "BUY"
 
-        self._ensure_filters()
-        rules = self._filters_cache.get(symbol, {"stepSize": 0.001, "minQty": 0.001})
-        qty = _round_step(float(pos["qty"]), rules["stepSize"])
-        if qty < rules["minQty"]:
+        if self.paper_mode:
             qty = float(pos["qty"])
+        else:
+            self._ensure_filters()
+            rules = self._filters_cache.get(symbol, {"stepSize": 0.001, "minQty": 0.001})
+            qty = _round_step(float(pos["qty"]), rules["stepSize"])
+            if qty < rules["minQty"]:
+                qty = float(pos["qty"])
 
         if self.paper_mode:
             exec_price = fallback_price
@@ -771,6 +802,7 @@ class BinanceTrader:
             fee_usd=total_fee,
             paper_balance=round(float(self._state.get("paper_balance", self.paper_balance_usd)), 2) if self.paper_mode else 0.0,
             is_paper=self.paper_mode,
+            wallet_name=self.wallet_name,
         )
 
     def has_open_positions(self) -> bool:
@@ -1218,6 +1250,7 @@ class BinanceTrader:
                                 "pnl_pct": round(net_pct, 2),
                                 "fee_usd": round(closed.fee_usd, 3),
                                 "is_paper": closed.is_paper,
+                                "wallet_name": self.wallet_name,
                                 "paper_balance": closed.paper_balance,
                                 "paper_initial": float(self._state.get("paper_initial_balance", self.paper_balance_usd)),
                                 "paper_trades": int(self._state.get("paper_total_trades", 0)),

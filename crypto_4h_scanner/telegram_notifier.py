@@ -121,7 +121,8 @@ def format_managed_close_message(ev_dict: dict) -> str:
     side_tag = f" | <b>{ev_dict['side']}</b>" if ev_dict.get("side") else ""
     tf_badge = ev_dict.get("tf_label") or "4S (4H)"
     is_paper = bool(ev_dict.get("is_paper"))
-    title_prefix = "🧪 [SANAL TEST] " if is_paper else ""
+    wname = str(ev_dict.get("wallet_name") or "KRİPTO")
+    title_prefix = f"🧪 [{wname} SANAL] " if is_paper else ""
     paper_block = ""
     if is_paper:
         fee_usd = float(ev_dict.get("fee_usd") or 0.0)
@@ -132,7 +133,7 @@ def format_managed_close_message(ev_dict: dict) -> str:
         wins = int(ev_dict.get("paper_wins") or 0)
         paper_block = (
             f"\n💸 <b>Binance Komisyon:</b> <code>-${fee_usd:.3f}</code> (Giriş+Çıkış %0.10)\n"
-            f"🏦 <b>Güncel Sanal Kasa:</b> <b>${bal:.2f}</b> (<b>{bal_pct:+.2f}%</b>) | <b>İşlem:</b> {wins}/{trades}"
+            f"🏦 <b>{wname} Sanal Kasa:</b> <b>${bal:.2f}</b> (<b>{bal_pct:+.2f}%</b>) | <b>İşlem:</b> {wins}/{trades}"
         )
     return (
         f"{icon} <b>{title_prefix}POZİSYON KAPATILDI — {ev_dict['reason']}</b>\n"
@@ -176,10 +177,11 @@ def format_dual_4h_message(
     trade_block = ""
     if trade_exec:
         if trade_exec.is_paper:
+            wname = trade_exec.wallet_name or "KRİPTO"
             trade_block = (
-                f"\n🧪 <b>SANAL {side.upper()} EMİR AÇILDI (TEST MODU)</b>\n"
+                f"\n🧪 <b>[{wname} SANAL] {side.upper()} EMİR AÇILDI</b>\n"
                 f"• Büyüklük: <b>${trade_exec.notional_usd:.2f}</b> | Miktar: <code>{trade_exec.qty:g}</code>\n"
-                f"• Giriş Komisyonu (%0.05): <code>-${trade_exec.fee_usd:.3f}</code> | Sanal Kasa: <b>${trade_exec.paper_balance:.2f}</b>\n"
+                f"• Giriş Komisyonu (%0.05): <code>-${trade_exec.fee_usd:.3f}</code> | {wname} Kasa: <b>${trade_exec.paper_balance:.2f}</b>\n"
                 f"• Emir ID: <code>{trade_exec.order_id}</code>\n"
             )
         else:
@@ -466,10 +468,21 @@ class TelegramNotifier:
             raise last_err
         return any_ok
 
-    def poll_commands(self, trader: BinanceTrader | None) -> None:
-        """Handle Telegram commands (/durdur, /baslat, /devam, /durum) from authorized chats."""
+    def poll_commands(
+        self,
+        trader: BinanceTrader | None,
+        extra_traders: list[BinanceTrader] | None = None,
+    ) -> None:
+        """Handle Telegram commands (/durdur, /baslat, /devam, /durum, /sifirla) from authorized chats."""
         if not self.bot_token or not self.chat_ids:
             return
+        all_traders: list[BinanceTrader] = []
+        if trader is not None:
+            all_traders.append(trader)
+        if extra_traders:
+            for t in extra_traders:
+                if t is not None and t not in all_traders:
+                    all_traders.append(t)
         url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
         params: dict = {"timeout": 0, "limit": 10}
         if self._last_update_id > 0:
@@ -493,55 +506,52 @@ class TelegramNotifier:
             cmd = raw_text.split()[0].split("@")[0] if raw_text else ""
             if cmd in ("/durdur", "/stop", "/kapat", "/duraklat", "/pause"):
                 self.set_paused(True, trader)
+                for t in all_traders:
+                    t.set_paused(True)
                 self.send_text(
                     "⏸️ <b>Bot DURDURULDU!</b>\n"
-                    "• Yeni LONG/SHORT pozisyon ve sinyal açılmayacak.\n"
-                    "• Açık pozisyon varsa stop ve trailing koruması çalışmaya devam eder.\n"
+                    "• Yeni pozisyon ve sinyal açılmayacak.\n"
+                    "• Açık pozisyon varsa Kâr Al / Kâr Kilidi / Stop takibi çalışmaya devam eder.\n"
                     "▶️ Tekrar açmak için: <code>/baslat</code>"
                 )
             elif cmd in ("/baslat", "/başlat", "/ac", "/aç", "/aktif", "/calistir", "/devam", "/reset", "/mola_iptal"):
                 self.set_paused(False, trader)
-                if trader is not None:
-                    trader.reset_cooldown()
+                for t in all_traders:
+                    t.set_paused(False)
+                    t.reset_cooldown()
                 self.send_text(
                     "▶️ <b>Bot AKTİF edildi!</b>\n"
                     "• Yeni sinyallerde otomatik işlem ve bildirim devam ediyor.\n"
                     "⏸️ Durdurmak için: <code>/durdur</code>"
                 )
             elif cmd in ("/sifirla", "/sıfırla", "/paper_reset"):
-                if trader is not None and trader.paper_mode:
-                    ps = trader.reset_paper_account()
-                    self.send_text(
-                        f"🔄 <b>Sanal Kasa Sıfırlandı!</b>\n"
-                        f"• Yeni Başlangıç Bakiyesi: <b>${ps['balance']:.2f}</b>\n"
-                        f"• Tüm sanal pozisyonlar ve istatistikler temizlendi."
-                    )
+                lines = ["🔄 <b>Sanal Kasalar Sıfırlandı!</b>"]
+                for t in all_traders:
+                    if t.paper_mode:
+                        ps = t.reset_paper_account()
+                        lines.append(f"• <b>{t.wallet_name} Sanal Kasa:</b> <b>${ps['balance']:.2f}</b>")
+                if len(lines) > 1:
+                    self.send_text("\n".join(lines))
             elif cmd in ("/durum", "/status", "/komutlar", "/yardim", "/help"):
                 paused = self.is_paused(trader)
                 state_badge = "⏸️ DURDURULDU" if paused else "🟢 AKTİF"
-                open_syms = list(trader._state.get("open_positions", {}).keys()) if trader else []
-                stops = int(trader._state.get("consecutive_stops", 0)) if trader else 0
-                max_s = trader.max_consecutive_stops if trader else 3
-                cd = (
-                    f"Aktif ({trader.cooldown_remaining_min()} dk kaldı)"
-                    if (trader and trader.is_in_cooldown())
-                    else "Kapalı"
-                )
-                paper_lines = ""
-                if trader is not None and trader.paper_mode:
-                    ps = trader.get_paper_summary()
-                    paper_lines = (
-                        f"• 🧪 <b>Mod:</b> SANAL TEST (Komisyon: %{ps['taker_fee_pct']:g}x2)\n"
-                        f"• 🏦 <b>Sanal Kasa:</b> <b>${ps['balance']:.2f}</b> (Başlangıç: ${ps['initial_balance']:.2f} | Net: <b>${ps['net_usd']:+.2f} / {ps['net_pct']:+.2f}%</b>)\n"
-                        f"• 💸 <b>Toplam Komisyon:</b> <code>-${ps['total_fees']:.3f}</code> | <b>İşlem:</b> {ps['win_trades']}/{ps['total_trades']}\n"
-                    )
-                self.send_text(
-                    f"📊 <b>Bot Durumu:</b> <b>{state_badge}</b>\n"
-                    f"{paper_lines}"
-                    f"• Açık Pozisyonlar: <code>{', '.join(open_syms) if open_syms else 'YOK'}</code>\n"
-                    f"• Art Arda Stop Sayacı: <b>{stops}/{max_s}</b> | Mola: <b>{cd}</b>\n"
-                    f"• Komutlar: <code>/durdur</code> | <code>/baslat</code> | <code>/durum</code> | <code>/sifirla</code>"
-                )
+                blocks = [f"📊 <b>Bot Durumu:</b> <b>{state_badge}</b>"]
+                for t in all_traders:
+                    open_syms = list(t._state.get("open_positions", {}).keys())
+                    if t.paper_mode:
+                        ps = t.get_paper_summary()
+                        blocks.append(
+                            f"\n🏦 <b>{t.wallet_name} SANAL KASA:</b> <b>${ps['balance']:.2f}</b> "
+                            f"(Net: <b>${ps['net_usd']:+.2f} / {ps['net_pct']:+.2f}%</b>)\n"
+                            f"• Komisyon: <code>-${ps['total_fees']:.3f}</code> | İşlem: <b>{ps['win_trades']}/{ps['total_trades']}</b>\n"
+                            f"• Açık ({len(open_syms)}/{t.max_positions}): <code>{', '.join(open_syms) if open_syms else 'YOK'}</code>"
+                        )
+                    else:
+                        blocks.append(
+                            f"\n💼 <b>{t.wallet_name} (GERÇEK):</b> Açık: <code>{', '.join(open_syms) if open_syms else 'YOK'}</code>"
+                        )
+                blocks.append("\n• Komutlar: <code>/durdur</code> | <code>/baslat</code> | <code>/durum</code> | <code>/sifirla</code>")
+                self.send_text("\n".join(blocks))
 
     def _try_open_trade(
         self,
@@ -814,6 +824,7 @@ class TelegramNotifier:
                                     "pnl_pct": round(net_pct, 2),
                                     "fee_usd": round(closed.fee_usd, 3),
                                     "is_paper": closed.is_paper,
+                                    "wallet_name": trader.wallet_name,
                                     "paper_balance": closed.paper_balance,
                                     "paper_initial": float(trader._state.get("paper_initial_balance", trader.paper_balance_usd)),
                                     "paper_trades": int(trader._state.get("paper_total_trades", 0)),
@@ -983,7 +994,10 @@ class TelegramNotifier:
                         if trade_exec:
                             stats["orders_opened"] += 1
                         else:
-                            trade_note = f"Emir açılmadı (Max {trader.max_positions} pozisyon, coin bekleme veya yetersiz marj)."
+                            reason_txt = getattr(trader, "last_reject_reason", "") or (
+                                f"Max {trader.max_positions} pozisyon, coin bekleme veya yetersiz marj."
+                            )
+                            trade_note = f"Emir açılmadı ({reason_txt})"
                     except Exception as exc:
                         trade_note = f"Emir hatası: {exc}"
                 try:

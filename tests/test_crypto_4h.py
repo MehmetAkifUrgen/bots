@@ -1059,25 +1059,45 @@ class TestBinanceTrader(unittest.TestCase):
             res = Coin4hResult("SOLUSDT", "papi", 100.0, 2.0, 200_000_000.0, ev_long, timeframe="4h")
             st = notifier.process_4h_alert_only([res], trader=trader, dual_mode=True)
             self.assertEqual(st["orders_opened"], 1)
-            self.assertIn("SANAL LONG EMİR AÇILDI", sent[-1])
+            self.assertIn("[KRİPTO SANAL] LONG EMİR AÇILDI", sent[-1])
             self.assertIn("Giriş Komisyonu (%0.05)", sent[-1])
 
             pos = trader._state["open_positions"]["SOLUSDT"]
-            # With $100 equity, 7.5% risk, 6% ATR stop -> notional = 100 * (7.5/6.0) = $125 -> qty = 1.2 -> $120
-            self.assertAlmostEqual(pos["notional_usd"], 120.0, places=1)
-            # Entry fee = $120 * 0.05% = $0.06 deducted from $100.00 -> $99.94
-            self.assertAlmostEqual(pos["entry_fee_usd"], 0.06, places=4)
-            self.assertAlmostEqual(trader.get_account_equity(), 99.94, places=2)
+            # With $100 equity, 7.5% risk, 6% ATR stop -> notional = 100 * (7.5/6.0) = $125.0 -> qty = 1.25 -> $125.0
+            self.assertAlmostEqual(pos["notional_usd"], 125.0, places=1)
+            # Entry fee = $125 * 0.05% = $0.0625 deducted from $100.00 -> $99.94
+            self.assertAlmostEqual(pos["entry_fee_usd"], 0.0625, places=4)
+            self.assertAlmostEqual(trader.get_account_equity(), 99.9375, places=3)
 
-            # Hit +2.5% TP at 102.5 -> gross profit = 1.2 * 2.5 = $3.00, exit fee = 123.0 * 0.05% = $0.0615
-            # Total fee = $0.1215 -> Net profit = $2.8785 -> Final paper balance = $102.88!
+            # Hit +2.5% TP at 102.5 -> gross profit = 1.25 * 2.5 = $3.125, exit fee = 128.125 * 0.05% = $0.0641
+            # Total fee = $0.1266 -> Net profit = $2.9984 -> Final paper balance = $103.00!
             evs = trader.manage_open_positions({"SOLUSDT": 102.5})
             self.assertEqual(len(evs), 1)
             self.assertTrue(evs[0]["is_paper"])
+            self.assertEqual(evs[0]["wallet_name"], "KRİPTO")
             self.assertEqual(evs[0]["reason"], "KÂR AL (%2-%3)")
-            self.assertAlmostEqual(evs[0]["fee_usd"], 0.1215, places=2)
-            self.assertAlmostEqual(evs[0]["pnl_usd"], 2.88, places=2)
-            self.assertAlmostEqual(evs[0]["paper_balance"], 102.88, places=2)
+            self.assertAlmostEqual(evs[0]["fee_usd"], 0.127, places=2)
+            self.assertAlmostEqual(evs[0]["pnl_usd"], 3.00, places=2)
+            self.assertAlmostEqual(evs[0]["paper_balance"], 103.00, places=2)
+
+            # Second independent $100 wallet for Binance US Stock Futures (ABD BORSA)
+            tradifi_trader = BinanceTrader(
+                api_key="",
+                api_secret="",
+                market="papi",
+                max_positions=5,
+                stop_loss_pct=1.5,
+                risk_per_trade_pct=7.5,
+                paper_mode=True,
+                paper_balance_usd=100.0,
+                taker_fee_pct=0.05,
+                wallet_name="ABD BORSA",
+                state_file=Path(tmp) / "paper_tradifi_state.json",
+            )
+            res_tsla = Coin4hResult("TSLAUSDT", "papi", 350.0, 4.0, 20_000_000.0, ev_long, timeframe="4h")
+            st_tsla = notifier.process_4h_alert_only([res_tsla], trader=tradifi_trader, dual_mode=True)
+            self.assertEqual(st_tsla["orders_opened"], 1)
+            self.assertIn("[ABD BORSA SANAL] LONG EMİR AÇILDI", sent[-1])
 
             # Reset paper wallet back to $100.00
             ps = trader.reset_paper_account()
