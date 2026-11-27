@@ -169,9 +169,17 @@ def format_dual_4h_message(
         trade_block = f"\nℹ️ <i>{html.escape(str(trade_note))}</i>\n"
 
     if is_long:
-        tp = ev.next_res if ev.next_res > entry * 1.005 else (ev.tp_level or entry * 1.025)
+        tp = (
+            ev.tp_level
+            if (ev.tp_level is not None and ev.tp_level > entry * 1.005)
+            else ev.next_res
+        )
         tp_pct = ((tp - entry) / entry * 100.0) if entry > 0 else 0.0
-        sl_atr = ev.prev_sup if (0 < ev.prev_sup < entry * 0.995) else sl
+        sl_atr = (
+            ev.sl_level
+            if (ev.sl_level is not None and 0 < ev.sl_level < entry * 0.995)
+            else (ev.prev_sup if (0 < ev.prev_sup < entry * 0.995) else sl)
+        )
         sl_atr_pct = ((sl_atr - entry) / entry * 100.0) if entry > 0 else -stop_loss_pct
         timing_tag = f"Son {long_window_min}dk Mum Kapanışı" if long_window_min > 0 else "Anlık Giriş"
         return (
@@ -693,6 +701,7 @@ class TelegramNotifier:
         short_top_gainers: int = 20,
         long_min_win_rate: float = 0.0,
         long_min_profit_pct: float = -1e9,
+        enable_short: bool = False,
     ) -> dict:
         """Process 4H signals: LONG on 4H Pine 5/5 (WR>=65%, Profit>=300%, instant), SHORT on 4H 5/5 + EMA200 (last 15m)."""
         sent_alerts: dict[str, int] = self._state["sent_alerts"]
@@ -844,14 +853,14 @@ class TelegramNotifier:
                         side = "LONG"
                         ev = long_ev
                         tf_used = res.timeframe
-                if side is None and sev_15m is not None:
+                if enable_short and side is None and sev_15m is not None:
                     if sev_15m.in_1h_zone and sev_15m.early_fired and (
                         top_gainers is None or res.symbol in top_gainers
                     ):
                         side = "SHORT"
                         use_short_15m_mode = True
                         tf_used = "15m"
-                elif side is None and short_ev.short_5_trigger and (top_gainers is None or res.symbol in top_gainers):
+                elif enable_short and side is None and short_ev.short_5_trigger and (top_gainers is None or res.symbol in top_gainers):
                     if short_win_ms > 0 and short_ev.bar_close_time > 0:
                         rem_ms = short_ev.bar_close_time - now_ms
                         if -60_000 <= rem_ms <= short_win_ms:
@@ -875,8 +884,16 @@ class TelegramNotifier:
                 if trader and trader.is_configured and not dry_run:
                     try:
                         if side == "LONG":
-                            tp_target = ev.next_res if ev.next_res > res.price * 1.005 else (ev.tp_level or res.price * 1.025)
-                            sl_target = ev.prev_sup if (0 < ev.prev_sup < res.price * 0.995) else ev.sl_level
+                            tp_target = (
+                                ev.tp_level
+                                if (ev.tp_level is not None and ev.tp_level > res.price * 1.005)
+                                else ev.next_res
+                            )
+                            sl_target = (
+                                ev.sl_level
+                                if (ev.sl_level is not None and 0 < ev.sl_level < res.price * 0.995)
+                                else ev.prev_sup
+                            )
                             trade_exec = trader.open_position(
                                 res.symbol,
                                 res.price,

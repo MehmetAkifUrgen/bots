@@ -424,14 +424,17 @@ class Binance4hScanner:
         interval: str = "1h",
         short_top_gainers: int = 20,
         extra_15m_symbols: set[str] | None = None,
+        enable_short: bool = False,
     ) -> tuple[list[Coin4hResult], list[str], float]:
-        """Scan Binance USDT pairs on 4H (+ Top N Gainers 1H->15m SHORT zone screening)."""
+        """Scan Binance USDT pairs on 4H (LONG-only when enable_short=False)."""
         started = time.time()
         coins = self.get_active_usdt_symbols(
             min_volume_usdt=min_volume_usdt, limit=limit
         )
         extra_syms = extra_15m_symbols or set()
-        if short_top_gainers > 0:
+        if not enable_short:
+            gainer_syms: set[str] = set()
+        elif short_top_gainers > 0:
             gainer_syms = {
                 c["symbol"]
                 for c in sorted(coins, key=lambda x: x["change_24h"], reverse=True)[:short_top_gainers]

@@ -274,17 +274,18 @@ def main() -> None:
     long_min_profit = float(os.getenv("LONG_MIN_PROFIT_PCT", "-999999"))
     effective_poll = min(args.poll_seconds, 60)
 
+    enable_short = os.getenv("ENABLE_SHORT", "false").strip().lower() in ("1", "true", "yes")
     short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "20")) or 20
     trade_mode_str = (
-        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, LONG: 4S ATR+%2-%3 TP, SHORT: Top{short_top_n} 1S→15dk)"
+        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, SADECE LONG: 4S Pine ATR+%2-%3 TP)"
         if trader
         else "KAPALI (Sadece Bildirim)"
     )
     print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] Hibrit 4S-ATR-LONG / Top{short_top_n}-1S→15dk-SHORT Bot başlatıldı | "
+        f"[{datetime.now().strftime('%H:%M:%S')}] 4S (4H) Sadece LONG Pine Botu başlatıldı | "
         f"Piyasa={args.market.upper()} | OtoAlım={trade_mode_str} | "
-        f"LONG=4S 5/5 (ATR+Destek SL, %2-%3 TP, +%1.3 Kâr Kilidi, Anlık) | "
-        f"SHORT=Top {short_top_n} Gainer + 1S/4S Duvar -> 15dk İlk Dönüş | Periyot={effective_poll}sn"
+        f"LONG=4S 5/5 (Pine ATR+Destek SL, Pine %2-%3 TP, +%1.3 Kâr Kilidi, 3'lü SAT) | "
+        f"SHORT={'AÇIK' if enable_short else 'KAPALI'} | Periyot={effective_poll}sn"
     )
 
     scan_interval = os.getenv("SCAN_INTERVAL", "4h").strip().lower()
@@ -308,6 +309,7 @@ def main() -> None:
                 interval=scan_interval,
                 short_top_gainers=short_top_n,
                 extra_15m_symbols=open_short_syms,
+                enable_short=enable_short,
             )
             entry_window_min = int(os.getenv("ENTRY_WINDOW_MINUTES", "0"))
             stats = notifier.process_4h_alert_only(
@@ -323,6 +325,7 @@ def main() -> None:
                 short_top_gainers=short_top_n,
                 long_min_win_rate=long_min_wr,
                 long_min_profit_pct=long_min_profit,
+                enable_short=enable_short,
             )
 
             long_now = sum(
@@ -332,33 +335,21 @@ def main() -> None:
                 and r.evaluation.win_rate >= long_min_wr
                 and r.evaluation.total_profit_pct >= long_min_profit
             )
-            zone_1h_now = sum(
-                1
-                for r in results
-                if r.short_15m_evaluation is not None and r.short_15m_evaluation.in_1h_zone
-            )
-            short_now = sum(
-                1
-                for r in results
-                if r.short_15m_evaluation is not None
-                and r.short_15m_evaluation.in_1h_zone
-                and r.short_15m_evaluation.early_fired
-            )
 
             _HEALTH_STATE.update(
                 {
                     "status": "paused" if notifier.is_paused(trader) else "ok",
                     "last_scan_at": datetime.now(timezone.utc).isoformat(),
                     "total_scanned": len(results),
-                    "qualifying_coins": long_now + short_now,
+                    "qualifying_coins": long_now,
                     "last_error": None,
                 }
             )
             paused_tag = " [DURDURULDU]" if notifier.is_paused(trader) else ""
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
-                f"[4S-LONG / Top{short_top_n}-SHORT]{paused_tag} Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
-                f"LONG(4S 5/5): {long_now}, Top{short_top_n}-1S-Bölge: {zone_1h_now}, SHORT(15dk Dönüş): {short_now} | "
+                f"[4S SADECE LONG]{paused_tag} Tarandı: {len(results)} coin ({duration}s, hata: {len(errors)}) | "
+                f"LONG(4S 5/5): {long_now} | SHORT: KAPALI | "
                 f"Emir -> Açılan: {stats['orders_opened']}, Kapanan: {stats['orders_closed']}"
             )
             if stats["errors"]:

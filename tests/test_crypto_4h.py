@@ -577,20 +577,24 @@ class TestBinanceTrader(unittest.TestCase):
                 ema200_bear=True, all_five_sell=True, short_5_trigger=True,
             )
             res_mid = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_mid, timeframe="4h")
-            # With short_entry_window_minutes=15, mid-candle (3h left) SHORT is blocked!
-            st0 = notifier.process_4h_alert_only([res_mid], dual_mode=True, short_entry_window_minutes=15, short_top_gainers=0)
+            # Default enable_short=False blocks SHORT completely!
+            ev_last15 = SystemEvaluation(**{**ev_mid.__dict__, "bar_close_time": now_ms + 12 * 60_000})
+            res_last15 = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_last15, timeframe="4h")
+            st_off = notifier.process_4h_alert_only([res_last15], dual_mode=True, short_entry_window_minutes=15, short_top_gainers=0)
+            self.assertEqual(st_off["short"], 0)
+
+            # With enable_short=True and short_entry_window_minutes=15, mid-candle (3h left) SHORT is blocked!
+            st0 = notifier.process_4h_alert_only([res_mid], dual_mode=True, short_entry_window_minutes=15, short_top_gainers=0, enable_short=True)
             self.assertEqual(st0["short"], 0)
 
             # 30m left is also outside last-15m SHORT window
             ev_30m = SystemEvaluation(**{**ev_mid.__dict__, "bar_close_time": now_ms + 30 * 60_000})
             res_30m = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_30m, timeframe="4h")
-            st_30m = notifier.process_4h_alert_only([res_30m], dual_mode=True, short_entry_window_minutes=15, short_top_gainers=0)
+            st_30m = notifier.process_4h_alert_only([res_30m], dual_mode=True, short_entry_window_minutes=15, short_top_gainers=0, enable_short=True)
             self.assertEqual(st_30m["short"], 0)
 
-            # Inside final 15 minutes (12m left) -> SHORT 5/5 + EMA200 fires!
-            ev_last15 = SystemEvaluation(**{**ev_mid.__dict__, "bar_close_time": now_ms + 12 * 60_000})
-            res_last15 = Coin4hResult("BTCUSDT", "papi", 100.0, -2.0, 100_000_000.0, ev_last15, timeframe="4h")
-            st1 = notifier.process_4h_alert_only([res_last15], dual_mode=True, short_entry_window_minutes=15, short_top_gainers=0)
+            # Inside final 15 minutes (12m left) with enable_short=True -> SHORT 5/5 + EMA200 fires!
+            st1 = notifier.process_4h_alert_only([res_last15], dual_mode=True, short_entry_window_minutes=15, short_top_gainers=0, enable_short=True)
             self.assertEqual(st1["short"], 1)
             self.assertEqual(len(sent), 1)
             self.assertIn("SHORT 5/5 + EMA200", sent[0])
@@ -942,15 +946,17 @@ class TestBinanceTrader(unittest.TestCase):
                 "BORINGUSDT", "papi", 100.0, 3.0, 80_000_000.0, base_4h_ev, timeframe="4h",
                 short_15m_evaluation=sev_ok,
             )
-            st_rank21 = notifier.process_4h_alert_only(top20_dummies + [res_rank21], trader=trader, dual_mode=True, short_top_gainers=20)
+            st_rank21 = notifier.process_4h_alert_only(top20_dummies + [res_rank21], trader=trader, dual_mode=True, short_top_gainers=20, enable_short=True)
             self.assertEqual(st_rank21["orders_opened"], 0)
 
-            # Ranked #1 in Top 20 Gainers (+65% 24h) + 1H zone + 15m early_fired -> opens SHORT immediately!
+            # Ranked #1 in Top 20 Gainers (+65% 24h) + 1H zone + 15m early_fired -> opens SHORT only when enable_short=True!
             res_ok = Coin4hResult(
                 "EVAAUSDT", "papi", 100.0, 65.0, 80_000_000.0, base_4h_ev, timeframe="4h",
                 short_15m_evaluation=sev_ok,
             )
-            st_open = notifier.process_4h_alert_only(top20_dummies + [res_ok], trader=trader, dual_mode=True, short_top_gainers=20)
+            st_disabled = notifier.process_4h_alert_only(top20_dummies + [res_ok], trader=trader, dual_mode=True, short_top_gainers=20)
+            self.assertEqual(st_disabled["orders_opened"], 0)
+            st_open = notifier.process_4h_alert_only(top20_dummies + [res_ok], trader=trader, dual_mode=True, short_top_gainers=20, enable_short=True)
             self.assertEqual(st_open["orders_opened"], 1)
             self.assertIn("[1S→15dk] ERKEN SHORT", sent[-1])
             self.assertIn("Top 20 Gainer (+65.00%)", sent[-1])
