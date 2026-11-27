@@ -1019,8 +1019,8 @@ class TestBinanceTrader(unittest.TestCase):
                 api_key="",
                 api_secret="",
                 market="papi",
-                min_usd=150.0,
-                max_usd=250.0,
+                min_usd=100.0,
+                max_usd=200.0,
                 leverage=20,
                 max_leverage=20,
                 stop_loss_pct=1.5,
@@ -1085,6 +1085,8 @@ class TestBinanceTrader(unittest.TestCase):
                 api_key="",
                 api_secret="",
                 market="papi",
+                min_usd=100.0,
+                max_usd=200.0,
                 max_positions=5,
                 stop_loss_pct=1.5,
                 risk_per_trade_pct=7.5,
@@ -1098,6 +1100,33 @@ class TestBinanceTrader(unittest.TestCase):
             st_tsla = notifier.process_4h_alert_only([res_tsla], trader=tradifi_trader, dual_mode=True)
             self.assertEqual(st_tsla["orders_opened"], 1)
             self.assertIn("[ABD BORSA SANAL] LONG EMİR AÇILDI", sent[-1])
+
+            # Verify cloud snapshot pack/unpack & daily report (so tomorrow's status query works 100%)
+            rep = trader.get_daily_report()
+            self.assertEqual(rep["today_trades"], 1)
+            self.assertEqual(rep["today_wins"], 1)
+            self.assertEqual(rep["today_stops"], 0)
+            self.assertAlmostEqual(rep["today_profit_usd"], 3.00, places=2)
+
+            b64 = notifier._pack_cloud_payload([trader, tradifi_trader])
+            self.assertTrue(len(b64) > 10)
+            unpacked = TelegramNotifier.unpack_cloud_payload(
+                {"entities": [{"url": f"https://t.me/estrabim_bot?start=st_{b64}"}]}
+            )
+            self.assertIsNotNone(unpacked)
+            assert unpacked is not None
+            self.assertAlmostEqual(unpacked["wallets"]["KRİPTO"]["paper_balance"], 103.00, places=1)
+            self.assertIn("TSLAUSDT", unpacked["wallets"]["ABD BORSA"]["open_positions"])
+
+            # Verify min $100 .. max $200 clamp on wide (-15%) and tight (-1%) stops
+            t_wide = tradifi_trader.open_position("NVDAUSDT", price=100.0, target_usd=200.0, sl_price=85.0, allow_wide_sl=True)
+            self.assertIsNotNone(t_wide)
+            assert t_wide is not None
+            self.assertAlmostEqual(t_wide.notional_usd, 100.0, places=1)  # Clamped up to min $100!
+            t_tight = tradifi_trader.open_position("AAPLUSDT", price=100.0, target_usd=200.0, sl_price=99.0, allow_wide_sl=True)
+            self.assertIsNotNone(t_tight)
+            assert t_tight is not None
+            self.assertAlmostEqual(t_tight.notional_usd, 200.0, places=1)  # Clamped down to max $200!
 
             # Reset paper wallet back to $100.00
             ps = trader.reset_paper_account()

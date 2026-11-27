@@ -36,14 +36,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--min-usd",
         type=float,
-        default=float(os.getenv("MIN_POSITION_USD", "150")),
-        help="Minimum pozisyon büyüklüğü USD (varsayılan: 150)",
+        default=float(os.getenv("MIN_POSITION_USD", "100")),
+        help="Minimum pozisyon büyüklüğü USD (varsayılan: 100)",
     )
     p.add_argument(
         "--max-usd",
         type=float,
-        default=float(os.getenv("MAX_POSITION_USD", "250")),
-        help="Maksimum pozisyon büyüklüğü USD (varsayılan: 250)",
+        default=float(os.getenv("MAX_POSITION_USD", "200")),
+        help="Maksimum pozisyon büyüklüğü USD (varsayılan: 200)",
     )
     p.add_argument(
         "--max-positions",
@@ -183,10 +183,12 @@ def _start_position_monitor(
                             )
                     last_sync = now
                 if not dry_run:
+                    any_closed = False
                     for t in traders:
                         if t.has_open_positions() or t.has_pending_close_events():
                             closed_events = t.manage_open_positions()
                             for ev in closed_events:
+                                any_closed = True
                                 print(
                                     f"[{datetime.now().strftime('%H:%M:%S')}] "
                                     f"[{t.wallet_name}] KAPANIŞ: {ev['symbol']} {ev['reason']} "
@@ -196,6 +198,8 @@ def _start_position_monitor(
                                     notifier.send_text(format_managed_close_message(ev))
                                 except Exception as exc:
                                     print(f"  Telegram kapanış bildirim hatası: {exc}")
+                    if any_closed:
+                        notifier.sync_cloud_dashboard(traders)
             except Exception as exc:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Pozisyon takip hatası: {exc}")
             time.sleep(interval_sec)
@@ -301,6 +305,9 @@ def main() -> None:
 
     active_traders = [t for t in (trader, tradifi_trader) if t is not None]
     if active_traders and not args.once:
+        restored = notifier.restore_from_cloud_dashboard(active_traders)
+        if restored:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Sanal kasa verileri bulut panelinden geri yüklendi!")
         for t in active_traders:
             try:
                 synced = t.sync_live_positions()
@@ -310,6 +317,7 @@ def main() -> None:
                 )
             except Exception as exc:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] [{t.wallet_name}] İlk senkron hatası: {exc}")
+        notifier.sync_cloud_dashboard(active_traders)
         _start_position_monitor(active_traders, notifier, dry_run=args.dry_run, interval_sec=2)
 
     long_window_min = int(os.getenv("LONG_ENTRY_WINDOW_MINUTES", "0"))
@@ -420,6 +428,13 @@ def main() -> None:
                     "last_error": None,
                 }
             )
+            if (
+                stats["orders_opened"]
+                + stats["orders_closed"]
+                + tradifi_stats["orders_opened"]
+                + tradifi_stats["orders_closed"]
+            ) > 0 and active_traders:
+                notifier.sync_cloud_dashboard(active_traders)
             paused_tag = " [DURDURULDU]" if notifier.is_paused(trader) else ""
             c_bal = f"${trader.get_account_equity():.2f}" if trader else "-"
             t_bal = f"${tradifi_trader.get_account_equity():.2f}" if tradifi_trader else "-"

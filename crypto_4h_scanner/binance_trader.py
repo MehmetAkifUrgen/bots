@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -130,6 +131,7 @@ class BinanceTrader:
                     data.setdefault("paper_win_trades", 0)
                     data.setdefault("paper_total_fees", 0.0)
                     data.setdefault("paper_realized_pnl", 0.0)
+                    data.setdefault("closed_history", [])
                     return data
             except Exception:
                 pass
@@ -145,6 +147,7 @@ class BinanceTrader:
             "paper_win_trades": 0,
             "paper_total_fees": 0.0,
             "paper_realized_pnl": 0.0,
+            "closed_history": [],
         }
 
     def get_paper_summary(self) -> dict:
@@ -177,8 +180,72 @@ class BinanceTrader:
             self._state["paper_win_trades"] = 0
             self._state["paper_total_fees"] = 0.0
             self._state["paper_realized_pnl"] = 0.0
+            self._state["closed_history"] = []
             self._save_state()
         return self.get_paper_summary()
+
+    def get_daily_report(self, date_tr: str | None = None) -> dict:
+        tz_tr = timezone(timedelta(hours=3))
+        target_day = date_tr or datetime.now(tz_tr).strftime("%Y-%m-%d")
+        with self._lock:
+            hist: list[dict] = list(self._state.get("closed_history", []))
+            today_rows = [r for r in hist if r.get("date_tr") == target_day]
+            wins = [r for r in today_rows if float(r.get("pnl_usd", 0.0)) > 0]
+            losses = [r for r in today_rows if float(r.get("pnl_usd", 0.0)) <= 0]
+            stops = [r for r in today_rows if bool(r.get("is_stop")) or float(r.get("pnl_usd", 0.0)) < 0]
+            gross_win = sum(float(r.get("pnl_usd", 0.0)) for r in wins)
+            gross_loss = sum(float(r.get("pnl_usd", 0.0)) for r in losses)
+            fees = sum(float(r.get("fee_usd", 0.0)) for r in today_rows)
+            return {
+                "date_tr": target_day,
+                "wallet_name": self.wallet_name,
+                "today_trades": len(today_rows),
+                "today_wins": len(wins),
+                "today_stops": len(stops),
+                "today_profit_usd": round(gross_win, 2),
+                "today_loss_usd": round(gross_loss, 2),
+                "today_net_usd": round(gross_win + gross_loss, 2),
+                "today_fees_usd": round(fees, 3),
+                "recent_trades": hist[-15:],
+                "open_positions": dict(self._state.get("open_positions", {})),
+                "summary": self.get_paper_summary(),
+            }
+
+    def export_cloud_snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "wallet_name": self.wallet_name,
+                "paper_balance": round(float(self._state.get("paper_balance", self.paper_balance_usd)), 4),
+                "paper_initial_balance": round(float(self._state.get("paper_initial_balance", self.paper_balance_usd)), 2),
+                "paper_total_trades": int(self._state.get("paper_total_trades", 0)),
+                "paper_win_trades": int(self._state.get("paper_win_trades", 0)),
+                "paper_total_fees": round(float(self._state.get("paper_total_fees", 0.0)), 4),
+                "paper_realized_pnl": round(float(self._state.get("paper_realized_pnl", 0.0)), 4),
+                "paused": bool(self._state.get("paused", False)),
+                "open_positions": dict(self._state.get("open_positions", {})),
+                "closed_history": list(self._state.get("closed_history", []))[-20:],
+            }
+
+    def import_cloud_snapshot(self, snap: dict) -> None:
+        if not isinstance(snap, dict):
+            return
+        with self._lock:
+            for k in (
+                "paper_balance",
+                "paper_initial_balance",
+                "paper_total_trades",
+                "paper_win_trades",
+                "paper_total_fees",
+                "paper_realized_pnl",
+                "paused",
+            ):
+                if k in snap:
+                    self._state[k] = snap[k]
+            if isinstance(snap.get("open_positions"), dict):
+                self._state["open_positions"] = snap["open_positions"]
+            if isinstance(snap.get("closed_history"), list):
+                self._state["closed_history"] = snap["closed_history"]
+            self._save_state()
 
     def is_paused(self) -> bool:
         with self._lock:
@@ -482,14 +549,19 @@ class BinanceTrader:
             equity = self.get_account_equity()
             if equity > 0:
                 risk_notional = equity * (self.risk_per_trade_pct / est_sl_pct)
-                min_floor = 12.0 if allow_wide_sl else 20.0
-                notional = max(min_floor, min(self.max_usd, risk_notional))
-                effective_min_usd = min(self.min_usd, max(10.0 if allow_wide_sl else 15.0, notional * 0.85))
+                if self.paper_mode:
+                    # Strictly honor min_usd ($100) .. max_usd ($200) bounds in paper simulation
+                    notional = max(self.min_usd, min(self.max_usd, risk_notional))
+                    effective_min_usd = self.min_usd
+                else:
+                    min_floor = 12.0 if allow_wide_sl else 20.0
+                    notional = max(min_floor, min(self.max_usd, risk_notional))
+                    effective_min_usd = min(self.min_usd, max(10.0 if allow_wide_sl else 15.0, notional * 0.85))
 
         free_usdt = self.get_free_usdt()
         effective_lev = min(self.max_leverage, self.leverage)
-        if allow_wide_sl and est_sl_pct > 2.5:
-            # Cap leverage safely so wide ATR stops never get liquidated before stop hits
+        if not self.paper_mode and allow_wide_sl and est_sl_pct > 2.5:
+            # Cap leverage safely on real exchange so wide ATR stops never get liquidated before stop hits
             effective_lev = min(effective_lev, max(2, int(80.0 / est_sl_pct)))
         if self._is_um_futures() and free_usdt > 0:
             if free_usdt * effective_lev * 0.90 < effective_min_usd:
@@ -679,6 +751,7 @@ class BinanceTrader:
         symbol: str,
         fallback_price: float,
         is_stop_loss: bool = False,
+        close_reason: str = "",
     ) -> TradeExecution | None:
         """Close an open LONG or SHORT position on Binance."""
         live_open = self.get_live_open_positions()
@@ -774,6 +847,37 @@ class BinanceTrader:
             )
         else:
             pnl_usd = gross_pnl
+
+        tz_tr = timezone(timedelta(hours=3))
+        now_tr = datetime.now(tz_tr)
+        raw_pct = (
+            ((exec_price - entry_px) / entry_px) * 100.0
+            if (entry_px > 0 and pos_side == "LONG")
+            else (((entry_px - exec_price) / entry_px) * 100.0 if entry_px > 0 else 0.0)
+        )
+        net_pct_rec = raw_pct - (2.0 * self.taker_fee_pct) if self.paper_mode else raw_pct
+        hist_list: list[dict] = self._state.setdefault("closed_history", [])
+        hist_list.append(
+            {
+                "ts": int(time.time()),
+                "date_tr": now_tr.strftime("%Y-%m-%d"),
+                "time_tr": now_tr.strftime("%H:%M"),
+                "symbol": symbol,
+                "wallet": self.wallet_name,
+                "side": pos_side,
+                "reason": close_reason or ("STOP" if is_stop_loss else "KAPANIŞ"),
+                "is_stop": bool(is_stop_loss),
+                "notional_usd": round(entry_px * exec_qty, 2),
+                "entry_price": entry_px,
+                "exit_price": exec_price,
+                "pnl_usd": round(pnl_usd, 2),
+                "pnl_pct": round(net_pct_rec, 2),
+                "fee_usd": round(total_fee, 3),
+                "balance_after": round(float(self._state.get("paper_balance", self.paper_balance_usd)), 2),
+            }
+        )
+        if len(hist_list) > 200:
+            self._state["closed_history"] = hist_list[-200:]
 
         if is_stop_loss:
             self._state["consecutive_stops"] = int(self._state.get("consecutive_stops", 0)) + 1
@@ -1217,6 +1321,7 @@ class BinanceTrader:
                         sym,
                         fallback_price=curr_price,
                         is_stop_loss=reason.startswith("STOP"),
+                        close_reason=reason,
                     )
                     if closed:
                         if pos_side == "LONG":

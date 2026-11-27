@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import base64
 import html
 import json
 from pathlib import Path
 import time
+import zlib
 import requests
 
 from .binance_scanner import Coin4hResult
@@ -404,10 +406,11 @@ class TelegramNotifier:
                     data.setdefault("sent_alerts", {})
                     data.setdefault("tracked_positions", {})
                     data.setdefault("paused", False)
+                    data.setdefault("dashboard_msg_id", 0)
                     return data
             except Exception:
                 pass
-        return {"sent_alerts": {}, "tracked_positions": {}, "paused": False}
+        return {"sent_alerts": {}, "tracked_positions": {}, "paused": False, "dashboard_msg_id": 0}
 
     def is_paused(self, trader: BinanceTrader | None = None) -> bool:
         if trader is not None and trader.is_paused():
@@ -532,6 +535,22 @@ class TelegramNotifier:
                         lines.append(f"• <b>{t.wallet_name} Sanal Kasa:</b> <b>${ps['balance']:.2f}</b>")
                 if len(lines) > 1:
                     self.send_text("\n".join(lines))
+                    self.sync_cloud_dashboard(all_traders)
+            elif cmd in ("/bugun", "/bugün", "/rapor", "/gunluk"):
+                tz_tr = timezone(timedelta(hours=3))
+                today_str = datetime.now(tz_tr).strftime("%Y-%m-%d")
+                blocks = [f"📅 <b>GÜNLÜK RAPOR ({today_str})</b>"]
+                for t in all_traders:
+                    rep = t.get_daily_report(today_str)
+                    ps = rep["summary"]
+                    blocks.append(
+                        f"\n🏦 <b>{t.wallet_name} SANAL KASA:</b> <b>${ps['balance']:.2f}</b>\n"
+                        f"• Bugün İşlem: <b>{rep['today_trades']}</b> "
+                        f"(✅ Başarılı: <b>{rep['today_wins']}</b> | 🛑 Stop/Zarar: <b>{rep['today_stops']}</b>)\n"
+                        f"• Bugün Kazanç: <b>+${rep['today_profit_usd']:.2f}</b> | Zarar: <b>${rep['today_loss_usd']:.2f}</b>\n"
+                        f"• Bugün Komisyon: <code>-${rep['today_fees_usd']:.3f}</code> | <b>Bugün Net: ${rep['today_net_usd']:+.2f}</b>"
+                    )
+                self.send_text("\n".join(blocks))
             elif cmd in ("/durum", "/status", "/komutlar", "/yardim", "/help"):
                 paused = self.is_paused(trader)
                 state_badge = "⏸️ DURDURULDU" if paused else "🟢 AKTİF"
@@ -539,19 +558,183 @@ class TelegramNotifier:
                 for t in all_traders:
                     open_syms = list(t._state.get("open_positions", {}).keys())
                     if t.paper_mode:
-                        ps = t.get_paper_summary()
+                        rep = t.get_daily_report()
+                        ps = rep["summary"]
                         blocks.append(
                             f"\n🏦 <b>{t.wallet_name} SANAL KASA:</b> <b>${ps['balance']:.2f}</b> "
-                            f"(Net: <b>${ps['net_usd']:+.2f} / {ps['net_pct']:+.2f}%</b>)\n"
-                            f"• Komisyon: <code>-${ps['total_fees']:.3f}</code> | İşlem: <b>{ps['win_trades']}/{ps['total_trades']}</b>\n"
+                            f"(Toplam Net: <b>${ps['net_usd']:+.2f} / {ps['net_pct']:+.2f}%</b>)\n"
+                            f"• Bugün: ✅ <b>{rep['today_wins']}</b> Başarılı | 🛑 <b>{rep['today_stops']}</b> Stop | "
+                            f"Kazanç: <b>+${rep['today_profit_usd']:.2f}</b> | Zarar: <b>${rep['today_loss_usd']:.2f}</b> | Net: <b>${rep['today_net_usd']:+.2f}</b>\n"
+                            f"• Toplam Komisyon: <code>-${ps['total_fees']:.3f}</code> | Toplam İşlem: <b>{ps['win_trades']}/{ps['total_trades']}</b>\n"
                             f"• Açık ({len(open_syms)}/{t.max_positions}): <code>{', '.join(open_syms) if open_syms else 'YOK'}</code>"
                         )
                     else:
                         blocks.append(
                             f"\n💼 <b>{t.wallet_name} (GERÇEK):</b> Açık: <code>{', '.join(open_syms) if open_syms else 'YOK'}</code>"
                         )
-                blocks.append("\n• Komutlar: <code>/durdur</code> | <code>/baslat</code> | <code>/durum</code> | <code>/sifirla</code>")
+                blocks.append("\n• Komutlar: <code>/durum</code> | <code>/bugun</code> | <code>/durdur</code> | <code>/baslat</code> | <code>/sifirla</code>")
                 self.send_text("\n".join(blocks))
+
+    def _pack_cloud_payload(self, traders: list[BinanceTrader]) -> str:
+        raw_obj = {
+            "v": 1,
+            "ts": int(time.time()),
+            "wallets": {t.wallet_name: t.export_cloud_snapshot() for t in traders if t is not None},
+        }
+        # Trim closed_history progressively if needed so compressed URL always stays < 1900 chars
+        for max_hist in (20, 10, 5, 0):
+            for w in raw_obj["wallets"].values():
+                w["closed_history"] = w.get("closed_history", [])[-max_hist:] if max_hist > 0 else []
+            comp = zlib.compress(json.dumps(raw_obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8"), 9)
+            b64 = base64.urlsafe_b64encode(comp).decode("ascii")
+            if len(b64) <= 1850:
+                return b64
+        return ""
+
+    @staticmethod
+    def unpack_cloud_payload(pinned_msg: dict) -> dict | None:
+        if not isinstance(pinned_msg, dict):
+            return None
+        for ent in pinned_msg.get("entities") or []:
+            url = str(ent.get("url") or "")
+            if "?start=st_" in url:
+                b64 = url.split("?start=st_", 1)[1]
+                try:
+                    raw = zlib.decompress(base64.urlsafe_b64decode(b64.encode("ascii")))
+                    return json.loads(raw.decode("utf-8"))
+                except Exception:
+                    return None
+        return None
+
+    def restore_from_cloud_dashboard(self, traders: list[BinanceTrader]) -> bool:
+        """Restore paper wallet states from pinned Telegram dashboard if local container restarted."""
+        if not self.bot_token or not self.chat_id or not traders:
+            return False
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{self.bot_token}/getChat",
+                params={"chat_id": self.chat_id},
+                timeout=self.timeout,
+            )
+            data = resp.json().get("result") or {}
+            pinned = data.get("pinned_message")
+            if not pinned:
+                return False
+            if int(pinned.get("message_id") or 0) > 0:
+                self._state["dashboard_msg_id"] = int(pinned["message_id"])
+                self._save_state()
+            payload = self.unpack_cloud_payload(pinned)
+            if not payload or not isinstance(payload.get("wallets"), dict):
+                return False
+            restored = False
+            for t in traders:
+                if t is not None and t.paper_mode and not t.state_file.exists():
+                    snap = payload["wallets"].get(t.wallet_name)
+                    if snap:
+                        t.import_cloud_snapshot(snap)
+                        restored = True
+            return restored
+        except Exception:
+            return False
+
+    def sync_cloud_dashboard(self, traders: list[BinanceTrader]) -> None:
+        """Update silent pinned Telegram dashboard + embedded cloud state so local CLI & user can inspect anytime."""
+        if not self.bot_token or not self.chat_id or not traders:
+            return
+        tz_tr = timezone(timedelta(hours=3))
+        now_tr = datetime.now(tz_tr)
+        today_str = now_tr.strftime("%Y-%m-%d")
+        lines = [
+            f"📌 <b>CANLI SANAL KASA PANELİ</b> (<i>{now_tr.strftime('%d.%m %H:%M')} TSİ</i>)",
+            "━━━━━━━━━━━━━━━━━━━━",
+        ]
+        recent_all: list[dict] = []
+        for t in traders:
+            if t is None or not t.paper_mode:
+                continue
+            rep = t.get_daily_report(today_str)
+            ps = rep["summary"]
+            open_pos = rep["open_positions"]
+            open_str = (
+                ", ".join(f"{s}(${float(p.get('notional_usd', 0)):.0f})" for s, p in open_pos.items())
+                if open_pos
+                else "YOK"
+            )
+            lines.append(
+                f"🏦 <b>{t.wallet_name}: ${ps['balance']:.2f}</b> ({ps['net_usd']:+.2f}$ / {ps['net_pct']:+.2f}%)\n"
+                f"• Bugün: ✅<b>{rep['today_wins']}</b> Kâr | 🛑<b>{rep['today_stops']}</b> Stop | "
+                f"+${rep['today_profit_usd']:.2f} / ${rep['today_loss_usd']:.2f} (Net: <b>${rep['today_net_usd']:+.2f}</b>)\n"
+                f"• Toplam: {ps['win_trades']}/{ps['total_trades']} işlem | Komisyon: -${ps['total_fees']:.2f}\n"
+                f"• Açık ({len(open_pos)}/{t.max_positions}): <code>{open_str}</code>"
+            )
+            recent_all.extend(rep["recent_trades"])
+
+        if recent_all:
+            recent_all.sort(key=lambda r: int(r.get("ts", 0)), reverse=True)
+            lines.append("━━━━━━━━━━━━━━━━━━━━\n🧾 <b>Son Kapanan İşlemler:</b>")
+            for r in recent_all[:8]:
+                ic = "✅" if float(r.get("pnl_usd", 0)) > 0 else "🛑"
+                lines.append(
+                    f"{ic} <code>{r.get('time_tr','')}</code> <b>{r.get('symbol')}</b> [{r.get('wallet','')}] "
+                    f"<b>${float(r.get('pnl_usd',0)):+.2f}</b> ({html.escape(str(r.get('reason','')))})"
+                )
+
+        b64 = self._pack_cloud_payload(traders)
+        hidden_link = f'<a href="https://t.me/estrabim_bot?start=st_{b64}">&#8203;</a>' if b64 else ""
+        full_html = "\n".join(lines) + hidden_link
+
+        msg_id = int(self._state.get("dashboard_msg_id") or 0)
+        base = f"https://api.telegram.org/bot{self.bot_token}"
+        try:
+            if msg_id == 0:
+                chat_r = requests.get(f"{base}/getChat", params={"chat_id": self.chat_id}, timeout=self.timeout).json()
+                pinned = (chat_r.get("result") or {}).get("pinned_message") or {}
+                if "CANLI SANAL KASA PANELİ" in str(pinned.get("text") or ""):
+                    msg_id = int(pinned.get("message_id") or 0)
+
+            if msg_id > 0:
+                ed = requests.post(
+                    f"{base}/editMessageText",
+                    json={
+                        "chat_id": self.chat_id,
+                        "message_id": msg_id,
+                        "text": full_html,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=self.timeout,
+                )
+                if ed.status_code == 200 or "message is not modified" in ed.text:
+                    self._state["dashboard_msg_id"] = msg_id
+                    self._save_state()
+                    return
+
+            sent_r = requests.post(
+                f"{base}/sendMessage",
+                json={
+                    "chat_id": self.chat_id,
+                    "text": full_html,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                    "disable_notification": True,
+                },
+                timeout=self.timeout,
+            ).json()
+            new_id = int((sent_r.get("result") or {}).get("message_id") or 0)
+            if new_id > 0:
+                self._state["dashboard_msg_id"] = new_id
+                self._save_state()
+                requests.post(
+                    f"{base}/pinChatMessage",
+                    json={
+                        "chat_id": self.chat_id,
+                        "message_id": new_id,
+                        "disable_notification": True,
+                    },
+                    timeout=self.timeout,
+                )
+        except Exception:
+            pass
 
     def _try_open_trade(
         self,
@@ -794,8 +977,13 @@ class TelegramNotifier:
                         and not ev_curr.green_trigger
                     ):
                         try:
+                            is_1h = getattr(res, "timeframe", "4h") == "1h"
+                            sat_reason = "SAT (1S İndikatör Çıkışı)" if is_1h else "SAT (4S İndikatör Çıkışı)"
                             closed = trader.close_position(
-                                res.symbol, fallback_price=res.price, is_stop_loss=False
+                                res.symbol,
+                                fallback_price=res.price,
+                                is_stop_loss=False,
+                                close_reason=sat_reason,
                             )
                             if closed:
                                 entry_px = float(pos.get("entry_price") or closed.price)
@@ -843,7 +1031,10 @@ class TelegramNotifier:
                     if sev.cover_confirmed_prev_bar and sev.prev_bar_open_time > entry_bar_ts:
                         try:
                             closed = trader.close_position(
-                                res.symbol, fallback_price=res.price, is_stop_loss=False
+                                res.symbol,
+                                fallback_price=res.price,
+                                is_stop_loss=False,
+                                close_reason="KAPAT (15dk Dönüş Sinyali)",
                             )
                             if closed:
                                 entry_px = float(pos.get("entry_price") or closed.price)
