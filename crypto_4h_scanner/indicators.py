@@ -115,6 +115,32 @@ def wilder_rsi(closes: pd.Series, length: int = 14) -> pd.Series:
     return pd.Series(rsi, index=closes.index, dtype=float)
 
 
+def wilder_atr(
+    highs: pd.Series, lows: pd.Series, closes: pd.Series, length: int = 14
+) -> pd.Series:
+    """Compute ATR using Wilder's RMA of True Range, matching TradingView ta.atr."""
+    n = len(closes)
+    if n < length:
+        return pd.Series(np.nan, index=closes.index, dtype=float)
+
+    h = highs.to_numpy(dtype=float)
+    l = lows.to_numpy(dtype=float)
+    c = closes.to_numpy(dtype=float)
+
+    tr = np.empty(n, dtype=float)
+    tr[0] = h[0] - l[0]
+    for i in range(1, n):
+        tr[i] = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+
+    atr = np.full(n, np.nan, dtype=float)
+    atr[length - 1] = float(np.mean(tr[:length]))
+    alpha = 1.0 / length
+    for i in range(length, n):
+        atr[i] = alpha * tr[i] + (1.0 - alpha) * atr[i - 1]
+
+    return pd.Series(atr, index=closes.index, dtype=float)
+
+
 def pine_ema(series: pd.Series, length: int) -> pd.Series:
     """EMA matching TradingView ta.ema (alpha = 2 / (length + 1), NaN-aware)."""
     vals = series.to_numpy(dtype=float)
@@ -711,6 +737,326 @@ def evaluate_4h_system(
         short_any4_trigger=last_short_any4_trig,
         long_3_trigger=last_long_3_trig,
         short_rev_trigger=last_short_rev_trig,
+        real_sell_cond=last_real_sell,
+    )
+
+
+def _get_target_tp_band(
+    price: float,
+    last_res: float | None,
+    fib_p: float | None,
+    fib_r1: float | None,
+    fib_r2: float | None,
+    h20: float,
+    min_tp_pct: float = 2.0,
+    max_tp_pct: float = 3.0,
+) -> float:
+    eff_min = min(min_tp_pct, max_tp_pct)
+    eff_max = max(min_tp_pct, max_tp_pct)
+    min_p = price * (1.0 + eff_min / 100.0)
+    max_p = price * (1.0 + eff_max / 100.0)
+    mid_p = price * (1.0 + ((eff_min + eff_max) * 0.5) / 100.0)
+
+    best: float | None = None
+    for cand in (last_res, fib_p, fib_r1, fib_r2, h20):
+        if cand is not None and not np.isnan(cand) and min_p <= cand <= max_p:
+            best = cand if best is None else min(best, cand)
+    return best if best is not None else mid_p
+
+
+def _get_init_stop_atr(
+    price: float,
+    last_sup: float | None,
+    fib_p: float | None,
+    fib_s1: float | None,
+    fib_s2: float | None,
+    l15: float,
+    atr_val: float,
+    use_atr_stop: bool = True,
+    atr_mult: float = 2.5,
+) -> float:
+    sup_stop = _get_prev_sup(price, last_sup, fib_p, fib_s1, fib_s2, l15)
+    if use_atr_stop and not np.isnan(atr_val) and atr_val > 0:
+        atr_stop = max(price * 0.01, price - (atr_val * atr_mult))
+        return min(sup_stop, atr_stop)
+    return sup_stop
+
+
+def evaluate_4h_atr_long_system(
+    df_4h: pd.DataFrame,
+    df_1m: pd.DataFrame | None = None,
+    pivot_len: int = 7,
+    min_tp_pct: float = 2.0,
+    max_tp_pct: float = 3.0,
+    be_trigger_pct: float = 1.3,
+    use_atr_stop: bool = True,
+    atr_len: int = 14,
+    atr_mult: float = 2.5,
+) -> SystemEvaluation | None:
+    """
+    Pine Script v5 'Günlük Sistem (ATR + %2-%3 TP + Yüksek Başarı)' run on 4H OHLCV.
+    - 5 indicators: Stoch RSI, RSI+MA, Fisher(9), WaveTrend(10,21), SMI(10,3,3)+EMA9.
+    - TP band: 2.0%-3.0% (lowest resistance in band, else +2.5% midpoint).
+    - Stop: min(Support Stop, entry - ATR(14)*2.5), BE lock at +1.3% -> +0.3%.
+    - SAT exit: (smi < smiEma9) and (wt1 < wt2) and (fisher < fisherTrigger).
+    """
+    if len(df_4h) < 60:
+        return None
+
+    opens = df_4h["open"].astype(float).reset_index(drop=True)
+    highs = df_4h["high"].astype(float).reset_index(drop=True)
+    lows = df_4h["low"].astype(float).reset_index(drop=True)
+    closes = df_4h["close"].astype(float).reset_index(drop=True)
+    open_times = df_4h["open_time"].astype("int64").reset_index(drop=True)
+
+    k, d = stochastic_rsi(closes, smooth_k=3, smooth_d=3, rsi_length=14, stoch_length=14)
+    rsi_main = wilder_rsi(closes, length=14)
+    rsi_ma = rsi_main.rolling(window=14, min_periods=14).mean()
+    fisher, fisher_trigger = fisher_transform(highs, lows, length=9)
+    wt1, wt2 = wavetrend(highs, lows, closes, n1=10, n2=21)
+    smi, smi_sig, smi_ema9 = stochastic_momentum_index(
+        highs, lows, closes, k_len=10, d_len=3, ema_len=3, ema9_len=9
+    )
+    atr_s = wilder_atr(highs, lows, closes, length=atr_len)
+    ema200 = pine_ema(closes, 200)
+
+    piv_h, piv_l = compute_pivots(highs, lows, left=pivot_len, right=pivot_len)
+    h20_s = highs.rolling(window=20, min_periods=1).max()
+    l15_s = lows.rolling(window=15, min_periods=1).min()
+
+    pos_stage = "NONE"
+    be_locked = False
+    entry_price: float | None = None
+    tp_level: float | None = None
+    sl_level: float | None = None
+    total_trades = 0
+    win_trades = 0
+    total_profit_pct = 0.0
+
+    last_res: float | None = None
+    last_sup: float | None = None
+
+    n = len(df_4h)
+    last_green_trig = False
+    last_orange_trig = False
+    last_exit_trig = False
+    last_exit_reason: str | None = None
+    last_exit_price: float | None = None
+    last_exit_pct: float | None = None
+
+    last_c1 = last_c2 = last_c3 = last_c4 = last_c5 = False
+    last_first3 = last_all5 = False
+    last_real_sell = False
+    last_ema200_bull = False
+    last_ema200_bear = False
+    last_fib_p = last_fib_r1 = last_fib_r2 = last_fib_s1 = last_fib_s2 = None
+
+    for i in range(n):
+        if not np.isnan(piv_h[i]):
+            last_res = float(piv_h[i])
+        if not np.isnan(piv_l[i]):
+            last_sup = float(piv_l[i])
+
+        if any(
+            np.isnan(x)
+            for x in (
+                k.iloc[i],
+                d.iloc[i],
+                rsi_main.iloc[i],
+                rsi_ma.iloc[i],
+                wt1.iloc[i],
+                wt2.iloc[i],
+                smi.iloc[i],
+                smi_sig.iloc[i],
+                smi_ema9.iloc[i],
+            )
+        ):
+            continue
+
+        c1 = bool(k.iloc[i] > d.iloc[i])
+        c2 = bool(rsi_main.iloc[i] > rsi_ma.iloc[i])
+        c3 = bool(fisher.iloc[i] > fisher_trigger.iloc[i])
+        c4 = bool(wt1.iloc[i] > wt2.iloc[i])
+        c5 = bool(
+            (smi.iloc[i] > smi_sig.iloc[i])
+            and (smi.iloc[i] > smi_ema9.iloc[i])
+            and (smi_sig.iloc[i] > smi_ema9.iloc[i])
+        )
+
+        first3 = c1 and c2 and c3
+        all5 = first3 and c4 and c5
+        real_sell = bool(
+            (smi.iloc[i] < smi_ema9.iloc[i])
+            and (wt1.iloc[i] < wt2.iloc[i])
+            and (fisher.iloc[i] < fisher_trigger.iloc[i])
+        )
+
+        bar_o = float(opens.iloc[i])
+        bar_h = float(highs.iloc[i])
+        bar_c = float(closes.iloc[i])
+        bar_ts = int(open_times.iloc[i])
+        atr_val = float(atr_s.iloc[i])
+        ema200_val = float(ema200.iloc[i])
+
+        exec_price = bar_c if i == n - 1 else (bar_o + bar_h) / 2.0
+        fib_p, fib_r1, fib_r2, fib_s1, fib_s2 = _monthly_fib_for_bar(bar_ts, df_1m)
+        h20 = float(h20_s.iloc[i])
+        l15 = float(l15_s.iloc[i])
+
+        green_trig = False
+        orange_trig = False
+        exit_trig = False
+        exit_reason: str | None = None
+        exit_price: float | None = None
+        exit_pct: float | None = None
+
+        if pos_stage == "NONE":
+            if all5:
+                orange_trig = True
+                pos_stage = "ORANGE"
+                be_locked = False
+                entry_price = exec_price
+                tp_level = _get_target_tp_band(
+                    entry_price, last_res, fib_p, fib_r1, fib_r2, h20, min_tp_pct, max_tp_pct
+                )
+                sl_level = _get_init_stop_atr(
+                    entry_price, last_sup, fib_p, fib_s1, fib_s2, l15, atr_val, use_atr_stop, atr_mult
+                )
+            elif first3:
+                green_trig = True
+                pos_stage = "GREEN"
+                be_locked = False
+                entry_price = exec_price
+                tp_level = _get_target_tp_band(
+                    entry_price, last_res, fib_p, fib_r1, fib_r2, h20, min_tp_pct, max_tp_pct
+                )
+                sl_level = _get_init_stop_atr(
+                    entry_price, last_sup, fib_p, fib_s1, fib_s2, l15, atr_val, use_atr_stop, atr_mult
+                )
+        elif pos_stage == "GREEN" and all5:
+            orange_trig = True
+            pos_stage = "ORANGE"
+
+        any_pos = pos_stage != "NONE" and not green_trig and not orange_trig
+        if any_pos:
+            assert entry_price is not None and tp_level is not None and sl_level is not None
+            if not be_locked and bar_h >= entry_price * (1.0 + be_trigger_pct / 100.0):
+                be_locked = True
+                sl_level = entry_price * 1.003
+
+            hit_stop = bar_c < sl_level
+            hit_tp = bar_h >= tp_level
+
+            if hit_tp:
+                exit_trig = True
+                exec_tp = max(bar_o, tp_level)
+                trade_pct = ((exec_tp - entry_price) / entry_price) * 100.0
+                total_trades += 1
+                total_profit_pct += trade_pct
+                if trade_pct > 0:
+                    win_trades += 1
+                exit_reason = "KÂR AL (%2-%3)"
+                exit_price = exec_tp
+                exit_pct = trade_pct
+                pos_stage = "NONE"
+                be_locked = False
+                entry_price = tp_level = sl_level = None
+            elif hit_stop:
+                exit_trig = True
+                exec_sl = sl_level if be_locked else bar_c
+                trade_pct = ((exec_sl - entry_price) / entry_price) * 100.0
+                total_trades += 1
+                total_profit_pct += trade_pct
+                if trade_pct > 0:
+                    win_trades += 1
+                exit_reason = "SAT (Kâr Kilidi)" if be_locked else "STOP (ATR+Destek)"
+                exit_price = exec_sl
+                exit_pct = trade_pct
+                pos_stage = "NONE"
+                be_locked = False
+                entry_price = tp_level = sl_level = None
+            elif real_sell:
+                exit_trig = True
+                trade_pct = ((bar_c - entry_price) / entry_price) * 100.0
+                total_trades += 1
+                total_profit_pct += trade_pct
+                if trade_pct > 0:
+                    win_trades += 1
+                exit_reason = "SAT"
+                exit_price = bar_c
+                exit_pct = trade_pct
+                pos_stage = "NONE"
+                be_locked = False
+                entry_price = tp_level = sl_level = None
+
+        if i == n - 1:
+            last_green_trig = green_trig
+            last_orange_trig = orange_trig
+            last_exit_trig = exit_trig
+            last_exit_reason = exit_reason
+            last_exit_price = exit_price
+            last_exit_pct = exit_pct
+            last_c1, last_c2, last_c3, last_c4, last_c5 = c1, c2, c3, c4, c5
+            last_first3, last_all5 = first3, all5
+            last_real_sell = real_sell
+            last_ema200_bull = bool(not np.isnan(ema200_val) and bar_c > ema200_val)
+            last_ema200_bear = bool(not np.isnan(ema200_val) and bar_c < ema200_val)
+            last_fib_p, last_fib_r1, last_fib_r2, last_fib_s1, last_fib_s2 = (
+                fib_p,
+                fib_r1,
+                fib_r2,
+                fib_s1,
+                fib_s2,
+            )
+
+    last_close = float(closes.iloc[-1])
+    last_atr = float(atr_s.iloc[-1])
+    # Always expose fresh %2-%3 TP and ATR+Destek SL anchored to current live price
+    live_tp = _get_target_tp_band(
+        last_close, last_res, last_fib_p, last_fib_r1, last_fib_r2, float(h20_s.iloc[-1]), min_tp_pct, max_tp_pct
+    )
+    live_sl = _get_init_stop_atr(
+        last_close, last_sup, last_fib_p, last_fib_s1, last_fib_s2, float(l15_s.iloc[-1]), last_atr, use_atr_stop, atr_mult
+    )
+    win_rate = (win_trades / total_trades) * 100.0 if total_trades > 0 else 0.0
+    bar_close_ts = (
+        int(df_4h["close_time"].iloc[-1])
+        if "close_time" in df_4h.columns
+        else int(open_times.iloc[-1]) + 4 * 3600 * 1000 - 1
+    )
+
+    return SystemEvaluation(
+        bar_open_time=int(open_times.iloc[-1]),
+        price=last_close,
+        cond1_buy=last_c1,
+        cond2_buy=last_c2,
+        cond3_buy=last_c3,
+        cond4_buy=last_c4,
+        cond5_buy=last_c5,
+        trend_ok=True,
+        first_three_buy=last_first3,
+        all_five_buy=last_all5,
+        green_trigger=last_green_trig,
+        orange_trigger=last_orange_trig,
+        exit_trigger=last_exit_trig,
+        exit_reason=last_exit_reason,
+        exit_price=last_exit_price,
+        exit_trade_pct=last_exit_pct,
+        in_green_pos=(pos_stage != "NONE"),
+        in_orange_pos=(pos_stage == "ORANGE"),
+        be_locked=be_locked,
+        entry_price=entry_price,
+        tp_level=tp_level,
+        sl_level=sl_level,
+        next_res=live_tp,
+        prev_sup=live_sl,
+        total_trades=total_trades,
+        win_trades=win_trades,
+        win_rate=round(win_rate, 2),
+        total_profit_pct=round(total_profit_pct, 2),
+        bar_close_time=bar_close_ts,
+        ema200_bull=last_ema200_bull,
+        ema200_bear=last_ema200_bear,
         real_sell_cond=last_real_sell,
     )
 

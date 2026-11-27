@@ -16,6 +16,7 @@ from .indicators import (
     SystemEvaluation,
     check_1h_short_zone,
     evaluate_1h_15m_system,
+    evaluate_4h_atr_long_system,
     evaluate_4h_system,
     evaluate_short_15m_system,
     resample_15m_to_45m,
@@ -367,8 +368,16 @@ class Binance4hScanner:
         df_1m = self.fetch_klines_cached(
             sym, interval="1M", initial_limit=36, pages=1, max_rows=48
         )
-        ev = evaluate_4h_system(
-            df_ohlcv, df_1m=df_1m, pivot_len=7, be_trigger_pct=2.5, ema200_filter=False
+        ev = evaluate_4h_atr_long_system(
+            df_ohlcv,
+            df_1m=df_1m,
+            pivot_len=7,
+            min_tp_pct=2.0,
+            max_tp_pct=3.0,
+            be_trigger_pct=1.3,
+            use_atr_stop=True,
+            atr_len=14,
+            atr_mult=2.5,
         )
         if ev is None:
             return None

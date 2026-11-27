@@ -366,6 +366,7 @@ class BinanceTrader:
         use_trailing: bool = True,
         be_trigger_pct: float = 0.0,
         entry_bar_open_time: int = 0,
+        allow_wide_sl: bool = False,
     ) -> TradeExecution | None:
         """Open a LONG or SHORT position if under max_positions, not in cooldown, and balance allows."""
         pos_side: Literal["LONG", "SHORT"] = "SHORT" if str(side).upper() == "SHORT" else "LONG"
@@ -385,15 +386,26 @@ class BinanceTrader:
 
         effective_min_usd = self.min_usd
         notional = max(self.min_usd, min(self.max_usd, target_usd))
-        if self.risk_per_trade_pct > 0 and self.stop_loss_pct > 0:
+        est_sl_pct = self.stop_loss_pct
+        if allow_wide_sl and sl_price is not None and price > 0:
+            if pos_side == "LONG" and 0 < sl_price < price * 0.995:
+                est_sl_pct = ((price - sl_price) / price) * 100.0
+            elif pos_side == "SHORT" and sl_price > price * 1.005:
+                est_sl_pct = ((sl_price - price) / price) * 100.0
+
+        if self.risk_per_trade_pct > 0 and est_sl_pct > 0:
             equity = self.get_account_equity()
             if equity > 0:
-                risk_notional = equity * (self.risk_per_trade_pct / self.stop_loss_pct)
-                notional = max(20.0, min(self.max_usd, risk_notional))
-                effective_min_usd = min(self.min_usd, max(15.0, notional * 0.85))
+                risk_notional = equity * (self.risk_per_trade_pct / est_sl_pct)
+                min_floor = 12.0 if allow_wide_sl else 20.0
+                notional = max(min_floor, min(self.max_usd, risk_notional))
+                effective_min_usd = min(self.min_usd, max(10.0 if allow_wide_sl else 15.0, notional * 0.85))
 
         free_usdt = self.get_free_usdt()
         effective_lev = min(self.max_leverage, self.leverage)
+        if allow_wide_sl and est_sl_pct > 2.5:
+            # Cap leverage safely so wide ATR stops never get liquidated before stop hits
+            effective_lev = min(effective_lev, max(2, int(80.0 / est_sl_pct)))
         if self._is_um_futures() and free_usdt > 0:
             if free_usdt * effective_lev * 0.90 < effective_min_usd:
                 needed_lev = int(math.ceil(notional / (free_usdt * 0.90)))
@@ -491,7 +503,9 @@ class BinanceTrader:
         actual_not = round(exec_qty * exec_price, 2)
         if pos_side == "LONG":
             default_sl = exec_price * (1.0 - self.stop_loss_pct / 100.0)
-            if sl_price is not None and default_sl <= sl_price < exec_price * 0.995:
+            if allow_wide_sl and sl_price is not None and 0 < sl_price < exec_price * 0.995:
+                final_sl = sl_price
+            elif sl_price is not None and default_sl <= sl_price < exec_price * 0.995:
                 final_sl = sl_price
             else:
                 final_sl = default_sl
@@ -502,7 +516,9 @@ class BinanceTrader:
             )
         else:
             default_sl = exec_price * (1.0 + self.stop_loss_pct / 100.0)
-            if sl_price is not None and exec_price * 1.005 < sl_price <= default_sl:
+            if allow_wide_sl and sl_price is not None and sl_price > exec_price * 1.005:
+                final_sl = sl_price
+            elif sl_price is not None and exec_price * 1.005 < sl_price <= default_sl:
                 final_sl = sl_price
             else:
                 final_sl = default_sl
@@ -528,6 +544,7 @@ class BinanceTrader:
             "use_trailing": bool(use_trailing),
             "be_trigger_pct": float(be_trigger_pct),
             "be_locked": False,
+            "allow_wide_sl": bool(allow_wide_sl),
             "entry_bar_open_time": int(entry_bar_open_time),
             "opened_at": int(time.time()),
         }
@@ -713,6 +730,7 @@ class BinanceTrader:
                     if (
                         not tracked[sym].get("trailing_active")
                         and not tracked[sym].get("be_locked")
+                        and not tracked[sym].get("allow_wide_sl")
                         and not tracked[sym].get("signal_lost")
                     ):
                         tracked[sym]["sl_price"] = (
@@ -745,13 +763,14 @@ class BinanceTrader:
                     "qty": qty,
                     "notional_usd": round(qty * ep, 2),
                     "sl_price": sl_px,
-                    "tp_price": ep * 0.955 if pos_side == "SHORT" else 0.0,
+                    "tp_price": ep * 0.955 if pos_side == "SHORT" else ep * 1.025,
                     "exchange_sl_price": sl_px,
                     "peak_price": ep,
                     "trailing_active": False,
                     "use_trailing": False,
-                    "be_trigger_pct": 1.5 if pos_side == "SHORT" else 0.0,
+                    "be_trigger_pct": 1.5 if pos_side == "SHORT" else 1.3,
                     "be_locked": False,
+                    "allow_wide_sl": False,
                     "entry_bar_open_time": 0,
                     "opened_at": int(time.time()),
                 }
@@ -974,7 +993,7 @@ class BinanceTrader:
                             pos["exchange_sl_price"] = new_sl
 
                     if tp_px > 0 and curr_price >= tp_px:
-                        reason = "KÂR AL (Direnç)"
+                        reason = "KÂR AL (%2-%3)" if pos.get("allow_wide_sl") else "KÂR AL (Direnç)"
                     elif use_trailing and trailing_active:
                         floor_sl = entry_px * (1.0 + self.trailing_floor_pct / 100.0)
                         trail_sl = peak_px * (1.0 - self.trailing_callback_pct / 100.0)
@@ -996,6 +1015,9 @@ class BinanceTrader:
                         if pos.get("be_locked"):
                             if curr_price <= sl_px:
                                 reason = "SAT (Kâr Kilidi +%0.30)"
+                        elif pos.get("allow_wide_sl"):
+                            if curr_price <= sl_px:
+                                reason = "STOP (ATR+Destek)"
                         elif pnl_pct <= -self.stop_loss_pct or curr_price <= sl_px:
                             if pos.get("signal_lost") and curr_price <= sl_px:
                                 reason = f"STOP (Sinyal Bozuldu -${self.signal_cancel_stop_usd:g})"

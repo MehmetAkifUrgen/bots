@@ -270,21 +270,21 @@ def main() -> None:
 
     long_window_min = int(os.getenv("LONG_ENTRY_WINDOW_MINUTES", "0"))
     short_window_min = int(os.getenv("SHORT_ENTRY_WINDOW_MINUTES", "15"))
-    long_min_wr = float(os.getenv("LONG_MIN_WIN_RATE", "65.0"))
-    long_min_profit = float(os.getenv("LONG_MIN_PROFIT_PCT", "300.0"))
+    long_min_wr = float(os.getenv("LONG_MIN_WIN_RATE", "0.0"))
+    long_min_profit = float(os.getenv("LONG_MIN_PROFIT_PCT", "-999999"))
     effective_poll = min(args.poll_seconds, 60)
 
     short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "20")) or 20
     trade_mode_str = (
-        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, LONG: 4S Direnç/SAT, SHORT: Top{short_top_n} 1S→15dk)"
+        f"AÇIK (${args.min_usd:.0f}-${args.max_usd:.0f}, Max {args.max_positions} poz, LONG: 4S ATR+%2-%3 TP, SHORT: Top{short_top_n} 1S→15dk)"
         if trader
         else "KAPALI (Sadece Bildirim)"
     )
     print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] Hibrit 4S-LONG / Top{short_top_n}-1S→15dk-SHORT Bot başlatıldı | "
+        f"[{datetime.now().strftime('%H:%M:%S')}] Hibrit 4S-ATR-LONG / Top{short_top_n}-1S→15dk-SHORT Bot başlatıldı | "
         f"Piyasa={args.market.upper()} | OtoAlım={trade_mode_str} | "
-        f"LONG=4S 5/5 (WR>=%{long_min_wr:g}, Getiri>=%{long_min_profit:g}, Anlık) | "
-        f"SHORT=Top {short_top_n} Gainer + 1S Bölge -> 15dk İlk Dönüş | Periyot={effective_poll}sn"
+        f"LONG=4S 5/5 (ATR+Destek SL, %2-%3 TP, +%1.3 Kâr Kilidi, Anlık) | "
+        f"SHORT=Top {short_top_n} Gainer + 1S/4S Duvar -> 15dk İlk Dönüş | Periyot={effective_poll}sn"
     )
 
     scan_interval = os.getenv("SCAN_INTERVAL", "4h").strip().lower()

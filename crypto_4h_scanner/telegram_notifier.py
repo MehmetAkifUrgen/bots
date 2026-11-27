@@ -169,17 +169,19 @@ def format_dual_4h_message(
         trade_block = f"\nℹ️ <i>{html.escape(str(trade_note))}</i>\n"
 
     if is_long:
-        tp = ev.tp_level or ev.next_res
+        tp = ev.next_res if ev.next_res > entry * 1.005 else (ev.tp_level or entry * 1.025)
         tp_pct = ((tp - entry) / entry * 100.0) if entry > 0 else 0.0
+        sl_atr = ev.prev_sup if (0 < ev.prev_sup < entry * 0.995) else sl
+        sl_atr_pct = ((sl_atr - entry) / entry * 100.0) if entry > 0 else -stop_loss_pct
         timing_tag = f"Son {long_window_min}dk Mum Kapanışı" if long_window_min > 0 else "Anlık Giriş"
         return (
-            f"🟠 <b>[{tf_short} SİSTEM] TURUNCU KESİN AL (5/5) — LONG</b>\n"
+            f"🟠 <b>[{tf_short} ATR SİSTEM] TURUNCU KESİN AL (5/5) — LONG</b>\n"
             f"🪙 <b>{res.symbol}</b> | <code>{tf_label}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
-            f"🎯 <b>Kâr Al (Direnç):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
-            f"🛑 <b>Stop (-%{stop_loss_pct:g}):</b> <code>{fmt_price(sl)}</code>\n"
-            f"🔒 <b>Çıkış Kuralı:</b> Direnç Kâr Al veya İndikatör SAT (Başabaş Kilidi ve Trailing Yok)\n"
+            f"🎯 <b>Kâr Al (%2-%3):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
+            f"🛑 <b>Stop (ATR+Destek):</b> <code>{fmt_price(sl_atr)}</code> (<b>{sl_atr_pct:.2f}%</b>)\n"
+            f"🔒 <b>Çıkış Kuralı:</b> %2-%3 TP | +%1.3'te +%0.30 Kâr Kilidi | 3'lü SAT\n"
             f"📈 <b>{tf_short} Backtest:</b> <b>%{ev.win_rate:.1f} Başarı</b> ({ev.win_trades}/{ev.total_trades}) | <b>Getiri: %{ev.total_profit_pct:+.1f}</b>\n"
             f"{trade_block}"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -689,8 +691,8 @@ class TelegramNotifier:
         long_entry_window_minutes: int | None = None,
         short_entry_window_minutes: int | None = None,
         short_top_gainers: int = 20,
-        long_min_win_rate: float = 65.0,
-        long_min_profit_pct: float = 300.0,
+        long_min_win_rate: float = 0.0,
+        long_min_profit_pct: float = -1e9,
     ) -> dict:
         """Process 4H signals: LONG on 4H Pine 5/5 (WR>=65%, Profit>=300%, instant), SHORT on 4H 5/5 + EMA200 (last 15m)."""
         sent_alerts: dict[str, int] = self._state["sent_alerts"]
@@ -873,17 +875,19 @@ class TelegramNotifier:
                 if trader and trader.is_configured and not dry_run:
                     try:
                         if side == "LONG":
-                            tp_target = ev.tp_level or ev.next_res
+                            tp_target = ev.next_res if ev.next_res > res.price * 1.005 else (ev.tp_level or res.price * 1.025)
+                            sl_target = ev.prev_sup if (0 < ev.prev_sup < res.price * 0.995) else ev.sl_level
                             trade_exec = trader.open_position(
                                 res.symbol,
                                 res.price,
                                 trader.max_usd,
                                 tp_price=tp_target,
-                                sl_price=None,
+                                sl_price=sl_target,
                                 side="LONG",
                                 use_trailing=False,
-                                be_trigger_pct=0.0,
+                                be_trigger_pct=1.3,
                                 entry_bar_open_time=ev.bar_open_time,
+                                allow_wide_sl=True,
                             )
                         elif use_short_15m_mode and sev_15m is not None:
                             trade_exec = trader.open_position(
