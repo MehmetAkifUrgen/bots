@@ -73,6 +73,7 @@ class BinanceTrader:
         paper_balance_usd: float = 100.0,
         taker_fee_pct: float = 0.05,
         wallet_name: str = "KRİPTO",
+        high_lev_fixed_usd: bool = False,
     ) -> None:
         self.api_key = api_key.strip()
         self.api_secret = api_secret.strip()
@@ -95,6 +96,7 @@ class BinanceTrader:
         self.paper_balance_usd = max(1.0, float(paper_balance_usd))
         self.taker_fee_pct = max(0.0, float(taker_fee_pct))
         self.wallet_name = wallet_name.strip() or "KRİPTO"
+        self.high_lev_fixed_usd = bool(high_lev_fixed_usd)
         self.last_reject_reason: str = ""
         self.state_file = state_file or (
             Path(__file__).resolve().parent / "trade_state.json"
@@ -132,6 +134,7 @@ class BinanceTrader:
                     data.setdefault("paper_total_fees", 0.0)
                     data.setdefault("paper_realized_pnl", 0.0)
                     data.setdefault("closed_history", [])
+                    data.setdefault("opened_signals", {})
                     return data
             except Exception:
                 pass
@@ -148,6 +151,7 @@ class BinanceTrader:
             "paper_total_fees": 0.0,
             "paper_realized_pnl": 0.0,
             "closed_history": [],
+            "opened_signals": {},
         }
 
     def get_paper_summary(self) -> dict:
@@ -551,42 +555,75 @@ class BinanceTrader:
             elif pos_side == "SHORT" and sl_price > price * 1.005:
                 est_sl_pct = ((sl_price - price) / price) * 100.0
 
-        if self.risk_per_trade_pct > 0 and est_sl_pct > 0:
-            equity = self.get_account_equity()
-            if equity > 0:
-                risk_notional = equity * (self.risk_per_trade_pct / est_sl_pct)
-                if self.paper_mode:
-                    # Strictly honor min_usd ($100) .. max_usd ($200) bounds in paper simulation
-                    notional = max(self.min_usd, min(self.max_usd, risk_notional))
-                    effective_min_usd = self.min_usd
-                else:
-                    min_floor = 12.0 if allow_wide_sl else 20.0
-                    notional = max(min_floor, min(self.max_usd, risk_notional))
-                    effective_min_usd = min(self.min_usd, max(10.0 if allow_wide_sl else 15.0, notional * 0.85))
-
         free_usdt = self.get_free_usdt()
         effective_lev = min(self.max_leverage, self.leverage)
-        if not self.paper_mode and allow_wide_sl and est_sl_pct > 2.5:
-            # Cap leverage safely on real exchange so wide ATR stops never get liquidated before stop hits
-            effective_lev = min(effective_lev, max(2, int(80.0 / est_sl_pct)))
-        if self._is_um_futures() and free_usdt > 0:
-            if free_usdt * effective_lev * 0.90 < effective_min_usd:
-                needed_lev = int(math.ceil(notional / (free_usdt * 0.90)))
-                effective_lev = min(self.max_leverage, max(effective_lev, needed_lev))
 
-        required_margin = (
-            notional / effective_lev if self._is_um_futures() else notional
-        )
-        if free_usdt < required_margin:
-            max_affordable_notional = (
-                free_usdt * effective_lev * 0.90
-                if self._is_um_futures()
-                else free_usdt * 0.98
-            )
-            if max_affordable_notional < effective_min_usd:
+        if self.high_lev_fixed_usd and not self.paper_mode and self._is_um_futures():
+            # Set highest supported leverage on Binance FIRST so small accounts ($18) easily open $100-$150 x 3 slots
+            lev_path = "/papi/v1/um/leverage" if self.market == "papi" else "/fapi/v1/leverage"
+            cand_levs = [lv for lv in (75, 50, 40, 30, 25, 20, 15, 10) if lv <= self.max_leverage]
+            if not cand_levs:
+                cand_levs = [self.max_leverage]
+            actual_lev = effective_lev
+            for try_lev in cand_levs:
+                try:
+                    lev_res = self._signed_request(
+                        "POST", lev_path, {"symbol": symbol, "leverage": try_lev}
+                    )
+                    actual_lev = int(lev_res.get("leverage") or try_lev)
+                    break
+                except Exception:
+                    continue
+            effective_lev = max(1, actual_lev)
+            rem_slots = max(1, self.max_positions - len(all_open_syms))
+            slot_margin = (free_usdt / rem_slots) * 0.90
+            slot_notional = slot_margin * effective_lev
+            max_afford = free_usdt * effective_lev * 0.90
+            if max_afford < 20.0:
                 self.last_reject_reason = f"{self.wallet_name} yetersiz serbest marj (${free_usdt:.2f})."
                 return None
-            notional = max(effective_min_usd, min(self.max_usd, max_affordable_notional))
+            if slot_notional >= self.min_usd:
+                notional = min(self.max_usd, slot_notional)
+            elif max_afford >= self.min_usd:
+                notional = self.min_usd
+            else:
+                notional = max_afford
+            effective_min_usd = min(self.min_usd, notional * 0.90)
+        else:
+            if self.risk_per_trade_pct > 0 and est_sl_pct > 0:
+                equity = self.get_account_equity()
+                if equity > 0:
+                    risk_notional = equity * (self.risk_per_trade_pct / est_sl_pct)
+                    if self.paper_mode:
+                        # Strictly honor min_usd ($100) .. max_usd ($150) bounds in paper simulation
+                        notional = max(self.min_usd, min(self.max_usd, risk_notional))
+                        effective_min_usd = self.min_usd
+                    else:
+                        min_floor = 12.0 if allow_wide_sl else 20.0
+                        notional = max(min_floor, min(self.max_usd, risk_notional))
+                        effective_min_usd = min(self.min_usd, max(10.0 if allow_wide_sl else 15.0, notional * 0.85))
+
+            if not self.paper_mode and allow_wide_sl and est_sl_pct > 2.5:
+                # Cap leverage safely on real exchange so wide ATR stops never get liquidated before stop hits
+                effective_lev = min(effective_lev, max(2, int(80.0 / est_sl_pct)))
+            if self._is_um_futures() and free_usdt > 0:
+                if free_usdt * effective_lev * 0.90 < effective_min_usd:
+                    needed_lev = int(math.ceil(notional / (free_usdt * 0.90)))
+                    effective_lev = min(self.max_leverage, max(effective_lev, needed_lev))
+
+            required_margin = (
+                notional / effective_lev if self._is_um_futures() else notional
+            )
+            if free_usdt < required_margin:
+                max_affordable_notional = (
+                    free_usdt * effective_lev * 0.90
+                    if self._is_um_futures()
+                    else free_usdt * 0.98
+                )
+                if max_affordable_notional < effective_min_usd:
+                    self.last_reject_reason = f"{self.wallet_name} yetersiz serbest marj (${free_usdt:.2f})."
+                    return None
+                notional = max(effective_min_usd, min(self.max_usd, max_affordable_notional))
 
         if self.paper_mode:
             qty = round(notional / price, 6) if price > 0 else 0.0
@@ -624,16 +661,17 @@ class BinanceTrader:
         elif self._is_um_futures():
             lev_path = "/papi/v1/um/leverage" if self.market == "papi" else "/fapi/v1/leverage"
             ord_path = "/papi/v1/um/order" if self.market == "papi" else "/fapi/v1/order"
-            for try_lev in dict.fromkeys([effective_lev, min(15, effective_lev), 10, 5]):
-                try:
-                    self._signed_request(
-                        "POST",
-                        lev_path,
-                        {"symbol": symbol, "leverage": try_lev},
-                    )
-                    break
-                except Exception:
-                    continue
+            if not self.high_lev_fixed_usd:
+                for try_lev in dict.fromkeys([effective_lev, min(15, effective_lev), 10, 5]):
+                    try:
+                        self._signed_request(
+                            "POST",
+                            lev_path,
+                            {"symbol": symbol, "leverage": try_lev},
+                        )
+                        break
+                    except Exception:
+                        continue
             res = self._signed_request(
                 "POST",
                 ord_path,
@@ -1035,9 +1073,10 @@ class BinanceTrader:
                     continue
                 if not self._is_bot_opened_position(sym, pos_side):
                     continue
+                is_long = pos_side == "LONG"
                 sl_px = (
-                    ep * (1.0 - self.stop_loss_pct / 100.0)
-                    if pos_side == "LONG"
+                    ep * 0.97
+                    if is_long
                     else ep * (1.0 + self.stop_loss_pct / 100.0)
                 )
                 tracked[sym] = {
@@ -1046,16 +1085,26 @@ class BinanceTrader:
                     "order_id": "recovered",
                     "entry_price": ep,
                     "qty": qty,
+                    "initial_qty": qty,
                     "notional_usd": round(qty * ep, 2),
+                    "initial_notional_usd": round(qty * ep, 2),
                     "sl_price": sl_px,
-                    "tp_price": ep * 0.955 if pos_side == "SHORT" else ep * 1.025,
+                    "close_sl_price": ep * 0.978 if is_long else 0.0,
+                    "tp_price": ep * 1.01 if is_long else ep * 0.955,
                     "exchange_sl_price": sl_px,
                     "peak_price": ep,
                     "trailing_active": False,
                     "use_trailing": False,
-                    "be_trigger_pct": 1.5 if pos_side == "SHORT" else 1.3,
+                    "be_trigger_pct": 0.0 if is_long else 1.5,
                     "be_locked": False,
-                    "allow_wide_sl": False,
+                    "allow_wide_sl": is_long,
+                    "v3_mode": is_long,
+                    "tp1_hit": False,
+                    "tp1_pct": 1.00,
+                    "fee_buffer_pct": 0.15,
+                    "trail_dist_pct": 1.10,
+                    "tp1_realized_pnl_usd": 0.0,
+                    "tp1_fee_usd": 0.0,
                     "entry_bar_open_time": 0,
                     "opened_at": int(time.time()),
                 }

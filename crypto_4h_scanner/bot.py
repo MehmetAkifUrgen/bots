@@ -42,8 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-usd",
         type=float,
-        default=float(os.getenv("MAX_POSITION_USD", "200")),
-        help="Maksimum pozisyon büyüklüğü USD (varsayılan: 200)",
+        default=float(os.getenv("MAX_POSITION_USD", "150")),
+        help="Maksimum pozisyon büyüklüğü USD (varsayılan: 150)",
     )
     p.add_argument(
         "--max-positions",
@@ -54,14 +54,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--leverage",
         type=int,
-        default=int(os.getenv("LEVERAGE", "20")),
-        help="Varsayılan kaldıraç (varsayılan: 20)",
+        default=int(os.getenv("LEVERAGE", "50")),
+        help="Varsayılan kaldıraç (varsayılan: 50)",
     )
     p.add_argument(
         "--max-leverage",
         type=int,
-        default=int(os.getenv("MAX_LEVERAGE", "20")),
-        help="Maksimum kaldıraç tavanı (varsayılan: 20)",
+        default=int(os.getenv("MAX_LEVERAGE", "75")),
+        help="Maksimum kaldıraç tavanı (varsayılan: 75)",
     )
     p.add_argument(
         "--min-volume",
@@ -160,18 +160,24 @@ def _start_health_server(port: int) -> None:
 def _start_position_monitor(
     traders: list[BinanceTrader],
     notifier: TelegramNotifier,
+    silent_traders: list[BinanceTrader] | None = None,
     dry_run: bool = False,
     interval_sec: int = 2,
 ) -> None:
-    """Fast 2-second monitor for TP, Break-Even Lock, and Stop-Loss across all wallets."""
+    """Fast 2-second monitor for TP1, Trailing, and Stop-Loss (visible paper + silent real Binance)."""
     primary = traders[0] if traders else None
     extras = traders[1:] if len(traders) > 1 else []
+    hidden = silent_traders or []
 
     def _loop() -> None:
         last_sync = 0.0
         while True:
             try:
                 notifier.poll_commands(primary, extra_traders=extras)
+                is_paused = notifier.is_paused(primary)
+                for ht in hidden:
+                    if ht.is_paused() != is_paused:
+                        ht.set_paused(is_paused)
                 now = time.time()
                 if now - last_sync >= 15.0:
                     for t in traders:
@@ -180,6 +186,13 @@ def _start_position_monitor(
                             print(
                                 f"[{datetime.now().strftime('%H:%M:%S')}] "
                                 f"[{t.wallet_name}] Açık pozisyon: {list(synced.keys())}"
+                            )
+                    for ht in hidden:
+                        synced_h = ht.sync_live_positions()
+                        if synced_h:
+                            print(
+                                f"[{datetime.now().strftime('%H:%M:%S')}] "
+                                f"[SESSİZ GERÇEK] Açık pozisyon: {list(synced_h.keys())}"
                             )
                     last_sync = now
                 if not dry_run:
@@ -200,13 +213,125 @@ def _start_position_monitor(
                                     print(f"  Telegram kapanış bildirim hatası: {exc}")
                     if any_closed:
                         notifier.sync_cloud_dashboard(traders)
+                    # Silent real Binance management (NEVER sends anything to Telegram!)
+                    for ht in hidden:
+                        if ht.has_open_positions() or ht.has_pending_close_events():
+                            h_events = ht.manage_open_positions()
+                            for hev in h_events:
+                                print(
+                                    f"[{datetime.now().strftime('%H:%M:%S')}] "
+                                    f"[SESSİZ GERÇEK] {hev['symbol']} {hev['reason']} "
+                                    f"({hev['pnl_usd']:+.2f}$ / {hev['pnl_pct']:+.2f}%)"
+                                )
             except Exception as exc:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Pozisyon takip hatası: {exc}")
             time.sleep(interval_sec)
 
     t_thread = threading.Thread(target=_loop, daemon=True)
     t_thread.start()
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Hızlı TP / Kâr Kilidi / Stop takipçisi aktif (her {interval_sec}sn)")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Hızlı TP / Trailing / Stop takipçisi aktif (her {interval_sec}sn)")
+
+
+def _process_silent_real_v3(
+    real_trader: BinanceTrader,
+    results: list,
+    long_min_wr: float,
+    long_min_profit: float,
+    long_window_min: int,
+    is_paused: bool,
+) -> tuple[int, int]:
+    """Execute Futures v3 entries & confirmed-bar exits on real Binance silently (zero Telegram output)."""
+    opened = 0
+    closed_cnt = 0
+    price_map = {r.symbol: r.price for r in results}
+    try:
+        evs = real_trader.manage_open_positions(price_map)
+        closed_cnt += sum(1 for e in evs if not e.get("is_partial"))
+    except Exception as exc:
+        print(f"  [SESSİZ GERÇEK] manage hatası: {exc}")
+
+    # 1) Confirmed 4H bar exits (-2.20% close stop & TREND BİTTİ) even when paused
+    for res in results:
+        pos = real_trader._state.get("open_positions", {}).get(res.symbol)
+        if not pos or not pos.get("v3_mode"):
+            continue
+        ev_curr = res.evaluation
+        entry_bar_ts = int(pos.get("entry_bar_open_time") or 0)
+        tp1_hit = bool(pos.get("tp1_hit", False))
+        close_sl_px = float(pos.get("close_sl_price") or 0.0)
+        if ev_curr.prev_bar_open_time > entry_bar_ts:
+            v3_reason: str | None = None
+            v3_stop = False
+            if not tp1_hit and close_sl_px > 0 and ev_curr.prev_bar_close < close_sl_px:
+                v3_reason = "STOP (4S Kapanış -%2.20)"
+                v3_stop = True
+            elif ev_curr.prev_bar_real_sell:
+                v3_reason = "TREND BİTTİ (KAPAT)"
+                v3_stop = False
+            if v3_reason:
+                try:
+                    c_res = real_trader.close_position(
+                        res.symbol, fallback_price=res.price, is_stop_loss=v3_stop, close_reason=v3_reason
+                    )
+                    if c_res:
+                        closed_cnt += 1
+                        print(f"  [SESSİZ GERÇEK KAPANIŞ] {res.symbol} -> {v3_reason} @ {c_res.price}")
+                except Exception as exc:
+                    print(f"  [SESSİZ GERÇEK] kapanış hatası {res.symbol}: {exc}")
+
+    if is_paused:
+        return opened, closed_cnt
+
+    # 2) New 4H Futures v3 LONG entries ($100-$150, Max 3, high leverage)
+    now_ms = int(time.time() * 1000)
+    win_ms = max(0, long_window_min) * 60 * 1000
+    seen_sigs: dict = real_trader._state.setdefault("opened_signals", {})
+    if len(seen_sigs) > 1000:
+        recent_items = sorted(seen_sigs.items(), key=lambda kv: kv[1], reverse=True)[:500]
+        real_trader._state["opened_signals"] = dict(recent_items)
+        seen_sigs = real_trader._state["opened_signals"]
+
+    for res in results:
+        ev = res.evaluation
+        if not (ev.orange_trigger and ev.win_rate >= long_min_wr and ev.total_profit_pct >= long_min_profit):
+            continue
+        if win_ms > 0 and ev.bar_close_time > 0:
+            rem_ms = ev.bar_close_time - now_ms
+            if not (-60_000 <= rem_ms <= win_ms):
+                continue
+        sig_key = f"{res.symbol}:{ev.bar_open_time}"
+        if sig_key in seen_sigs:
+            continue
+        try:
+            tex = real_trader.open_position(
+                res.symbol,
+                res.price,
+                real_trader.max_usd,
+                tp_price=res.price * 1.01,
+                sl_price=res.price * 0.97,
+                side="LONG",
+                use_trailing=False,
+                be_trigger_pct=0.0,
+                entry_bar_open_time=ev.bar_open_time,
+                allow_wide_sl=True,
+                v3_mode=True,
+                tp1_pct=1.00,
+                fee_buffer_pct=0.15,
+                trail_dist_pct=1.10,
+                close_stop_pct=2.20,
+                hard_stop_pct=3.00,
+            )
+            if tex:
+                seen_sigs[sig_key] = int(time.time())
+                real_trader._save_state()
+                opened += 1
+                print(
+                    f"  [SESSİZ GERÇEK AÇILIŞ] {res.symbol} ${tex.notional_usd:.2f} @ {tex.price} (ID:{tex.order_id})"
+                )
+        except Exception as exc:
+            print(f"  [SESSİZ GERÇEK] açılış hatası {res.symbol}: {exc}")
+
+    return opened, closed_cnt
 
 
 def main() -> None:
@@ -230,10 +355,15 @@ def main() -> None:
         return
 
     paper_mode = os.getenv("PAPER_TRADE", "true").strip().lower() not in ("0", "false", "no")
+    silent_real_env = os.getenv("SILENT_REAL_TRADE", "true").strip().lower() not in ("0", "false", "no")
     paper_balance = float(os.getenv("PAPER_BALANCE_USD", "100.0"))
     paper_min_usd = float(os.getenv("PAPER_MIN_USD", "100.0"))
-    paper_max_usd = float(os.getenv("PAPER_MAX_USD", "200.0"))
-    paper_max_pos = int(os.getenv("PAPER_MAX_POSITIONS", "5"))
+    paper_max_usd = float(os.getenv("PAPER_MAX_USD", "150.0"))
+    paper_max_pos = int(os.getenv("PAPER_MAX_POSITIONS", "3"))
+    real_min_usd = float(os.getenv("REAL_MIN_USD", "100.0"))
+    real_max_usd = float(os.getenv("REAL_MAX_USD", "150.0"))
+    real_max_pos = int(os.getenv("REAL_MAX_POSITIONS", "3"))
+    real_max_lev = int(os.getenv("REAL_MAX_LEVERAGE", "75"))
     taker_fee_pct = float(os.getenv("TAKER_FEE_PCT", "0.05"))
     auto_trade_env = os.getenv("AUTO_TRADE", "true").strip().lower() not in ("0", "false", "no")
     api_key = os.getenv("BINANCE_API_KEY", "")
@@ -246,6 +376,7 @@ def main() -> None:
     )
     trader: BinanceTrader | None = None
     tradifi_trader: BinanceTrader | None = None
+    real_trader: BinanceTrader | None = None
     if auto_trade_env and not args.no_auto_trade and (paper_mode or (api_key and api_secret)):
         trade_state_path = (
             Path(__file__).resolve().parent / "paper_trade_state.json"
@@ -300,6 +431,27 @@ def main() -> None:
             taker_fee_pct=taker_fee_pct,
             wallet_name="ABD BORSA",
         )
+        # Silent real Binance executor (NEVER exposed in Telegram!)
+        if paper_mode and silent_real_env and api_key and api_secret:
+            real_trader = BinanceTrader(
+                api_key=api_key,
+                api_secret=api_secret,
+                market=args.market,
+                min_usd=real_min_usd,
+                max_usd=real_max_usd,
+                max_positions=real_max_pos,
+                leverage=real_max_lev,
+                max_leverage=real_max_lev,
+                stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "1.5")),
+                cooldown_minutes=0,
+                symbol_stop_cooldown_minutes=240,
+                risk_per_trade_pct=0.0,
+                state_file=DEFAULT_TRADE_STATE_FILE,
+                proxy_url=proxy_url,
+                paper_mode=False,
+                wallet_name="GERÇEK",
+                high_lev_fixed_usd=True,
+            )
 
     scanner = Binance4hScanner(market=args.market, max_workers=args.workers, contract_type="PERPETUAL")
     tradifi_scanner = Binance4hScanner(market=args.market, max_workers=args.workers, contract_type="TRADIFI_PERPETUAL")
@@ -308,7 +460,8 @@ def main() -> None:
         _start_health_server(args.port)
 
     active_traders = [t for t in (trader, tradifi_trader) if t is not None]
-    if active_traders and not args.once:
+    silent_traders = [real_trader] if real_trader is not None else []
+    if (active_traders or silent_traders) and not args.once:
         restored = notifier.restore_from_cloud_dashboard(active_traders)
         if restored:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Sanal kasa verileri bulut panelinden geri yüklendi!")
@@ -321,8 +474,23 @@ def main() -> None:
                 )
             except Exception as exc:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] [{t.wallet_name}] İlk senkron hatası: {exc}")
+        for ht in silent_traders:
+            try:
+                synced_h = ht.sync_live_positions()
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] "
+                    f"[SESSİZ GERÇEK] Canlı senkron: {list(synced_h.keys()) or 'YOK'}"
+                )
+            except Exception as exc:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [SESSİZ GERÇEK] İlk senkron hatası: {exc}")
         notifier.sync_cloud_dashboard(active_traders)
-        _start_position_monitor(active_traders, notifier, dry_run=args.dry_run, interval_sec=2)
+        _start_position_monitor(
+            active_traders,
+            notifier,
+            silent_traders=silent_traders,
+            dry_run=args.dry_run,
+            interval_sec=2,
+        )
 
     long_window_min = int(os.getenv("LONG_ENTRY_WINDOW_MINUTES", "0"))
     short_window_min = int(os.getenv("SHORT_ENTRY_WINDOW_MINUTES", "15"))
@@ -384,6 +552,15 @@ def main() -> None:
                 long_min_profit_pct=long_min_profit,
                 enable_short=enable_short,
             )
+            if real_trader is not None and not args.dry_run:
+                _process_silent_real_v3(
+                    real_trader,
+                    results,
+                    long_min_wr=long_min_wr,
+                    long_min_profit=long_min_profit,
+                    long_window_min=long_window_min,
+                    is_paused=notifier.is_paused(trader),
+                )
 
             # 2) Binance US Stock Futures (TRADIFI_PERPETUAL) on its own $100 virtual wallet
             tradifi_results, tradifi_errors, tradifi_dur = tradifi_scanner.scan_4h_bist_alerts(

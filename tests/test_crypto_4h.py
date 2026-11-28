@@ -1156,6 +1156,158 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertEqual(ps["balance"], 100.0)
             self.assertEqual(ps["total_trades"], 0)
 
+    def test_silent_real_18_usd_high_leverage_3_slots_zero_telegram_leak(self) -> None:
+        import time as _time
+        from crypto_4h_scanner.bot import _process_silent_real_v3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1) Visible paper trader for Telegram ($100-$150, Max 3)
+            paper_trader = BinanceTrader(
+                api_key="",
+                api_secret="",
+                market="papi",
+                min_usd=100.0,
+                max_usd=150.0,
+                max_positions=3,
+                paper_mode=True,
+                paper_balance_usd=112.22,
+                taker_fee_pct=0.05,
+                wallet_name="KRİPTO",
+                state_file=Path(tmp) / "paper_state.json",
+            )
+            # 2) Silent real Binance trader ($18.50 equity, $100-$150, Max 3, high_lev_fixed_usd=True)
+            real_trader = BinanceTrader(
+                api_key="real_k",
+                api_secret="real_s",
+                market="papi",
+                min_usd=100.0,
+                max_usd=150.0,
+                max_positions=3,
+                leverage=75,
+                max_leverage=75,
+                paper_mode=False,
+                wallet_name="GERÇEK",
+                high_lev_fixed_usd=True,
+                symbol_stop_cooldown_minutes=0,
+                state_file=Path(tmp) / "real_state.json",
+            )
+            real_trader._filters_cache = {
+                sym: {"stepSize": 0.1, "minQty": 0.1, "minNotional": 5.0, "tickSize": 0.01}
+                for sym in ("SOLUSDT", "APTUSDT", "WIFUSDT", "SUIUSDT")
+            }
+
+            live_wallet = {"free": 18.50}
+            live_positions: dict[str, dict] = {}
+            lev_caps = {"SOLUSDT": 50, "APTUSDT": 25, "WIFUSDT": 25, "SUIUSDT": 50}
+            real_orders: list[tuple[str, str, float]] = []
+
+            real_trader.get_free_usdt = lambda: live_wallet["free"]  # type: ignore[method-assign]
+            real_trader.get_live_open_positions = lambda: dict(live_positions)  # type: ignore[method-assign]
+
+            def fake_real_signed(method: str, path: str, params=None):
+                if path == "/papi/v1/um/leverage":
+                    sym = params["symbol"]
+                    req_lev = int(params["leverage"])
+                    if req_lev > lev_caps[sym]:
+                        raise RuntimeError("Leverage exceeds max bracket")
+                    return {"symbol": sym, "leverage": req_lev}
+                if path == "/papi/v1/um/order":
+                    sym = params["symbol"]
+                    qty = float(params["quantity"])
+                    side = params["side"]
+                    real_orders.append((sym, side, qty))
+                    if side == "BUY":
+                        notional = qty * 10.0
+                        used_margin = notional / lev_caps[sym]
+                        live_wallet["free"] = max(0.0, live_wallet["free"] - used_margin)
+                        live_positions[sym] = {"symbol": sym, "qty": qty, "entry_price": 10.0, "side": "LONG"}
+                    else:
+                        if sym in live_positions:
+                            rem = live_positions[sym]["qty"] - qty
+                            if rem <= 1e-6:
+                                live_positions.pop(sym, None)
+                            else:
+                                live_positions[sym]["qty"] = rem
+                    return {"orderId": 888999, "avgPrice": "10.0", "executedQty": str(qty)}
+                if path == "/papi/v1/um/algo/order":
+                    return {"algoId": 777111}
+                return {}
+
+            real_trader._signed_request = fake_real_signed  # type: ignore[method-assign]
+
+            notifier = TelegramNotifier("tok", "chat", Path(tmp) / "alert.json")
+            telegram_msgs: list[str] = []
+            notifier.send_text = lambda text: telegram_msgs.append(text) or True  # type: ignore[method-assign]
+
+            now_ms = int(_time.time() * 1000)
+            bar_open = 1_700_100_000_000
+            ev_v3 = SystemEvaluation(
+                bar_open_time=bar_open,
+                bar_close_time=now_ms + 3 * 3600_000,
+                price=10.0,
+                cond1_buy=True, cond2_buy=True, cond3_buy=True, cond4_buy=True, cond5_buy=True,
+                trend_ok=True, first_three_buy=True, all_five_buy=True,
+                green_trigger=True, orange_trigger=True, exit_trigger=False,
+                exit_reason=None, exit_price=None, exit_trade_pct=None,
+                in_green_pos=True, in_orange_pos=True, be_locked=False,
+                entry_price=10.0, tp_level=10.1, sl_level=9.78, next_res=10.1, prev_sup=9.78,
+                total_trades=30, win_trades=24, win_rate=80.0, total_profit_pct=420.0,
+            )
+            results = [
+                Coin4hResult(sym, "papi", 10.0, 4.0, 100_000_000.0, ev_v3, timeframe="4h")
+                for sym in ("SOLUSDT", "APTUSDT", "WIFUSDT", "SUIUSDT")
+            ]
+
+            # Paper trader opens 3 positions and notifies Telegram ONLY with SANAL info
+            st_paper = notifier.process_4h_alert_only(results, trader=paper_trader, dual_mode=True)
+            self.assertEqual(st_paper["orders_opened"], 3)
+            msg_count_after_paper = len(telegram_msgs)
+            self.assertGreater(msg_count_after_paper, 0)
+
+            # Silent real trader opens 3 positions ($100-$150 each on $18.50 equity!) with ZERO Telegram messages!
+            r_opened, r_closed = _process_silent_real_v3(
+                real_trader, results, long_min_wr=70.0, long_min_profit=300.0, long_window_min=0, is_paused=False
+            )
+            self.assertEqual(r_opened, 3)
+            self.assertEqual(r_closed, 0)
+            self.assertEqual(len(telegram_msgs), msg_count_after_paper)  # Zero extra Telegram messages!
+            for m in telegram_msgs:
+                self.assertNotIn("GERÇEK", m)
+                self.assertNotIn("888999", m)
+                self.assertNotIn("18.50", m)
+
+            # Verify all 3 real positions are sized strictly inside [$100, $150] and 4th (SUIUSDT) was blocked by max_positions=3
+            self.assertEqual(set(real_trader._state["open_positions"].keys()), {"SOLUSDT", "APTUSDT", "WIFUSDT"})
+            for sym, rpos in real_trader._state["open_positions"].items():
+                self.assertGreaterEqual(rpos["notional_usd"], 100.0)
+                self.assertLessEqual(rpos["notional_usd"], 150.0)
+                self.assertTrue(rpos["v3_mode"])
+
+            # Verify TP1 (50% close) + confirmed TREND BİTTİ exit on real_trader also produce ZERO Telegram messages
+            tp1_evs = real_trader.manage_open_positions({"SOLUSDT": 10.12})
+            self.assertEqual(len(tp1_evs), 1)
+            self.assertTrue(tp1_evs[0]["is_partial"])
+
+            ev_exit = SystemEvaluation(
+                **{
+                    **ev_v3.__dict__,
+                    "bar_open_time": bar_open + 8 * 3600_000,
+                    "prev_bar_open_time": bar_open + 4 * 3600_000,
+                    "prev_bar_close": 10.25,
+                    "prev_bar_real_sell": True,
+                    "orange_trigger": False,
+                    "green_trigger": False,
+                }
+            )
+            exit_results = [Coin4hResult("SOLUSDT", "papi", 10.25, 5.0, 100_000_000.0, ev_exit, timeframe="4h")]
+            r_op2, r_cl2 = _process_silent_real_v3(
+                real_trader, exit_results, long_min_wr=70.0, long_min_profit=300.0, long_window_min=0, is_paused=True
+            )
+            self.assertEqual(r_op2, 0)
+            self.assertEqual(r_cl2, 1)
+            self.assertNotIn("SOLUSDT", real_trader._state["open_positions"])
+            self.assertEqual(len(telegram_msgs), msg_count_after_paper)  # Still zero real leaks!
+
 
 if __name__ == "__main__":
     unittest.main()
