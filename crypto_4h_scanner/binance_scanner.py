@@ -18,6 +18,7 @@ from .indicators import (
     evaluate_1h_15m_system,
     evaluate_4h_atr_long_system,
     evaluate_4h_system,
+    evaluate_futures_v3_system,
     evaluate_short_15m_system,
     resample_15m_to_45m,
     resample_1h_to_4h,
@@ -367,27 +368,26 @@ class Binance4hScanner:
         df_ohlcv = self.fetch_klines_cached(
             sym, interval="4h", initial_limit=1500, pages=4, max_rows=5000
         )
-        df_1m = self.fetch_klines_cached(
-            sym, interval="1M", initial_limit=36, pages=1, max_rows=48
-        )
-        ev = evaluate_4h_atr_long_system(
+        ev = evaluate_futures_v3_system(
             df_ohlcv,
-            df_1m=df_1m,
-            pivot_len=7,
-            min_tp_pct=2.0,
-            max_tp_pct=3.0,
-            be_trigger_pct=1.3,
-            use_atr_stop=True,
-            atr_len=14,
-            atr_mult=2.5,
+            use_local_trend=False,
+            use_anti_top=True,
+            tp1_pct=1.00,
+            fee_buffer_pct=0.15,
+            trail_dist_pct=1.10,
+            max_stop_pct=2.20,
+            hard_stop_pct=3.00,
         )
         if ev is None:
             return None
 
-        # 2-Stage SHORT (ONLY Top 10 Gainers): 1H/4H Resistance or EMA200 Wall + Red Candle -> 15m Early Reversal
+        # 2-Stage SHORT (ONLY Top 10/20 Gainers when enabled): 1H/4H Wall + Red Candle -> 15m Early Reversal
         in_1h_zone = False
         htf_reason = ""
         if allow_short_scan:
+            df_1m = self.fetch_klines_cached(
+                sym, interval="1M", initial_limit=36, pages=1, max_rows=48
+            )
             df_1h_short = self.fetch_klines_cached(
                 sym, interval="1h", initial_limit=350, pages=1, max_rows=450
             )

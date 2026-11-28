@@ -51,6 +51,9 @@ class SystemEvaluation:
     long_3_trigger: bool = False
     short_rev_trigger: bool = False
     real_sell_cond: bool = False
+    prev_bar_open_time: int = 0
+    prev_bar_close: float = 0.0
+    prev_bar_real_sell: bool = False
 
 
 @dataclass(frozen=True)
@@ -1058,6 +1061,272 @@ def evaluate_4h_atr_long_system(
         ema200_bull=last_ema200_bull,
         ema200_bear=last_ema200_bear,
         real_sell_cond=last_real_sell,
+    )
+
+
+def evaluate_futures_v3_system(
+    df_ohlcv: pd.DataFrame,
+    use_local_trend: bool = False,
+    use_anti_top: bool = True,
+    tp1_pct: float = 1.00,
+    fee_buffer_pct: float = 0.15,
+    trail_dist_pct: float = 1.10,
+    max_stop_pct: float = 2.20,
+    hard_stop_pct: float = 3.00,
+) -> SystemEvaluation | None:
+    """
+    Exact 1:1 port of Pine Script v5:
+    'Kripto Futures v3: Hata Düzeltilmiş (%50 TP1 + %50 Trailing)'
+    """
+    if len(df_ohlcv) < 60:
+        return None
+
+    opens = df_ohlcv["open"].astype(float).reset_index(drop=True)
+    highs = df_ohlcv["high"].astype(float).reset_index(drop=True)
+    lows = df_ohlcv["low"].astype(float).reset_index(drop=True)
+    closes = df_ohlcv["close"].astype(float).reset_index(drop=True)
+    open_times = df_ohlcv["open_time"].astype("int64").reset_index(drop=True)
+
+    k, d = stochastic_rsi(closes, smooth_k=3, smooth_d=3, rsi_length=14, stoch_length=14)
+    rsi_main = wilder_rsi(closes, length=14)
+    rsi_ma = rsi_main.rolling(window=14, min_periods=14).mean()
+    fisher, fisher_trigger = fisher_transform(highs, lows, length=9)
+    wt1, wt2 = wavetrend(highs, lows, closes, n1=10, n2=21)
+    smi, smi_sig, smi_ema9 = stochastic_momentum_index(
+        highs, lows, closes, k_len=10, d_len=3, ema_len=3, ema9_len=9
+    )
+    ema50 = pine_ema(closes, 50)
+    ema200 = pine_ema(closes, 200)
+
+    pos_stage = "NONE"
+    tp1_hit = False
+    entry_price: float | None = None
+    tp1_level: float | None = None
+    sl_level: float | None = None
+    peak_price: float | None = None
+    tp1_locked_gain = 0.0
+    entry_bar_idx: int | None = None
+    total_trades = 0
+    win_trades = 0
+    total_profit_pct = 0.0
+
+    n = len(df_ohlcv)
+    last_green_fired = False
+    last_orange_fired = False
+    last_exit_trig = False
+    last_exit_reason: str | None = None
+    last_exit_price: float | None = None
+    last_exit_pct: float | None = None
+
+    last_c1 = last_c2 = last_c3 = last_c4 = last_c5 = False
+    last_trend_ok = True
+    last_first3 = last_all5 = False
+    last_real_sell = False
+    prev_real_sell = False
+    last_ema200_bull = False
+    last_ema200_bear = False
+
+    for i in range(n):
+        if any(
+            np.isnan(x)
+            for x in (
+                k.iloc[i],
+                d.iloc[i],
+                rsi_main.iloc[i],
+                rsi_ma.iloc[i],
+                wt1.iloc[i],
+                wt2.iloc[i],
+                smi.iloc[i],
+                smi_sig.iloc[i],
+                smi_ema9.iloc[i],
+            )
+        ):
+            continue
+
+        bar_o = float(opens.iloc[i])
+        bar_h = float(highs.iloc[i])
+        bar_l = float(lows.iloc[i])
+        bar_c = float(closes.iloc[i])
+        ema50_val = float(ema50.iloc[i])
+        ema200_val = float(ema200.iloc[i])
+
+        c1 = bool(k.iloc[i] > d.iloc[i])
+        c2 = bool(rsi_main.iloc[i] > rsi_ma.iloc[i])
+        c3 = bool(fisher.iloc[i] > fisher_trigger.iloc[i])
+        c4 = bool(wt1.iloc[i] > wt2.iloc[i])
+        c5 = bool(
+            (smi.iloc[i] > smi_sig.iloc[i])
+            and (smi.iloc[i] > smi_ema9.iloc[i])
+            and (smi_sig.iloc[i] > smi_ema9.iloc[i])
+        )
+
+        cond_trend = (not use_local_trend) or np.isnan(ema50_val) or (bar_c >= ema50_val)
+        not_top = (not use_anti_top) or (float(rsi_main.iloc[i]) < 72.0)
+
+        first3 = c1 and c2 and c3 and cond_trend and not_top
+        all5 = first3 and c4 and c5
+        real_sell = bool(
+            (smi.iloc[i] < smi_ema9.iloc[i])
+            and (wt1.iloc[i] < wt2.iloc[i])
+            and (fisher.iloc[i] < fisher_trigger.iloc[i])
+        )
+
+        exec_price = bar_c if i == n - 1 else (bar_o + bar_h) / 2.0
+
+        green_fired = False
+        orange_fired = False
+        exit_trig = False
+        exit_reason: str | None = None
+        exit_price: float | None = None
+        exit_pct: float | None = None
+
+        if pos_stage == "NONE":
+            if all5:
+                orange_fired = True
+                pos_stage = "ORANGE"
+                tp1_hit = False
+                tp1_locked_gain = 0.0
+                entry_price = exec_price
+                peak_price = exec_price
+                entry_bar_idx = i
+                tp1_level = entry_price * (1.0 + tp1_pct / 100.0)
+                sl_level = entry_price * (1.0 - max_stop_pct / 100.0)
+            elif first3:
+                green_fired = True
+                pos_stage = "GREEN"
+                tp1_hit = False
+                tp1_locked_gain = 0.0
+                entry_price = exec_price
+                peak_price = exec_price
+                entry_bar_idx = i
+                tp1_level = entry_price * (1.0 + tp1_pct / 100.0)
+                sl_level = entry_price * (1.0 - max_stop_pct / 100.0)
+        elif pos_stage == "GREEN" and all5:
+            orange_fired = True
+            pos_stage = "ORANGE"
+
+        if pos_stage != "NONE" and entry_bar_idx is not None and i > entry_bar_idx:
+            assert entry_price is not None and tp1_level is not None and sl_level is not None
+            peak_price = max(peak_price if peak_price is not None else bar_h, bar_h)
+
+            if not tp1_hit and bar_h >= tp1_level:
+                tp1_hit = True
+                exec_tp1 = max(bar_o, tp1_level)
+                tp1_locked_gain = ((exec_tp1 - entry_price) / entry_price) * 100.0
+                sl_level = entry_price * (1.0 + fee_buffer_pct / 100.0)
+
+            if tp1_hit:
+                trail_sl = peak_price * (1.0 - trail_dist_pct / 100.0)
+                sl_level = max(sl_level, trail_sl)
+
+            is_confirmed = i < n - 1
+            hard_stop_px = entry_price * (1.0 - hard_stop_pct / 100.0)
+            hit_hard_stop = (not tp1_hit) and (bar_l <= hard_stop_px)
+            hit_stop = ((not tp1_hit) and is_confirmed and (bar_c < sl_level)) or (
+                tp1_hit and (bar_l <= sl_level)
+            )
+            hit_sell = is_confirmed and real_sell and (tp1_hit or pos_stage == "ORANGE")
+
+            if hit_hard_stop or hit_stop:
+                exit_trig = True
+                exec_sl = hard_stop_px if hit_hard_stop else (sl_level if tp1_hit else bar_c)
+                runner_pct = ((exec_sl - entry_price) / entry_price) * 100.0
+                final_pct = (tp1_locked_gain * 0.5 + runner_pct * 0.5) if tp1_hit else runner_pct
+                total_trades += 1
+                total_profit_pct += final_pct
+                if final_pct > 0:
+                    win_trades += 1
+                exit_reason = (
+                    "TRAILING KÂR (%50)"
+                    if tp1_hit
+                    else ("ACİL STOP" if hit_hard_stop else "STOP")
+                )
+                exit_price = exec_sl
+                exit_pct = final_pct
+                pos_stage = "NONE"
+                tp1_hit = False
+                tp1_locked_gain = 0.0
+                entry_price = tp1_level = sl_level = peak_price = entry_bar_idx = None
+            elif hit_sell:
+                exit_trig = True
+                runner_pct = ((bar_c - entry_price) / entry_price) * 100.0
+                final_pct = (tp1_locked_gain * 0.5 + runner_pct * 0.5) if tp1_hit else runner_pct
+                total_trades += 1
+                total_profit_pct += final_pct
+                if final_pct > 0:
+                    win_trades += 1
+                exit_reason = "TREND BİTTİ (KAPAT)"
+                exit_price = bar_c
+                exit_pct = final_pct
+                pos_stage = "NONE"
+                tp1_hit = False
+                tp1_locked_gain = 0.0
+                entry_price = tp1_level = sl_level = peak_price = entry_bar_idx = None
+
+        if i == n - 2:
+            prev_real_sell = real_sell
+        if i == n - 1:
+            last_green_fired = green_fired
+            last_orange_fired = orange_fired
+            last_exit_trig = exit_trig
+            last_exit_reason = exit_reason
+            last_exit_price = exit_price
+            last_exit_pct = exit_pct
+            last_c1, last_c2, last_c3, last_c4, last_c5 = c1, c2, c3, c4, c5
+            last_trend_ok = cond_trend and not_top
+            last_first3, last_all5 = first3, all5
+            last_real_sell = real_sell
+            last_ema200_bull = bool(not np.isnan(ema200_val) and bar_c > ema200_val)
+            last_ema200_bear = bool(not np.isnan(ema200_val) and bar_c < ema200_val)
+
+    last_close = float(closes.iloc[-1])
+    prev_bar_ts = int(open_times.iloc[-2]) if n >= 2 else 0
+    prev_bar_c = float(closes.iloc[-2]) if n >= 2 else last_close
+    live_tp1 = last_close * (1.0 + tp1_pct / 100.0)
+    live_sl = last_close * (1.0 - max_stop_pct / 100.0)
+    win_rate = (win_trades / total_trades) * 100.0 if total_trades > 0 else 0.0
+    bar_close_ts = (
+        int(df_ohlcv["close_time"].iloc[-1])
+        if "close_time" in df_ohlcv.columns
+        else int(open_times.iloc[-1]) + 4 * 3600 * 1000 - 1
+    )
+
+    return SystemEvaluation(
+        bar_open_time=int(open_times.iloc[-1]),
+        price=last_close,
+        cond1_buy=last_c1,
+        cond2_buy=last_c2,
+        cond3_buy=last_c3,
+        cond4_buy=last_c4,
+        cond5_buy=last_c5,
+        trend_ok=last_trend_ok,
+        first_three_buy=last_first3,
+        all_five_buy=last_all5,
+        green_trigger=last_green_fired,
+        orange_trigger=last_orange_fired,
+        exit_trigger=last_exit_trig,
+        exit_reason=last_exit_reason,
+        exit_price=last_exit_price,
+        exit_trade_pct=last_exit_pct,
+        in_green_pos=(pos_stage != "NONE"),
+        in_orange_pos=(pos_stage == "ORANGE"),
+        be_locked=tp1_hit,
+        entry_price=entry_price,
+        tp_level=tp1_level,
+        sl_level=sl_level,
+        next_res=live_tp1,
+        prev_sup=live_sl,
+        total_trades=total_trades,
+        win_trades=win_trades,
+        win_rate=round(win_rate, 2),
+        total_profit_pct=round(total_profit_pct, 2),
+        bar_close_time=bar_close_ts,
+        ema200_bull=last_ema200_bull,
+        ema200_bear=last_ema200_bear,
+        real_sell_cond=last_real_sell,
+        prev_bar_open_time=prev_bar_ts,
+        prev_bar_close=prev_bar_c,
+        prev_bar_real_sell=prev_real_sell,
     )
 
 

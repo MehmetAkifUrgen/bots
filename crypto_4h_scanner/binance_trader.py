@@ -505,6 +505,12 @@ class BinanceTrader:
         be_trigger_pct: float = 0.0,
         entry_bar_open_time: int = 0,
         allow_wide_sl: bool = False,
+        v3_mode: bool = False,
+        tp1_pct: float = 1.00,
+        fee_buffer_pct: float = 0.15,
+        trail_dist_pct: float = 1.10,
+        close_stop_pct: float = 2.20,
+        hard_stop_pct: float = 3.00,
     ) -> TradeExecution | None:
         """Open a LONG or SHORT position if under max_positions, not in cooldown, and balance allows."""
         self.last_reject_reason = ""
@@ -538,8 +544,8 @@ class BinanceTrader:
 
         effective_min_usd = self.min_usd
         notional = max(self.min_usd, min(self.max_usd, target_usd))
-        est_sl_pct = self.stop_loss_pct
-        if allow_wide_sl and sl_price is not None and price > 0:
+        est_sl_pct = close_stop_pct if v3_mode else self.stop_loss_pct
+        if not v3_mode and allow_wide_sl and sl_price is not None and price > 0:
             if pos_side == "LONG" and 0 < sl_price < price * 0.995:
                 est_sl_pct = ((price - sl_price) / price) * 100.0
             elif pos_side == "SHORT" and sl_price > price * 1.005:
@@ -681,7 +687,12 @@ class BinanceTrader:
                 exec_price = price
             order_id = str(res.get("orderId", ""))
             actual_not = round(exec_qty * exec_price, 2)
-        if pos_side == "LONG":
+        if v3_mode and pos_side == "LONG":
+            final_sl = exec_price * (1.0 - hard_stop_pct / 100.0)
+            final_tp = exec_price * (1.0 + tp1_pct / 100.0)
+            close_sl_px = exec_price * (1.0 - close_stop_pct / 100.0)
+        elif pos_side == "LONG":
+            close_sl_px = 0.0
             default_sl = exec_price * (1.0 - self.stop_loss_pct / 100.0)
             if allow_wide_sl and sl_price is not None and 0 < sl_price < exec_price * 0.995:
                 final_sl = sl_price
@@ -695,6 +706,7 @@ class BinanceTrader:
                 else 0.0
             )
         else:
+            close_sl_px = 0.0
             default_sl = exec_price * (1.0 + self.stop_loss_pct / 100.0)
             if allow_wide_sl and sl_price is not None and sl_price > exec_price * 1.005:
                 final_sl = sl_price
@@ -715,8 +727,11 @@ class BinanceTrader:
             "order_id": order_id,
             "entry_price": exec_price,
             "qty": exec_qty,
+            "initial_qty": exec_qty,
             "notional_usd": actual_not,
+            "initial_notional_usd": actual_not,
             "sl_price": final_sl,
+            "close_sl_price": close_sl_px,
             "tp_price": final_tp,
             "exchange_sl_price": final_sl if algo_sl_id else 0.0,
             "peak_price": exec_price,
@@ -724,7 +739,14 @@ class BinanceTrader:
             "use_trailing": bool(use_trailing),
             "be_trigger_pct": float(be_trigger_pct),
             "be_locked": False,
-            "allow_wide_sl": bool(allow_wide_sl),
+            "allow_wide_sl": bool(allow_wide_sl or v3_mode),
+            "v3_mode": bool(v3_mode),
+            "tp1_hit": False,
+            "tp1_pct": float(tp1_pct),
+            "fee_buffer_pct": float(fee_buffer_pct),
+            "trail_dist_pct": float(trail_dist_pct),
+            "tp1_realized_pnl_usd": 0.0,
+            "tp1_fee_usd": 0.0,
             "entry_bar_open_time": int(entry_bar_open_time),
             "entry_fee_usd": entry_fee,
             "leverage": effective_lev,
@@ -827,12 +849,18 @@ class BinanceTrader:
             else (entry_px - exec_price) * exec_qty
         )
 
+        tp1_prev_net = float((prev_pos or {}).get("tp1_realized_pnl_usd") or 0.0)
+        tp1_prev_fee = float((prev_pos or {}).get("tp1_fee_usd") or 0.0)
+        init_notional = float((prev_pos or {}).get("initial_notional_usd") or (entry_px * exec_qty))
+
         total_fee = 0.0
         if self.paper_mode:
             entry_fee = float((prev_pos or {}).get("entry_fee_usd") or 0.0)
             exit_fee = round((exec_qty * exec_price) * (self.taker_fee_pct / 100.0), 4)
-            total_fee = round(entry_fee + exit_fee, 4)
-            pnl_usd = gross_pnl - total_fee
+            leg_fee = round(entry_fee + exit_fee, 4)
+            leg_net = gross_pnl - leg_fee
+            total_fee = round(tp1_prev_fee + leg_fee, 4)
+            pnl_usd = round(tp1_prev_net + leg_net, 4)
             self._state["paper_balance"] = round(
                 float(self._state.get("paper_balance", self.paper_balance_usd)) + gross_pnl - exit_fee, 4
             )
@@ -843,19 +871,22 @@ class BinanceTrader:
             if pnl_usd > 0:
                 self._state["paper_win_trades"] = int(self._state.get("paper_win_trades", 0)) + 1
             self._state["paper_realized_pnl"] = round(
-                float(self._state.get("paper_realized_pnl", 0.0)) + pnl_usd, 4
+                float(self._state.get("paper_realized_pnl", 0.0)) + leg_net, 4
             )
         else:
-            pnl_usd = gross_pnl
+            pnl_usd = round(tp1_prev_net + gross_pnl, 4)
 
         tz_tr = timezone(timedelta(hours=3))
         now_tr = datetime.now(tz_tr)
-        raw_pct = (
-            ((exec_price - entry_px) / entry_px) * 100.0
-            if (entry_px > 0 and pos_side == "LONG")
-            else (((entry_px - exec_price) / entry_px) * 100.0 if entry_px > 0 else 0.0)
-        )
-        net_pct_rec = raw_pct - (2.0 * self.taker_fee_pct) if self.paper_mode else raw_pct
+        if init_notional > 0 and tp1_prev_fee > 0:
+            net_pct_rec = (pnl_usd / init_notional) * 100.0
+        else:
+            raw_pct = (
+                ((exec_price - entry_px) / entry_px) * 100.0
+                if (entry_px > 0 and pos_side == "LONG")
+                else (((entry_px - exec_price) / entry_px) * 100.0 if entry_px > 0 else 0.0)
+            )
+            net_pct_rec = raw_pct - (2.0 * self.taker_fee_pct) if self.paper_mode else raw_pct
         hist_list: list[dict] = self._state.setdefault("closed_history", [])
         hist_list.append(
             {
@@ -866,8 +897,8 @@ class BinanceTrader:
                 "wallet": self.wallet_name,
                 "side": pos_side,
                 "reason": close_reason or ("STOP" if is_stop_loss else "KAPANIŞ"),
-                "is_stop": bool(is_stop_loss),
-                "notional_usd": round(entry_px * exec_qty, 2),
+                "is_stop": bool(is_stop_loss and pnl_usd < 0),
+                "notional_usd": round(init_notional, 2),
                 "entry_price": entry_px,
                 "exit_price": exec_price,
                 "pnl_usd": round(pnl_usd, 2),
@@ -1175,6 +1206,104 @@ class BinanceTrader:
                 "stop_usd": self.signal_cancel_stop_usd,
             }
 
+    def _partial_close_v3_tp1(self, symbol: str, pos: dict, curr_price: float) -> dict | None:
+        """Close 50% of a v3_mode LONG position at TP1 (+1.0%) and lock SL to +0.15% / peak trailing."""
+        entry_px = float(pos.get("entry_price") or 0.0)
+        full_qty = float(pos.get("qty") or 0.0)
+        if entry_px <= 0 or full_qty <= 0:
+            return None
+
+        if self.paper_mode:
+            half_qty = round(full_qty * 0.5, 6)
+            exec_px = curr_price
+            tp1_order_id = f"PAPER_TP1_{symbol}_{int(time.time())}"
+        else:
+            self._ensure_filters()
+            rules = self._filters_cache.get(symbol, {"stepSize": 0.001, "minQty": 0.001})
+            half_qty = _round_step(full_qty * 0.5, rules["stepSize"])
+            if half_qty < rules["minQty"] or (full_qty - half_qty) < rules["minQty"]:
+                return None
+            ord_path = "/papi/v1/um/order" if self.market == "papi" else "/fapi/v1/order"
+            res = self._signed_request(
+                "POST",
+                ord_path,
+                {
+                    "symbol": symbol,
+                    "side": "SELL",
+                    "type": "MARKET",
+                    "quantity": f"{half_qty:g}",
+                    "reduceOnly": "true",
+                },
+            )
+            exec_px = float(res.get("avgPrice") or 0.0) or curr_price
+            half_qty = float(res.get("executedQty") or 0.0) or half_qty
+            tp1_order_id = str(res.get("orderId", ""))
+
+        rem_qty = max(0.0, full_qty - half_qty)
+        gross_leg1 = (exec_px - entry_px) * half_qty
+        entry_fee_full = float(pos.get("entry_fee_usd") or 0.0)
+        leg1_entry_fee = round(entry_fee_full * 0.5, 4)
+        rem_entry_fee = round(max(0.0, entry_fee_full - leg1_entry_fee), 4)
+
+        if self.paper_mode:
+            leg1_exit_fee = round((half_qty * exec_px) * (self.taker_fee_pct / 100.0), 4)
+            leg1_fee = round(leg1_entry_fee + leg1_exit_fee, 4)
+            leg1_net = round(gross_leg1 - leg1_fee, 4)
+            self._state["paper_balance"] = round(
+                float(self._state.get("paper_balance", self.paper_balance_usd)) + gross_leg1 - leg1_exit_fee, 4
+            )
+            self._state["paper_total_fees"] = round(
+                float(self._state.get("paper_total_fees", 0.0)) + leg1_exit_fee, 4
+            )
+            self._state["paper_realized_pnl"] = round(
+                float(self._state.get("paper_realized_pnl", 0.0)) + leg1_net, 4
+            )
+        else:
+            leg1_fee = 0.0
+            leg1_net = round(gross_leg1, 4)
+
+        fee_buf_pct = float(pos.get("fee_buffer_pct") or 0.15)
+        trail_pct = float(pos.get("trail_dist_pct") or 1.10)
+        peak_px = max(float(pos.get("peak_price") or curr_price), curr_price)
+        locked_sl = max(
+            entry_px * (1.0 + fee_buf_pct / 100.0),
+            peak_px * (1.0 - trail_pct / 100.0),
+        )
+
+        pos["qty"] = rem_qty
+        pos["notional_usd"] = round(rem_qty * entry_px, 2)
+        pos["entry_fee_usd"] = rem_entry_fee
+        pos["tp1_hit"] = True
+        pos["be_locked"] = True
+        pos["tp1_realized_pnl_usd"] = leg1_net
+        pos["tp1_fee_usd"] = leg1_fee
+        pos["peak_price"] = peak_px
+        pos["sl_price"] = locked_sl
+        if curr_price > locked_sl and self.place_exchange_stop_loss(symbol, locked_sl, pos_side="LONG"):
+            pos["exchange_sl_price"] = locked_sl
+
+        raw_pct = ((exec_px - entry_px) / entry_px * 100.0) if entry_px > 0 else 0.0
+        net_pct = raw_pct - (2.0 * self.taker_fee_pct) if self.paper_mode else raw_pct
+        return {
+            "symbol": symbol,
+            "side": "LONG",
+            "is_partial": True,
+            "reason": "TP1 (%50 KÂR AL — Kalan %50 Trailing)",
+            "entry_price": entry_px,
+            "exit_price": exec_px,
+            "new_sl_price": locked_sl,
+            "pnl_usd": round(leg1_net, 2),
+            "pnl_pct": round(net_pct, 2),
+            "fee_usd": round(leg1_fee, 3),
+            "is_paper": self.paper_mode,
+            "wallet_name": self.wallet_name,
+            "paper_balance": round(float(self._state.get("paper_balance", self.paper_balance_usd)), 2),
+            "paper_initial": float(self._state.get("paper_initial_balance", self.paper_balance_usd)),
+            "paper_trades": int(self._state.get("paper_total_trades", 0)),
+            "paper_wins": int(self._state.get("paper_win_trades", 0)),
+            "order_id": tp1_order_id,
+        }
+
     def manage_open_positions(
         self, price_map: dict[str, float] | None = None
     ) -> list[dict]:
@@ -1234,7 +1363,34 @@ class BinanceTrader:
 
                 reason: str | None = None
                 tp_px = float(pos.get("tp_price") or 0.0)
-                if pos_side == "LONG":
+                if pos_side == "LONG" and pos.get("v3_mode"):
+                    tp1_hit = bool(pos.get("tp1_hit", False))
+                    if not tp1_hit and tp_px > 0 and curr_price >= tp_px:
+                        tp1_ev = self._partial_close_v3_tp1(sym, pos, curr_price)
+                        if tp1_ev is not None:
+                            events.append(tp1_ev)
+                            state_dirty = True
+                            tp1_hit = True
+                    if tp1_hit:
+                        fee_buf_pct = float(pos.get("fee_buffer_pct") or 0.15)
+                        trail_pct = float(pos.get("trail_dist_pct") or 1.10)
+                        floor_sl = entry_px * (1.0 + fee_buf_pct / 100.0)
+                        trail_sl = peak_px * (1.0 - trail_pct / 100.0)
+                        new_sl = max(float(pos.get("sl_price") or 0.0), floor_sl, trail_sl)
+                        if new_sl > float(pos.get("sl_price") or 0.0):
+                            pos["sl_price"] = new_sl
+                            state_dirty = True
+                            ex_sl = float(pos.get("exchange_sl_price") or 0.0)
+                            if new_sl > ex_sl * 1.002 and curr_price > new_sl:
+                                if self.place_exchange_stop_loss(sym, new_sl, pos_side="LONG"):
+                                    pos["exchange_sl_price"] = new_sl
+                        if curr_price <= float(pos.get("sl_price") or 0.0):
+                            reason = "TRAILING KÂR (%50)"
+                    else:
+                        hard_sl = float(pos.get("sl_price") or (entry_px * 0.97))
+                        if curr_price <= hard_sl:
+                            reason = "ACİL STOP (-%3.0 Fitil)"
+                elif pos_side == "LONG":
                     be_trig = float(pos.get("be_trigger_pct") or 0.0)
                     if not use_trailing and be_trig > 0 and not pos.get("be_locked") and pnl_pct >= be_trig:
                         be_sl = entry_px * 1.003
@@ -1324,26 +1480,37 @@ class BinanceTrader:
                         close_reason=reason,
                     )
                     if closed:
-                        if pos_side == "LONG":
-                            realized_usd = (closed.price - entry_px) * closed.qty
-                            realized_pct = (
-                                ((closed.price - entry_px) / entry_px) * 100.0
-                                if entry_px > 0
-                                else 0.0
-                            )
-                        else:
-                            realized_usd = (entry_px - closed.price) * closed.qty
-                            realized_pct = (
-                                ((entry_px - closed.price) / entry_px) * 100.0
-                                if entry_px > 0
-                                else 0.0
-                            )
-                        net_usd = realized_usd - closed.fee_usd if closed.is_paper else realized_usd
-                        net_pct = (
-                            realized_pct - (2.0 * self.taker_fee_pct)
-                            if closed.is_paper
-                            else realized_pct
+                        last_hist = (
+                            self._state.get("closed_history", [])[-1]
+                            if self._state.get("closed_history")
+                            else None
                         )
+                        if last_hist and last_hist.get("symbol") == sym:
+                            net_usd = float(last_hist["pnl_usd"])
+                            net_pct = float(last_hist["pnl_pct"])
+                            tot_fee = float(last_hist["fee_usd"])
+                        else:
+                            if pos_side == "LONG":
+                                realized_usd = (closed.price - entry_px) * closed.qty
+                                realized_pct = (
+                                    ((closed.price - entry_px) / entry_px) * 100.0
+                                    if entry_px > 0
+                                    else 0.0
+                                )
+                            else:
+                                realized_usd = (entry_px - closed.price) * closed.qty
+                                realized_pct = (
+                                    ((entry_px - closed.price) / entry_px) * 100.0
+                                    if entry_px > 0
+                                    else 0.0
+                                )
+                            net_usd = realized_usd - closed.fee_usd if closed.is_paper else realized_usd
+                            net_pct = (
+                                realized_pct - (2.0 * self.taker_fee_pct)
+                                if closed.is_paper
+                                else realized_pct
+                            )
+                            tot_fee = closed.fee_usd
                         events.append(
                             {
                                 "symbol": sym,
@@ -1353,7 +1520,7 @@ class BinanceTrader:
                                 "exit_price": closed.price,
                                 "pnl_usd": round(net_usd, 2),
                                 "pnl_pct": round(net_pct, 2),
-                                "fee_usd": round(closed.fee_usd, 3),
+                                "fee_usd": round(tot_fee, 3),
                                 "is_paper": closed.is_paper,
                                 "wallet_name": self.wallet_name,
                                 "paper_balance": closed.paper_balance,

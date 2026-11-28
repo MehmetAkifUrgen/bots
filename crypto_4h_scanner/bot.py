@@ -231,6 +231,8 @@ def main() -> None:
 
     paper_mode = os.getenv("PAPER_TRADE", "true").strip().lower() not in ("0", "false", "no")
     paper_balance = float(os.getenv("PAPER_BALANCE_USD", "100.0"))
+    paper_min_usd = float(os.getenv("PAPER_MIN_USD", "100.0"))
+    paper_max_usd = float(os.getenv("PAPER_MAX_USD", "200.0"))
     paper_max_pos = int(os.getenv("PAPER_MAX_POSITIONS", "5"))
     taker_fee_pct = float(os.getenv("TAKER_FEE_PCT", "0.05"))
     auto_trade_env = os.getenv("AUTO_TRADE", "true").strip().lower() not in ("0", "false", "no")
@@ -251,12 +253,14 @@ def main() -> None:
             else DEFAULT_TRADE_STATE_FILE
         )
         eff_max_pos = paper_max_pos if paper_mode else args.max_positions
+        eff_min_usd = paper_min_usd if paper_mode else args.min_usd
+        eff_max_usd = paper_max_usd if paper_mode else args.max_usd
         trader = BinanceTrader(
             api_key=api_key,
             api_secret=api_secret,
             market=args.market,
-            min_usd=args.min_usd,
-            max_usd=args.max_usd,
+            min_usd=eff_min_usd,
+            max_usd=eff_max_usd,
             max_positions=eff_max_pos,
             leverage=args.leverage,
             max_leverage=args.max_leverage,
@@ -280,8 +284,8 @@ def main() -> None:
             api_key="",
             api_secret="",
             market=args.market,
-            min_usd=args.min_usd,
-            max_usd=args.max_usd,
+            min_usd=paper_min_usd,
+            max_usd=paper_max_usd,
             max_positions=paper_max_pos,
             leverage=args.leverage,
             max_leverage=args.max_leverage,
@@ -322,22 +326,22 @@ def main() -> None:
 
     long_window_min = int(os.getenv("LONG_ENTRY_WINDOW_MINUTES", "0"))
     short_window_min = int(os.getenv("SHORT_ENTRY_WINDOW_MINUTES", "15"))
-    long_min_wr = float(os.getenv("LONG_MIN_WIN_RATE", "0.0"))
-    long_min_profit = float(os.getenv("LONG_MIN_PROFIT_PCT", "-999999"))
+    long_min_wr = float(os.getenv("LONG_MIN_WIN_RATE", "70.0"))
+    long_min_profit = float(os.getenv("LONG_MIN_PROFIT_PCT", "300.0"))
     effective_poll = min(args.poll_seconds, 60)
 
     enable_short = os.getenv("ENABLE_SHORT", "false").strip().lower() in ("1", "true", "yes")
     short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "20")) or 20
     mode_badge = f"SANAL TEST (${paper_balance:g}, Komisyon %{taker_fee_pct:g}x2)" if paper_mode else "GERÇEK BİNANCE"
     trade_mode_str = (
-        f"{mode_badge} (Max {args.max_positions} poz, SADECE LONG: 4S Pine ATR+%2-%3 TP)"
+        f"{mode_badge} (Max {paper_max_pos if paper_mode else args.max_positions} poz, 4S Futures v3: %50 TP1 + %50 Trailing)"
         if trader
         else "KAPALI (Sadece Bildirim)"
     )
     print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] 4S (4H) Sadece LONG Pine Botu başlatıldı | "
+        f"[{datetime.now().strftime('%H:%M:%S')}] 4S (4H) Futures v3 Botu başlatıldı | "
         f"Piyasa={args.market.upper()} | OtoAlım={trade_mode_str} | "
-        f"LONG=4S 5/5 (Pine ATR+Destek SL, Pine %2-%3 TP, +%1.3 Kâr Kilidi, 3'lü SAT) | "
+        f"LONG=4S 5/5 (WR>=%{long_min_wr:g}, Getiri>=%{long_min_profit:g}, %50 TP1 + %50 Trailing) | "
         f"SHORT={'AÇIK' if enable_short else 'KAPALI'} | Periyot={effective_poll}sn"
     )
 

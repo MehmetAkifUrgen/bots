@@ -123,8 +123,26 @@ def format_managed_close_message(ev_dict: dict) -> str:
     side_tag = f" | <b>{ev_dict['side']}</b>" if ev_dict.get("side") else ""
     tf_badge = ev_dict.get("tf_label") or "4S (4H)"
     is_paper = bool(ev_dict.get("is_paper"))
+    is_partial = bool(ev_dict.get("is_partial"))
     wname = str(ev_dict.get("wallet_name") or "KRİPTO")
     title_prefix = f"🧪 [{wname} SANAL] " if is_paper else ""
+    if is_partial:
+        fee_usd = float(ev_dict.get("fee_usd") or 0.0)
+        bal = float(ev_dict.get("paper_balance") or 0.0)
+        new_sl = float(ev_dict.get("new_sl_price") or 0.0)
+        paper_line = (
+            f"\n💸 <b>Komisyon (%50):</b> <code>-${fee_usd:.3f}</code> | 🏦 <b>{wname} Kasa:</b> <b>${bal:.2f}</b>"
+            if is_paper
+            else ""
+        )
+        return (
+            f"🎯 <b>{title_prefix}{ev_dict['reason']}</b>\n"
+            f"🪙 <b>{ev_dict['symbol']}</b>{side_tag} | <code>{tf_badge}</code>\n"
+            f"💵 <b>Giriş:</b> <code>{fmt_price(ev_dict['entry_price'])}</code> → <b>TP1:</b> <code>{fmt_price(ev_dict['exit_price'])}</code>\n"
+            f"📊 <b>Kilitlenen İlk %50 Net Kâr:</b> <b>${pnl_usd:+.2f} ({pnl_pct:+.2f}%)</b>\n"
+            f"🛡️ <b>Kalan %50 Yeni Stop:</b> <code>{fmt_price(new_sl)}</code> (+%0.15 taban / %1.10 zirve takip)"
+            f"{paper_line}"
+        )
     paper_block = ""
     if is_paper:
         fee_usd = float(ev_dict.get("fee_usd") or 0.0)
@@ -196,27 +214,18 @@ def format_dual_4h_message(
         trade_block = f"\nℹ️ <i>{html.escape(str(trade_note))}</i>\n"
 
     if is_long:
-        tp = (
-            ev.tp_level
-            if (ev.tp_level is not None and ev.tp_level > entry * 1.005)
-            else ev.next_res
-        )
-        tp_pct = ((tp - entry) / entry * 100.0) if entry > 0 else 0.0
-        sl_atr = (
-            ev.sl_level
-            if (ev.sl_level is not None and 0 < ev.sl_level < entry * 0.995)
-            else (ev.prev_sup if (0 < ev.prev_sup < entry * 0.995) else sl)
-        )
-        sl_atr_pct = ((sl_atr - entry) / entry * 100.0) if entry > 0 else -stop_loss_pct
+        tp1 = entry * 1.01
+        sl_close = entry * (1.0 - 0.022)
+        sl_hard = entry * (1.0 - 0.030)
         timing_tag = f"Son {long_window_min}dk Mum Kapanışı" if long_window_min > 0 else "Anlık Giriş"
         return (
-            f"🟠 <b>[{tf_short} ATR SİSTEM] TURUNCU KESİN AL (5/5) — LONG</b>\n"
+            f"🟠 <b>[{tf_short} FUTURES v3] KESİN LONG (5/5)</b>\n"
             f"🪙 <b>{res.symbol}</b> | <code>{tf_label}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
-            f"🎯 <b>Kâr Al (%2-%3):</b> <code>{fmt_price(tp)}</code> (<b>+{tp_pct:.2f}%</b>)\n"
-            f"🛑 <b>Stop (ATR+Destek):</b> <code>{fmt_price(sl_atr)}</code> (<b>{sl_atr_pct:.2f}%</b>)\n"
-            f"🔒 <b>Çıkış Kuralı:</b> %2-%3 TP | +%1.3'te +%0.30 Kâr Kilidi | 3'lü SAT\n"
+            f"🎯 <b>TP1 (%50 Kâr Al):</b> <code>{fmt_price(tp1)}</code> (<b>+1.00%</b>)\n"
+            f"🚀 <b>Kalan %50:</b> +%0.15 Garanti Kilit + Zirveden <b>%1.10</b> Trailing\n"
+            f"🛑 <b>Stop:</b> <code>{fmt_price(sl_close)}</code> (-%2.20 Kapanış) | Acil Fitil: <code>{fmt_price(sl_hard)}</code> (-%3.00)\n"
             f"📈 <b>{tf_short} Backtest:</b> <b>%{ev.win_rate:.1f} Başarı</b> ({ev.win_trades}/{ev.total_trades}) | <b>Getiri: %{ev.total_profit_pct:+.1f}</b>\n"
             f"{trade_block}"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -932,8 +941,8 @@ class TelegramNotifier:
         long_entry_window_minutes: int | None = None,
         short_entry_window_minutes: int | None = None,
         short_top_gainers: int = 20,
-        long_min_win_rate: float = 0.0,
-        long_min_profit_pct: float = -1e9,
+        long_min_win_rate: float = 70.0,
+        long_min_profit_pct: float = 300.0,
         enable_short: bool = False,
     ) -> dict:
         """Process 4H signals: LONG on 4H Pine 5/5 (WR>=65%, Profit>=300%, instant), SHORT on 4H 5/5 + EMA200 (last 15m)."""
@@ -953,7 +962,8 @@ class TelegramNotifier:
             try:
                 closed_events = trader.manage_open_positions(price_map)
                 for ev_dict in closed_events:
-                    stats["orders_closed"] += 1
+                    if not ev_dict.get("is_partial"):
+                        stats["orders_closed"] += 1
                     try:
                         self.send_text(format_managed_close_message(ev_dict))
                     except Exception as exc:
@@ -968,7 +978,57 @@ class TelegramNotifier:
                     continue
                 pos_side = str(pos.get("side") or "LONG").upper()
                 entry_bar_ts = int(pos.get("entry_bar_open_time") or 0)
-                if pos_side == "LONG" and not pos.get("use_trailing", True):
+                if pos_side == "LONG" and pos.get("v3_mode"):
+                    ev_curr = res.evaluation
+                    tp1_hit = bool(pos.get("tp1_hit", False))
+                    close_sl_px = float(pos.get("close_sl_price") or 0.0)
+                    # Confirmed 4H bar checks (matching Pine barstate.isconfirmed!)
+                    if ev_curr.prev_bar_open_time > entry_bar_ts:
+                        v3_reason: str | None = None
+                        v3_is_stop = False
+                        if not tp1_hit and close_sl_px > 0 and ev_curr.prev_bar_close < close_sl_px:
+                            v3_reason = "STOP (4S Kapanış -%2.20)"
+                            v3_is_stop = True
+                        elif ev_curr.prev_bar_real_sell:
+                            v3_reason = "TREND BİTTİ (KAPAT)"
+                            v3_is_stop = False
+                        if v3_reason:
+                            try:
+                                closed = trader.close_position(
+                                    res.symbol,
+                                    fallback_price=res.price,
+                                    is_stop_loss=v3_is_stop,
+                                    close_reason=v3_reason,
+                                )
+                                if closed:
+                                    last_h = (
+                                        trader._state.get("closed_history", [])[-1]
+                                        if trader._state.get("closed_history")
+                                        else {}
+                                    )
+                                    stats["orders_closed"] += 1
+                                    ev_close = {
+                                        "symbol": res.symbol,
+                                        "side": "LONG",
+                                        "tf_label": "4S (4H)",
+                                        "reason": v3_reason,
+                                        "entry_price": float(pos.get("entry_price") or closed.price),
+                                        "exit_price": closed.price,
+                                        "pnl_usd": float(last_h.get("pnl_usd", 0.0)),
+                                        "pnl_pct": float(last_h.get("pnl_pct", 0.0)),
+                                        "fee_usd": float(last_h.get("fee_usd", closed.fee_usd)),
+                                        "is_paper": closed.is_paper,
+                                        "wallet_name": trader.wallet_name,
+                                        "paper_balance": closed.paper_balance,
+                                        "paper_initial": float(trader._state.get("paper_initial_balance", trader.paper_balance_usd)),
+                                        "paper_trades": int(trader._state.get("paper_total_trades", 0)),
+                                        "paper_wins": int(trader._state.get("paper_win_trades", 0)),
+                                        "order_id": closed.order_id,
+                                    }
+                                    self.send_text(format_managed_close_message(ev_close))
+                            except Exception as exc:
+                                stats["errors"].append(f"{res.symbol} V3_CLOSE: {exc}")
+                elif pos_side == "LONG" and not pos.get("use_trailing", True):
                     ev_curr = res.evaluation
                     if (
                         ev_curr.real_sell_cond
@@ -1138,27 +1198,23 @@ class TelegramNotifier:
                 if trader and trader.is_configured and not dry_run:
                     try:
                         if side == "LONG":
-                            tp_target = (
-                                ev.tp_level
-                                if (ev.tp_level is not None and ev.tp_level > res.price * 1.005)
-                                else ev.next_res
-                            )
-                            sl_target = (
-                                ev.sl_level
-                                if (ev.sl_level is not None and 0 < ev.sl_level < res.price * 0.995)
-                                else ev.prev_sup
-                            )
                             trade_exec = trader.open_position(
                                 res.symbol,
                                 res.price,
                                 trader.max_usd,
-                                tp_price=tp_target,
-                                sl_price=sl_target,
+                                tp_price=res.price * 1.01,
+                                sl_price=res.price * 0.97,
                                 side="LONG",
                                 use_trailing=False,
-                                be_trigger_pct=1.3,
+                                be_trigger_pct=0.0,
                                 entry_bar_open_time=ev.bar_open_time,
                                 allow_wide_sl=True,
+                                v3_mode=True,
+                                tp1_pct=1.00,
+                                fee_buffer_pct=0.15,
+                                trail_dist_pct=1.10,
+                                close_stop_pct=2.20,
+                                hard_stop_pct=3.00,
                             )
                         elif use_short_15m_mode and sev_15m is not None:
                             trade_exec = trader.open_position(
