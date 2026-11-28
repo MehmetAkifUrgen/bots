@@ -354,11 +354,11 @@ class Binance4hScanner:
             df_ohlcv,
             use_local_trend=False,
             use_anti_top=True,
-            tp1_pct=1.00,
+            tp1_pct=2.00,
             fee_buffer_pct=0.15,
             trail_dist_pct=1.10,
             max_stop_pct=2.20,
-            hard_stop_pct=3.00,
+            hard_stop_pct=2.20,
         )
         if ev is None:
             return None

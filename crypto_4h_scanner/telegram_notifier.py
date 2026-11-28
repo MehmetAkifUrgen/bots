@@ -214,18 +214,18 @@ def format_dual_4h_message(
         trade_block = f"\nℹ️ <i>{html.escape(str(trade_note))}</i>\n"
 
     if is_long:
-        tp1 = entry * 1.01
+        tp1 = entry * 1.02
         sl_close = entry * (1.0 - 0.022)
-        sl_hard = entry * (1.0 - 0.030)
+        sl_hard = entry * (1.0 - 0.022)
         timing_tag = f"Son {long_window_min}dk Mum Kapanışı" if long_window_min > 0 else "Anlık Giriş"
         return (
             f"🟠 <b>[{tf_short} FUTURES v3] KESİN LONG (5/5)</b>\n"
             f"🪙 <b>{res.symbol}</b> | <code>{tf_label}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
-            f"🎯 <b>TP1 (%50 Kâr Al):</b> <code>{fmt_price(tp1)}</code> (<b>+1.00%</b>)\n"
+            f"🎯 <b>TP1 (%50 Kâr Al):</b> <code>{fmt_price(tp1)}</code> (<b>+2.00%</b>)\n"
             f"🚀 <b>Kalan %50:</b> +%0.15 Garanti Kilit + Zirveden <b>%1.10</b> Trailing\n"
-            f"🛑 <b>Stop:</b> <code>{fmt_price(sl_close)}</code> (-%2.20 Kapanış) | Acil Fitil: <code>{fmt_price(sl_hard)}</code> (-%3.00)\n"
+            f"🛑 <b>Stop:</b> <code>{fmt_price(sl_close)}</code> (-%2.20 Kapanış) | Acil Fitil: <code>{fmt_price(sl_hard)}</code> (-%2.20)\n"
             f"📈 <b>{tf_short} Backtest:</b> <b>%{ev.win_rate:.1f} Başarı</b> ({ev.win_trades}/{ev.total_trades}) | <b>Getiri: %{ev.total_profit_pct:+.1f}</b>\n"
             f"{trade_block}"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1205,19 +1205,19 @@ class TelegramNotifier:
                                 res.symbol,
                                 res.price,
                                 trader.max_usd,
-                                tp_price=res.price * 1.01,
-                                sl_price=res.price * 0.97,
+                                tp_price=res.price * 1.02,
+                                sl_price=res.price * 0.978,
                                 side="LONG",
                                 use_trailing=False,
                                 be_trigger_pct=0.0,
                                 entry_bar_open_time=ev.bar_open_time,
                                 allow_wide_sl=True,
                                 v3_mode=True,
-                                tp1_pct=1.00,
+                                tp1_pct=2.00,
                                 fee_buffer_pct=0.15,
                                 trail_dist_pct=1.10,
                                 close_stop_pct=2.20,
-                                hard_stop_pct=3.00,
+                                hard_stop_pct=2.20,
                             )
                         elif use_short_15m_mode and sev_15m is not None:
                             trade_exec = trader.open_position(

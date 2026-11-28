@@ -311,19 +311,19 @@ def _process_silent_real_v3(
                 res.symbol,
                 res.price,
                 real_trader.max_usd,
-                tp_price=res.price * 1.01,
-                sl_price=res.price * 0.97,
+                tp_price=res.price * 1.02,
+                sl_price=res.price * 0.978,
                 side="LONG",
                 use_trailing=False,
                 be_trigger_pct=0.0,
                 entry_bar_open_time=ev.bar_open_time,
                 allow_wide_sl=True,
                 v3_mode=True,
-                tp1_pct=1.00,
+                tp1_pct=2.00,
                 fee_buffer_pct=0.15,
                 trail_dist_pct=1.10,
                 close_stop_pct=2.20,
-                hard_stop_pct=3.00,
+                hard_stop_pct=2.20,
             )
             if tex:
                 seen_sigs[sig_key] = int(time.time())

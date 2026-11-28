@@ -510,11 +510,11 @@ class BinanceTrader:
         entry_bar_open_time: int = 0,
         allow_wide_sl: bool = False,
         v3_mode: bool = False,
-        tp1_pct: float = 1.00,
+        tp1_pct: float = 2.00,
         fee_buffer_pct: float = 0.15,
         trail_dist_pct: float = 1.10,
         close_stop_pct: float = 2.20,
-        hard_stop_pct: float = 3.00,
+        hard_stop_pct: float = 2.20,
     ) -> TradeExecution | None:
         """Open a LONG or SHORT position if under max_positions, not in cooldown, and balance allows."""
         self.last_reject_reason = ""
@@ -1127,7 +1127,7 @@ class BinanceTrader:
                     continue
                 is_long = pos_side == "LONG"
                 sl_px = (
-                    (ep * 1.0015 if tp1_done else ep * 0.97)
+                    (ep * 1.0015 if tp1_done else ep * 0.978)
                     if is_long
                     else ep * (1.0 + self.stop_loss_pct / 100.0)
                 )
@@ -1142,7 +1142,7 @@ class BinanceTrader:
                     "initial_notional_usd": round(init_qty * ep, 2),
                     "sl_price": sl_px,
                     "close_sl_price": ep * 0.978 if is_long else 0.0,
-                    "tp_price": ep * 1.01 if is_long else ep * 0.955,
+                    "tp_price": ep * 1.02 if is_long else ep * 0.955,
                     "exchange_sl_price": sl_px,
                     "peak_price": ep,
                     "trailing_active": False,
@@ -1152,7 +1152,7 @@ class BinanceTrader:
                     "allow_wide_sl": is_long,
                     "v3_mode": is_long,
                     "tp1_hit": bool(is_long and tp1_done),
-                    "tp1_pct": 1.00,
+                    "tp1_pct": 2.00,
                     "fee_buffer_pct": 0.15,
                     "trail_dist_pct": 1.10,
                     "tp1_realized_pnl_usd": 0.0,
@@ -1488,9 +1488,9 @@ class BinanceTrader:
                         if curr_price <= float(pos.get("sl_price") or 0.0):
                             reason = "TRAILING KÂR (%50)"
                     else:
-                        hard_sl = float(pos.get("sl_price") or (entry_px * 0.97))
+                        hard_sl = float(pos.get("sl_price") or (entry_px * 0.978))
                         if curr_price <= hard_sl:
-                            reason = "ACİL STOP (-%3.0 Fitil)"
+                            reason = "ACİL STOP (-%2.20 Fitil)"
                 elif pos_side == "LONG":
                     be_trig = float(pos.get("be_trigger_pct") or 0.0)
                     if not use_trailing and be_trig > 0 and not pos.get("be_locked") and pnl_pct >= be_trig:
