@@ -75,6 +75,7 @@ class Binance4hScanner:
         self.contract_type = contract_type
         self._session_local = threading.local()
         self._cache_lock = threading.Lock()
+        self._rate_lock = threading.Lock()
         self._active_symbols: set[str] = set()
         self._active_symbols_ts: float = 0.0
         self._kline_cache: dict[tuple[str, str], pd.DataFrame] = {}
@@ -95,14 +96,18 @@ class Binance4hScanner:
                 self._used_weight_1m = int(w)
             except ValueError:
                 pass
-        if self._used_weight_1m >= 1800:
-            # Pause briefly so 1-minute weight window cools down before hitting 2400
-            time.sleep(5.0)
-        elif self._used_weight_1m >= 1400:
-            time.sleep(0.35)
+        if self._used_weight_1m >= 1900:
+            # Wait out current UTC minute window so 500+ coin scans never hit 2400 (HTTP 429/418)
+            with self._rate_lock:
+                if self._used_weight_1m >= 1900:
+                    wait_s = max(2.0, 60.5 - (time.time() % 60.0))
+                    time.sleep(wait_s)
+                    self._used_weight_1m = 0
+        elif self._used_weight_1m >= 1500:
+            time.sleep(0.25)
 
     def get_active_usdt_symbols(
-        self, min_volume_usdt: float = 5_000_000.0, limit: int = 0
+        self, min_volume_usdt: float = 0.0, limit: int = 0
     ) -> list[dict]:
         """Fetch active USDT pairs sorted by 24h quote volume descending (exchangeInfo cached 1h)."""
         sess = self._get_session()
@@ -126,6 +131,11 @@ class Binance4hScanner:
                     if s.get("contractType") == self.contract_type
                     and s.get("quoteAsset") == "USDT"
                     and s.get("status") == "TRADING"
+                    and (
+                        self.contract_type != "PERPETUAL"
+                        or s.get("underlyingType", "COIN")
+                        not in ("EQUITY", "HK_EQUITY", "CN_EQUITY", "KR_EQUITY")
+                    )
                 }
             else:
                 self._active_symbols = {
@@ -150,7 +160,7 @@ class Binance4hScanner:
             if sym not in active_symbols:
                 continue
             quote_vol = float(t.get("quoteVolume", 0.0))
-            if quote_vol < min_volume_usdt:
+            if min_volume_usdt > 0 and quote_vol < min_volume_usdt:
                 continue
             coins.append(
                 {
@@ -219,24 +229,28 @@ class Binance4hScanner:
 
         # Initial load
         df = self.fetch_klines(symbol, interval=interval, limit=initial_limit)
-        for _ in range(max(0, pages - 1)):
-            if df.empty:
-                break
-            first_ts = int(df["open_time"].iloc[0])
-            try:
-                older = self.fetch_klines(
-                    symbol, interval=interval, limit=initial_limit, end_time=first_ts - 1
-                )
-                if older.empty:
+        if len(df) >= initial_limit:
+            for _ in range(max(0, pages - 1)):
+                if df.empty:
                     break
-                df = (
-                    pd.concat([older, df], ignore_index=True)
-                    .drop_duplicates(subset=["open_time"], keep="last")
-                    .sort_values("open_time")
-                    .reset_index(drop=True)
-                )
-            except Exception:
-                break
+                first_ts = int(df["open_time"].iloc[0])
+                try:
+                    older = self.fetch_klines(
+                        symbol, interval=interval, limit=initial_limit, end_time=first_ts - 1
+                    )
+                    if older.empty:
+                        break
+                    got_full_page = len(older) >= initial_limit
+                    df = (
+                        pd.concat([older, df], ignore_index=True)
+                        .drop_duplicates(subset=["open_time"], keep="last")
+                        .sort_values("open_time")
+                        .reset_index(drop=True)
+                    )
+                    if not got_full_page:
+                        break
+                except Exception:
+                    break
 
         with self._cache_lock:
             self._kline_cache[key] = df.tail(max_rows).reset_index(drop=True)
@@ -421,7 +435,7 @@ class Binance4hScanner:
 
     def scan_4h_bist_alerts(
         self,
-        min_volume_usdt: float = 5_000_000.0,
+        min_volume_usdt: float = 0.0,
         limit: int = 0,
         interval: str = "1h",
         short_top_gainers: int = 20,

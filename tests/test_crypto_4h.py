@@ -1308,6 +1308,51 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertNotIn("SOLUSDT", real_trader._state["open_positions"])
             self.assertEqual(len(telegram_msgs), msg_count_after_paper)  # Still zero real leaks!
 
+            # 3) Verify 24h volume filter is removed (min_volume=0) and US Stock / Equity symbols are excluded
+            from crypto_4h_scanner.binance_scanner import Binance4hScanner
+            from crypto_4h_scanner.bot import build_parser
+
+            parsed_defaults = build_parser().parse_args([])
+            self.assertEqual(parsed_defaults.min_volume, 0.0)
+
+            sc = Binance4hScanner(market="papi", contract_type="PERPETUAL")
+
+            class _FakeResp:
+                headers: dict[str, str] = {}
+
+                def __init__(self, data):
+                    self._data = data
+
+                def raise_for_status(self) -> None:
+                    return
+
+                def json(self):
+                    return self._data
+
+            class _FakeSess:
+                def get(self, url: str, timeout: float = 10.0, **kwargs):
+                    if "exchangeInfo" in url:
+                        return _FakeResp(
+                            {
+                                "symbols": [
+                                    {"symbol": "MICROUSDT", "contractType": "PERPETUAL", "quoteAsset": "USDT", "status": "TRADING", "underlyingType": "COIN"},
+                                    {"symbol": "TSLAUSDT", "contractType": "TRADIFI_PERPETUAL", "quoteAsset": "USDT", "status": "TRADING", "underlyingType": "EQUITY"},
+                                    {"symbol": "AAPLUSDT", "contractType": "PERPETUAL", "quoteAsset": "USDT", "status": "TRADING", "underlyingType": "EQUITY"},
+                                ]
+                            }
+                        )
+                    return _FakeResp(
+                        [
+                            {"symbol": "MICROUSDT", "lastPrice": "0.05", "priceChangePercent": "2.0", "quoteVolume": "120.0"},
+                            {"symbol": "TSLAUSDT", "lastPrice": "350.0", "priceChangePercent": "3.0", "quoteVolume": "90000000.0"},
+                            {"symbol": "AAPLUSDT", "lastPrice": "230.0", "priceChangePercent": "1.0", "quoteVolume": "80000000.0"},
+                        ]
+                    )
+
+            sc._get_session = lambda: _FakeSess()  # type: ignore[method-assign]
+            active_coins = sc.get_active_usdt_symbols(min_volume_usdt=parsed_defaults.min_volume)
+            self.assertEqual([c["symbol"] for c in active_coins], ["MICROUSDT"])
+
 
 if __name__ == "__main__":
     unittest.main()

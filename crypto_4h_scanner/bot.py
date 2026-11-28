@@ -66,8 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--min-volume",
         type=float,
-        default=float(os.getenv("MIN_VOLUME_USDT", "15000000")),
-        help="Minimum 24s USDT hacim filtresi (varsayılan: 15000000)",
+        default=float(os.getenv("SCAN_MIN_VOLUME_USDT", "0")),
+        help="Minimum 24s USDT hacim filtresi (varsayılan: 0 = hacim filtresi yok, tüm coinler)",
     )
     p.add_argument(
         "--min-win-rate",
@@ -96,8 +96,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--workers",
         type=int,
-        default=int(os.getenv("SCAN_WORKERS", "2")),
-        help="Paralel tarama iş parçacığı sayısı (varsayılan: 2)",
+        default=int(os.getenv("SCAN_WORKERS", "4")),
+        help="Paralel tarama iş parçacığı sayısı (varsayılan: 4)",
     )
     p.add_argument(
         "--no-auto-trade",
@@ -356,6 +356,7 @@ def main() -> None:
 
     paper_mode = os.getenv("PAPER_TRADE", "true").strip().lower() not in ("0", "false", "no")
     silent_real_env = os.getenv("SILENT_REAL_TRADE", "true").strip().lower() not in ("0", "false", "no")
+    enable_tradifi = os.getenv("ENABLE_TRADIFI", "false").strip().lower() in ("1", "true", "yes")
     paper_balance = float(os.getenv("PAPER_BALANCE_USD", "100.0"))
     paper_min_usd = float(os.getenv("PAPER_MIN_USD", "100.0"))
     paper_max_usd = float(os.getenv("PAPER_MAX_USD", "150.0"))
@@ -410,28 +411,29 @@ def main() -> None:
             taker_fee_pct=taker_fee_pct,
             wallet_name="KRİPTO",
         )
-        # Second independent $100 virtual wallet for Binance US Stock Futures (TRADIFI_PERPETUAL)
-        tradifi_trader = BinanceTrader(
-            api_key="",
-            api_secret="",
-            market=args.market,
-            min_usd=paper_min_usd,
-            max_usd=paper_max_usd,
-            max_positions=paper_max_pos,
-            leverage=args.leverage,
-            max_leverage=args.max_leverage,
-            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "1.5")),
-            cooldown_minutes=0,
-            symbol_stop_cooldown_minutes=240,
-            risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "7.5")),
-            state_file=Path(__file__).resolve().parent / "paper_tradifi_state.json",
-            proxy_url=proxy_url,
-            paper_mode=True,
-            paper_balance_usd=paper_balance,
-            taker_fee_pct=taker_fee_pct,
-            wallet_name="ABD BORSA",
-        )
-        # Silent real Binance executor (NEVER exposed in Telegram!)
+        # Optional virtual wallet for Binance US Stock Futures (disabled by default: ENABLE_TRADIFI=false)
+        if enable_tradifi:
+            tradifi_trader = BinanceTrader(
+                api_key="",
+                api_secret="",
+                market=args.market,
+                min_usd=paper_min_usd,
+                max_usd=paper_max_usd,
+                max_positions=paper_max_pos,
+                leverage=args.leverage,
+                max_leverage=args.max_leverage,
+                stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "1.5")),
+                cooldown_minutes=0,
+                symbol_stop_cooldown_minutes=240,
+                risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "7.5")),
+                state_file=Path(__file__).resolve().parent / "paper_tradifi_state.json",
+                proxy_url=proxy_url,
+                paper_mode=True,
+                paper_balance_usd=paper_balance,
+                taker_fee_pct=taker_fee_pct,
+                wallet_name="ABD BORSA",
+            )
+        # Silent real Binance executor — CRYPTO ONLY, NEVER exposed in Telegram!
         if paper_mode and silent_real_env and api_key and api_secret:
             real_trader = BinanceTrader(
                 api_key=api_key,
@@ -454,7 +456,11 @@ def main() -> None:
             )
 
     scanner = Binance4hScanner(market=args.market, max_workers=args.workers, contract_type="PERPETUAL")
-    tradifi_scanner = Binance4hScanner(market=args.market, max_workers=args.workers, contract_type="TRADIFI_PERPETUAL")
+    tradifi_scanner = (
+        Binance4hScanner(market=args.market, max_workers=args.workers, contract_type="TRADIFI_PERPETUAL")
+        if enable_tradifi
+        else None
+    )
 
     if args.port > 0 and not args.once:
         _start_health_server(args.port)
@@ -562,28 +568,32 @@ def main() -> None:
                     is_paused=notifier.is_paused(trader),
                 )
 
-            # 2) Binance US Stock Futures (TRADIFI_PERPETUAL) on its own $100 virtual wallet
-            tradifi_results, tradifi_errors, tradifi_dur = tradifi_scanner.scan_4h_bist_alerts(
-                min_volume_usdt=float(os.getenv("TRADIFI_MIN_VOLUME_USDT", "500000")),
-                limit=args.limit,
-                interval=scan_interval,
-                enable_short=False,
-            )
-            tradifi_stats = notifier.process_4h_alert_only(
-                tradifi_results,
-                min_win_rate=long_min_wr,
-                min_profit_pct=long_min_profit,
-                dry_run=args.dry_run,
-                trader=tradifi_trader,
-                dual_mode=True,
-                entry_window_minutes=entry_window_min,
-                long_entry_window_minutes=long_window_min,
-                short_entry_window_minutes=short_window_min,
-                short_top_gainers=short_top_n,
-                long_min_win_rate=long_min_wr,
-                long_min_profit_pct=long_min_profit,
-                enable_short=False,
-            )
+            # 2) Binance US Stock Futures disabled unless ENABLE_TRADIFI=true
+            if enable_tradifi and tradifi_scanner is not None:
+                tradifi_results, tradifi_errors, tradifi_dur = tradifi_scanner.scan_4h_bist_alerts(
+                    min_volume_usdt=0.0,
+                    limit=args.limit,
+                    interval=scan_interval,
+                    enable_short=False,
+                )
+                tradifi_stats = notifier.process_4h_alert_only(
+                    tradifi_results,
+                    min_win_rate=long_min_wr,
+                    min_profit_pct=long_min_profit,
+                    dry_run=args.dry_run,
+                    trader=tradifi_trader,
+                    dual_mode=True,
+                    entry_window_minutes=entry_window_min,
+                    long_entry_window_minutes=long_window_min,
+                    short_entry_window_minutes=short_window_min,
+                    short_top_gainers=short_top_n,
+                    long_min_win_rate=long_min_wr,
+                    long_min_profit_pct=long_min_profit,
+                    enable_short=False,
+                )
+            else:
+                tradifi_results, tradifi_dur = [], 0.0
+                tradifi_stats = {"orders_opened": 0, "orders_closed": 0}
 
             long_now = sum(
                 1
