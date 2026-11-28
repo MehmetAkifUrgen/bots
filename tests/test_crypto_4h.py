@@ -695,7 +695,7 @@ class TestBinanceTrader(unittest.TestCase):
         ev_v3 = evaluate_futures_v3_system(df_wave)
         self.assertIsNotNone(ev_v3)
         assert ev_v3 is not None
-        self.assertAlmostEqual(ev_v3.next_res, ev_v3.price * 1.02, places=4)
+        self.assertAlmostEqual(ev_v3.next_res, ev_v3.price * 1.015, places=4)
         self.assertAlmostEqual(ev_v3.prev_sup, ev_v3.price * 0.978, places=4)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -749,7 +749,7 @@ class TestBinanceTrader(unittest.TestCase):
                 green_trigger=True, orange_trigger=True, exit_trigger=False,
                 exit_reason=None, exit_price=None, exit_trade_pct=None,
                 in_green_pos=True, in_orange_pos=True, be_locked=False,
-                entry_price=100.0, tp_level=102.0, sl_level=97.8, next_res=102.0, prev_sup=97.8,
+                entry_price=100.0, tp_level=101.5, sl_level=97.8, next_res=101.5, prev_sup=97.8,
                 total_trades=40, win_trades=30, win_rate=75.0, total_profit_pct=350.0,
             )
             res_eth = Coin4hResult("ETHUSDT", "papi", 100.0, 4.0, 200_000_000.0, ev_entry, timeframe="4h")
@@ -759,20 +759,20 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertEqual(st_open["orders_opened"], 1)
             pos = trader._state["open_positions"]["ETHUSDT"]
             self.assertTrue(pos["v3_mode"])
-            self.assertAlmostEqual(pos["tp_price"], 102.0, places=2)
+            self.assertAlmostEqual(pos["tp_price"], 101.5, places=2)
             self.assertAlmostEqual(pos["close_sl_price"], 97.8, places=2)
             self.assertAlmostEqual(pos["sl_price"], 97.8, places=2)  # -2.20% hard stop!
 
             # Dip to 98.5 (-1.5% intrabar) does NOT trigger -2.20% hard stop!
             self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 98.5})), 0)
 
-            # Reaching +2.0% (102.0) closes 50% at TP1 and locks trailing SL at 100.878 (+0.878%)!
-            last_price["p"] = 102.0
-            tp1_evs = trader.manage_open_positions({"ETHUSDT": 102.0})
+            # Reaching +1.5% (101.5) closes 50% at TP1 and locks trailing SL at 100.3835 (+0.3835%)!
+            last_price["p"] = 101.5
+            tp1_evs = trader.manage_open_positions({"ETHUSDT": 101.5})
             self.assertEqual(len(tp1_evs), 1)
             self.assertTrue(tp1_evs[0]["is_partial"])
             self.assertTrue(trader._state["open_positions"]["ETHUSDT"]["tp1_hit"])
-            self.assertAlmostEqual(trader._state["open_positions"]["ETHUSDT"]["sl_price"], 100.878, places=2)
+            self.assertAlmostEqual(trader._state["open_positions"]["ETHUSDT"]["sl_price"], 100.3835, places=2)
 
             # Rally to 104.0 (+4.0%) moves trailing SL up to 104.0 * 0.989 = 102.856!
             self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 104.0})), 0)
@@ -1067,7 +1067,7 @@ class TestBinanceTrader(unittest.TestCase):
                 green_trigger=True, orange_trigger=True, exit_trigger=False,
                 exit_reason=None, exit_price=None, exit_trade_pct=None,
                 in_green_pos=True, in_orange_pos=True, be_locked=False,
-                entry_price=100.0, tp_level=102.0, sl_level=97.8, next_res=102.0, prev_sup=97.8,
+                entry_price=100.0, tp_level=101.5, sl_level=97.8, next_res=101.5, prev_sup=97.8,
                 total_trades=20, win_trades=15, win_rate=75.0, total_profit_pct=350.0,
             )
             res = Coin4hResult("SOLUSDT", "papi", 100.0, 2.0, 200_000_000.0, ev_long, timeframe="4h")
@@ -1083,8 +1083,8 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertAlmostEqual(pos["entry_fee_usd"], 0.10, places=4)
             self.assertAlmostEqual(trader.get_account_equity(), 99.90, places=2)
 
-            # 1) Hit +2.0% TP1 at 102.0 -> closes 50% (qty=1.0, gross=+$2.00, leg1 fee=$0.05+$0.051=$0.101 -> net +$1.899)
-            evs_tp1 = trader.manage_open_positions({"SOLUSDT": 102.0})
+            # 1) Hit +1.5% TP1 at 101.5 -> closes 50% (qty=1.0, gross=+$1.50, leg1 fee=$0.05+$0.05075=$0.10075 -> net +$1.39925)
+            evs_tp1 = trader.manage_open_positions({"SOLUSDT": 101.5})
             self.assertEqual(len(evs_tp1), 1)
             self.assertTrue(evs_tp1[0]["is_partial"])
             self.assertIn("SOLUSDT", trader._state["open_positions"])
@@ -1092,7 +1092,7 @@ class TestBinanceTrader(unittest.TestCase):
 
             # 2) Rally to 104.0 (trail SL -> 102.856), then pullback to 102.80 -> closes remaining 50% (qty=1.0 @ 102.80)!
             # Leg2 gross = +$2.80, leg2 fee = $0.05 + $0.0514 = $0.1014 -> leg2 net = +$2.6986
-            # Combined net = $1.899 + $2.6986 = +$4.5976 (~+$4.60), Final balance = $104.60!
+            # Combined net = $1.39925 + $2.6986 = +$4.09785 (~+$4.10), Final balance = $104.10!
             self.assertEqual(len(trader.manage_open_positions({"SOLUSDT": 104.0})), 0)
             evs = trader.manage_open_positions({"SOLUSDT": 102.80})
             self.assertEqual(len(evs), 1)
@@ -1100,8 +1100,8 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertEqual(evs[0]["wallet_name"], "KRİPTO")
             self.assertEqual(evs[0]["reason"], "TRAILING KÂR (%50)")
             self.assertAlmostEqual(evs[0]["fee_usd"], 0.202, places=2)
-            self.assertAlmostEqual(evs[0]["pnl_usd"], 4.60, places=2)
-            self.assertAlmostEqual(evs[0]["paper_balance"], 104.60, places=2)
+            self.assertAlmostEqual(evs[0]["pnl_usd"], 4.10, places=2)
+            self.assertAlmostEqual(evs[0]["paper_balance"], 104.10, places=2)
 
             # Second independent $100 wallet for Binance US Stock Futures (ABD BORSA)
             tradifi_trader = BinanceTrader(
@@ -1129,7 +1129,7 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertEqual(rep["today_trades"], 1)
             self.assertEqual(rep["today_wins"], 1)
             self.assertEqual(rep["today_stops"], 0)
-            self.assertAlmostEqual(rep["today_profit_usd"], 4.60, places=2)
+            self.assertAlmostEqual(rep["today_profit_usd"], 4.10, places=2)
 
             b64 = notifier._pack_cloud_payload([trader, tradifi_trader])
             self.assertTrue(len(b64) > 10)
@@ -1138,7 +1138,7 @@ class TestBinanceTrader(unittest.TestCase):
             )
             self.assertIsNotNone(unpacked)
             assert unpacked is not None
-            self.assertAlmostEqual(unpacked["wallets"]["KRİPTO"]["paper_balance"], 104.60, places=1)
+            self.assertAlmostEqual(unpacked["wallets"]["KRİPTO"]["paper_balance"], 104.10, places=1)
             self.assertIn("TSLAUSDT", unpacked["wallets"]["ABD BORSA"]["open_positions"])
 
             # Verify min $100 .. max $200 clamp on wide (-15%) and tight (-1%) stops
@@ -1284,7 +1284,7 @@ class TestBinanceTrader(unittest.TestCase):
                 self.assertTrue(rpos["v3_mode"])
 
             # Verify TP1 (50% close) + confirmed TREND BİTTİ exit on real_trader also produce ZERO Telegram messages
-            tp1_evs = real_trader.manage_open_positions({"SOLUSDT": 10.22})
+            tp1_evs = real_trader.manage_open_positions({"SOLUSDT": 10.16})
             self.assertEqual(len(tp1_evs), 1)
             self.assertTrue(tp1_evs[0]["is_partial"])
 
@@ -1436,7 +1436,7 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertIsNotNone(res_1h)
             assert res_1h is not None
             self.assertEqual(res_1h.timeframe, "1h")
-            self.assertAlmostEqual(res_1h.evaluation.next_res, res_1h.price * 1.02, places=4)
+            self.assertAlmostEqual(res_1h.evaluation.next_res, res_1h.price * 1.015, places=4)
             self.assertAlmostEqual(res_1h.evaluation.prev_sup, res_1h.price * 0.978, places=4)
 
             res_1h_sig = Coin4hResult("AVAXUSDT", "papi", 10.0, 4.0, 50_000_000.0, ev_v3, timeframe="1h")

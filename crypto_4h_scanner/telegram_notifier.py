@@ -214,7 +214,7 @@ def format_dual_4h_message(
         trade_block = f"\nℹ️ <i>{html.escape(str(trade_note))}</i>\n"
 
     if is_long:
-        tp1 = entry * 1.02
+        tp1 = entry * 1.015
         sl_close = entry * (1.0 - 0.022)
         sl_hard = entry * (1.0 - 0.022)
         timing_tag = f"Son {long_window_min}dk Mum Kapanışı" if long_window_min > 0 else "Anlık Giriş"
@@ -223,7 +223,7 @@ def format_dual_4h_message(
             f"🪙 <b>{res.symbol}</b> | <code>{tf_label}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
-            f"🎯 <b>TP1 (%50 Kâr Al):</b> <code>{fmt_price(tp1)}</code> (<b>+2.00%</b>)\n"
+            f"🎯 <b>TP1 (%50 Kâr Al):</b> <code>{fmt_price(tp1)}</code> (<b>+1.50%</b>)\n"
             f"🚀 <b>Kalan %50:</b> +%0.15 Garanti Kilit + Zirveden <b>%1.10</b> Trailing\n"
             f"🛑 <b>Stop:</b> <code>{fmt_price(sl_close)}</code> (-%2.20 Kapanış) | Acil Fitil: <code>{fmt_price(sl_hard)}</code> (-%2.20)\n"
             f"📈 <b>{tf_short} Backtest:</b> <b>%{ev.win_rate:.1f} Başarı</b> ({ev.win_trades}/{ev.total_trades}) | <b>Getiri: %{ev.total_profit_pct:+.1f}</b>\n"
@@ -1205,7 +1205,7 @@ class TelegramNotifier:
                                 res.symbol,
                                 res.price,
                                 trader.max_usd,
-                                tp_price=res.price * 1.02,
+                                tp_price=res.price * 1.015,
                                 sl_price=res.price * 0.978,
                                 side="LONG",
                                 use_trailing=False,
@@ -1213,7 +1213,7 @@ class TelegramNotifier:
                                 entry_bar_open_time=ev.bar_open_time,
                                 allow_wide_sl=True,
                                 v3_mode=True,
-                                tp1_pct=2.00,
+                                tp1_pct=1.50,
                                 fee_buffer_pct=0.15,
                                 trail_dist_pct=1.10,
                                 close_stop_pct=2.20,

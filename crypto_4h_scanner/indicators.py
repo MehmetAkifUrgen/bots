@@ -1068,7 +1068,7 @@ def evaluate_futures_v3_system(
     df_ohlcv: pd.DataFrame,
     use_local_trend: bool = False,
     use_anti_top: bool = True,
-    tp1_pct: float = 2.00,
+    tp1_pct: float = 1.50,
     fee_buffer_pct: float = 0.15,
     trail_dist_pct: float = 1.10,
     max_stop_pct: float = 2.20,
