@@ -1353,6 +1353,38 @@ class TestBinanceTrader(unittest.TestCase):
             active_coins = sc.get_active_usdt_symbols(min_volume_usdt=parsed_defaults.min_volume)
             self.assertEqual([c["symbol"] for c in active_coins], ["MICROUSDT"])
 
+            # 4) Verify US Stock symbol (TSLAUSDT) opens on Telegram ABD BORSA virtual wallet,
+            #    while _process_silent_real_v3 strictly blocks excluded_symbols on real Binance!
+            tradifi_paper = BinanceTrader(
+                api_key="",
+                api_secret="",
+                market="papi",
+                min_usd=100.0,
+                max_usd=150.0,
+                max_positions=3,
+                paper_mode=True,
+                paper_balance_usd=99.59,
+                taker_fee_pct=0.05,
+                wallet_name="ABD BORSA",
+                state_file=Path(tmp) / "tradifi_paper.json",
+            )
+            res_tsla_v3 = Coin4hResult("TSLAUSDT", "papi", 10.0, 4.0, 90_000_000.0, ev_v3, timeframe="4h")
+            st_tradifi = notifier.process_4h_alert_only([res_tsla_v3], trader=tradifi_paper, dual_mode=True)
+            self.assertEqual(st_tradifi["orders_opened"], 1)
+            self.assertIn("[ABD BORSA SANAL] LONG EMİR AÇILDI", telegram_msgs[-1])
+
+            r_op_tsla, _ = _process_silent_real_v3(
+                real_trader,
+                [res_tsla_v3],
+                long_min_wr=70.0,
+                long_min_profit=300.0,
+                long_window_min=0,
+                is_paused=False,
+                excluded_symbols={"TSLAUSDT"},
+            )
+            self.assertEqual(r_op_tsla, 0)
+            self.assertNotIn("TSLAUSDT", real_trader._state["open_positions"])
+
 
 if __name__ == "__main__":
     unittest.main()

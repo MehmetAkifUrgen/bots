@@ -239,8 +239,11 @@ def _process_silent_real_v3(
     long_min_profit: float,
     long_window_min: int,
     is_paused: bool,
+    excluded_symbols: set[str] | None = None,
 ) -> tuple[int, int]:
-    """Execute Futures v3 entries & confirmed-bar exits on real Binance silently (zero Telegram output)."""
+    """Execute Futures v3 entries & confirmed-bar exits on real Binance CRYPTO ONLY (zero Telegram output)."""
+    blocked = excluded_symbols or set()
+    results = [r for r in results if r.symbol not in blocked]
     opened = 0
     closed_cnt = 0
     price_map = {r.symbol: r.price for r in results}
@@ -356,7 +359,7 @@ def main() -> None:
 
     paper_mode = os.getenv("PAPER_TRADE", "true").strip().lower() not in ("0", "false", "no")
     silent_real_env = os.getenv("SILENT_REAL_TRADE", "true").strip().lower() not in ("0", "false", "no")
-    enable_tradifi = os.getenv("ENABLE_TRADIFI", "false").strip().lower() in ("1", "true", "yes")
+    enable_tradifi = os.getenv("ENABLE_TRADIFI", "true").strip().lower() not in ("0", "false", "no")
     paper_balance = float(os.getenv("PAPER_BALANCE_USD", "100.0"))
     paper_min_usd = float(os.getenv("PAPER_MIN_USD", "100.0"))
     paper_max_usd = float(os.getenv("PAPER_MAX_USD", "150.0"))
@@ -559,6 +562,7 @@ def main() -> None:
                 enable_short=enable_short,
             )
             if real_trader is not None and not args.dry_run:
+                tradifi_syms = set(tradifi_scanner._active_symbols) if tradifi_scanner is not None else set()
                 _process_silent_real_v3(
                     real_trader,
                     results,
@@ -566,6 +570,7 @@ def main() -> None:
                     long_min_profit=long_min_profit,
                     long_window_min=long_window_min,
                     is_paused=notifier.is_paused(trader),
+                    excluded_symbols=tradifi_syms,
                 )
 
             # 2) Binance US Stock Futures disabled unless ENABLE_TRADIFI=true
