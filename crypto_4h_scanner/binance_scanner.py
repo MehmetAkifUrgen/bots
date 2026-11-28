@@ -357,8 +357,8 @@ class Binance4hScanner:
             tp1_pct=1.50,
             fee_buffer_pct=0.15,
             trail_dist_pct=1.10,
-            max_stop_pct=2.20,
-            hard_stop_pct=2.20,
+            max_stop_pct=2.50,
+            hard_stop_pct=2.50,
         )
         if ev is None:
             return None

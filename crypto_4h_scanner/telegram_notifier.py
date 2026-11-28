@@ -215,8 +215,8 @@ def format_dual_4h_message(
 
     if is_long:
         tp1 = entry * 1.015
-        sl_close = entry * (1.0 - 0.022)
-        sl_hard = entry * (1.0 - 0.022)
+        sl_close = entry * (1.0 - 0.025)
+        sl_hard = entry * (1.0 - 0.025)
         timing_tag = f"Son {long_window_min}dk Mum Kapanışı" if long_window_min > 0 else "Anlık Giriş"
         return (
             f"🟠 <b>[{tf_short} FUTURES v3] KESİN LONG (5/5)</b>\n"
@@ -225,7 +225,7 @@ def format_dual_4h_message(
             f"💵 <b>Giriş:</b> <code>{fmt_price(entry)}</code> (Anlık: <code>{fmt_price(res.price)}</code>)\n"
             f"🎯 <b>TP1 (%50 Kâr Al):</b> <code>{fmt_price(tp1)}</code> (<b>+1.50%</b>)\n"
             f"🚀 <b>Kalan %50:</b> +%0.15 Garanti Kilit + Zirveden <b>%1.10</b> Trailing\n"
-            f"🛑 <b>Stop:</b> <code>{fmt_price(sl_close)}</code> (-%2.20 Kapanış) | Acil Fitil: <code>{fmt_price(sl_hard)}</code> (-%2.20)\n"
+            f"🛑 <b>Stop:</b> <code>{fmt_price(sl_close)}</code> (-%2.50 Kapanış) | Acil Fitil: <code>{fmt_price(sl_hard)}</code> (-%2.50)\n"
             f"📈 <b>{tf_short} Backtest:</b> <b>%{ev.win_rate:.1f} Başarı</b> ({ev.win_trades}/{ev.total_trades}) | <b>Getiri: %{ev.total_profit_pct:+.1f}</b>\n"
             f"{trade_block}"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -990,7 +990,7 @@ class TelegramNotifier:
                         v3_reason: str | None = None
                         v3_is_stop = False
                         if not tp1_hit and close_sl_px > 0 and ev_curr.prev_bar_close < close_sl_px:
-                            v3_reason = f"STOP ({tf_s} Kapanış -%2.20)"
+                            v3_reason = f"STOP ({tf_s} Kapanış -%2.50)"
                             v3_is_stop = True
                         elif ev_curr.prev_bar_real_sell:
                             v3_reason = "TREND BİTTİ (KAPAT)"
@@ -1206,7 +1206,7 @@ class TelegramNotifier:
                                 res.price,
                                 trader.max_usd,
                                 tp_price=res.price * 1.015,
-                                sl_price=res.price * 0.978,
+                                sl_price=res.price * 0.975,
                                 side="LONG",
                                 use_trailing=False,
                                 be_trigger_pct=0.0,
@@ -1216,8 +1216,8 @@ class TelegramNotifier:
                                 tp1_pct=1.50,
                                 fee_buffer_pct=0.15,
                                 trail_dist_pct=1.10,
-                                close_stop_pct=2.20,
-                                hard_stop_pct=2.20,
+                                close_stop_pct=2.50,
+                                hard_stop_pct=2.50,
                             )
                         elif use_short_15m_mode and sev_15m is not None:
                             trade_exec = trader.open_position(

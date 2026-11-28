@@ -1071,8 +1071,8 @@ def evaluate_futures_v3_system(
     tp1_pct: float = 1.50,
     fee_buffer_pct: float = 0.15,
     trail_dist_pct: float = 1.10,
-    max_stop_pct: float = 2.20,
-    hard_stop_pct: float = 2.20,
+    max_stop_pct: float = 2.50,
+    hard_stop_pct: float = 2.50,
 ) -> SystemEvaluation | None:
     """
     Exact 1:1 port of Pine Script v5:

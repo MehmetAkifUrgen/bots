@@ -513,8 +513,8 @@ class BinanceTrader:
         tp1_pct: float = 1.50,
         fee_buffer_pct: float = 0.15,
         trail_dist_pct: float = 1.10,
-        close_stop_pct: float = 2.20,
-        hard_stop_pct: float = 2.20,
+        close_stop_pct: float = 2.50,
+        hard_stop_pct: float = 2.50,
     ) -> TradeExecution | None:
         """Open a LONG or SHORT position if under max_positions, not in cooldown, and balance allows."""
         self.last_reject_reason = ""
@@ -1127,7 +1127,7 @@ class BinanceTrader:
                     continue
                 is_long = pos_side == "LONG"
                 sl_px = (
-                    (ep * 1.0015 if tp1_done else ep * 0.978)
+                    (ep * 1.0015 if tp1_done else ep * 0.975)
                     if is_long
                     else ep * (1.0 + self.stop_loss_pct / 100.0)
                 )
@@ -1141,7 +1141,7 @@ class BinanceTrader:
                     "notional_usd": round(qty * ep, 2),
                     "initial_notional_usd": round(init_qty * ep, 2),
                     "sl_price": sl_px,
-                    "close_sl_price": ep * 0.978 if is_long else 0.0,
+                    "close_sl_price": ep * 0.975 if is_long else 0.0,
                     "tp_price": ep * 1.015 if is_long else ep * 0.955,
                     "exchange_sl_price": sl_px,
                     "peak_price": ep,
@@ -1488,9 +1488,9 @@ class BinanceTrader:
                         if curr_price <= float(pos.get("sl_price") or 0.0):
                             reason = "TRAILING KÂR (%50)"
                     else:
-                        hard_sl = float(pos.get("sl_price") or (entry_px * 0.978))
+                        hard_sl = float(pos.get("sl_price") or (entry_px * 0.975))
                         if curr_price <= hard_sl:
-                            reason = "ACİL STOP (-%2.20 Fitil)"
+                            reason = "ACİL STOP (-%2.50 Fitil)"
                 elif pos_side == "LONG":
                     be_trig = float(pos.get("be_trigger_pct") or 0.0)
                     if not use_trailing and be_trig > 0 and not pos.get("be_locked") and pnl_pct >= be_trig:

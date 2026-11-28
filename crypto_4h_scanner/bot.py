@@ -253,7 +253,7 @@ def _process_silent_real_v3(
     except Exception as exc:
         print(f"  [SESSİZ GERÇEK] manage hatası: {exc}")
 
-    # 1) Confirmed bar exits (-2.20% close stop & TREND BİTTİ) even when paused
+    # 1) Confirmed bar exits (-2.50% close stop & TREND BİTTİ) even when paused
     for res in results:
         pos = real_trader._state.get("open_positions", {}).get(res.symbol)
         if not pos or not pos.get("v3_mode"):
@@ -267,7 +267,7 @@ def _process_silent_real_v3(
             v3_reason: str | None = None
             v3_stop = False
             if not tp1_hit and close_sl_px > 0 and ev_curr.prev_bar_close < close_sl_px:
-                v3_reason = f"STOP ({tf_s} Kapanış -%2.20)"
+                v3_reason = f"STOP ({tf_s} Kapanış -%2.50)"
                 v3_stop = True
             elif ev_curr.prev_bar_real_sell:
                 v3_reason = "TREND BİTTİ (KAPAT)"
@@ -312,7 +312,7 @@ def _process_silent_real_v3(
                 res.price,
                 real_trader.max_usd,
                 tp_price=res.price * 1.015,
-                sl_price=res.price * 0.978,
+                sl_price=res.price * 0.975,
                 side="LONG",
                 use_trailing=False,
                 be_trigger_pct=0.0,
@@ -322,8 +322,8 @@ def _process_silent_real_v3(
                 tp1_pct=1.50,
                 fee_buffer_pct=0.15,
                 trail_dist_pct=1.10,
-                close_stop_pct=2.20,
-                hard_stop_pct=2.20,
+                close_stop_pct=2.50,
+                hard_stop_pct=2.50,
             )
             if tex:
                 seen_sigs[sig_key] = int(time.time())

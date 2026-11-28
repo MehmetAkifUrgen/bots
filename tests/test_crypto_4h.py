@@ -696,7 +696,7 @@ class TestBinanceTrader(unittest.TestCase):
         self.assertIsNotNone(ev_v3)
         assert ev_v3 is not None
         self.assertAlmostEqual(ev_v3.next_res, ev_v3.price * 1.015, places=4)
-        self.assertAlmostEqual(ev_v3.prev_sup, ev_v3.price * 0.978, places=4)
+        self.assertAlmostEqual(ev_v3.prev_sup, ev_v3.price * 0.975, places=4)
 
         with tempfile.TemporaryDirectory() as tmp:
             trader = BinanceTrader(
@@ -749,7 +749,7 @@ class TestBinanceTrader(unittest.TestCase):
                 green_trigger=True, orange_trigger=True, exit_trigger=False,
                 exit_reason=None, exit_price=None, exit_trade_pct=None,
                 in_green_pos=True, in_orange_pos=True, be_locked=False,
-                entry_price=100.0, tp_level=101.5, sl_level=97.8, next_res=101.5, prev_sup=97.8,
+                entry_price=100.0, tp_level=101.5, sl_level=97.5, next_res=101.5, prev_sup=97.5,
                 total_trades=40, win_trades=30, win_rate=75.0, total_profit_pct=350.0,
             )
             res_eth = Coin4hResult("ETHUSDT", "papi", 100.0, 4.0, 200_000_000.0, ev_entry, timeframe="4h")
@@ -760,11 +760,11 @@ class TestBinanceTrader(unittest.TestCase):
             pos = trader._state["open_positions"]["ETHUSDT"]
             self.assertTrue(pos["v3_mode"])
             self.assertAlmostEqual(pos["tp_price"], 101.5, places=2)
-            self.assertAlmostEqual(pos["close_sl_price"], 97.8, places=2)
-            self.assertAlmostEqual(pos["sl_price"], 97.8, places=2)  # -2.20% hard stop!
+            self.assertAlmostEqual(pos["close_sl_price"], 97.5, places=2)
+            self.assertAlmostEqual(pos["sl_price"], 97.5, places=2)  # -2.50% hard stop!
 
-            # Dip to 98.5 (-1.5% intrabar) does NOT trigger -2.20% hard stop!
-            self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 98.5})), 0)
+            # Dip to 98.0 (-2.0% intrabar) does NOT trigger -2.50% hard stop!
+            self.assertEqual(len(trader.manage_open_positions({"ETHUSDT": 98.0})), 0)
 
             # Reaching +1.5% (101.5) closes 50% at TP1 and locks trailing SL at 100.3835 (+0.3835%)!
             last_price["p"] = 101.5
@@ -801,14 +801,14 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertNotIn("ETHUSDT", trader._state["open_positions"])
             self.assertIn("TREND BİTTİ (KAPAT)", sent[-1])
 
-            # Hard stop (-2.20% wick) test before TP1
+            # Hard stop (-2.50% wick) test before TP1
             notifier.set_paused(False, trader)
             last_price["p"] = 1.00
             trader.open_position("XRPUSDT", price=1.00, target_usd=200.0, side="LONG", v3_mode=True)
-            last_price["p"] = 0.977
-            hs_evs = trader.manage_open_positions({"XRPUSDT": 0.977})
+            last_price["p"] = 0.974
+            hs_evs = trader.manage_open_positions({"XRPUSDT": 0.974})
             self.assertEqual(len(hs_evs), 1)
-            self.assertEqual(hs_evs[0]["reason"], "ACİL STOP (-%2.20 Fitil)")
+            self.assertEqual(hs_evs[0]["reason"], "ACİL STOP (-%2.50 Fitil)")
 
     def test_resample_1h_to_4h_preserves_true_4h_close_time(self) -> None:
         h1_ms = 3600 * 1000
@@ -1067,7 +1067,7 @@ class TestBinanceTrader(unittest.TestCase):
                 green_trigger=True, orange_trigger=True, exit_trigger=False,
                 exit_reason=None, exit_price=None, exit_trade_pct=None,
                 in_green_pos=True, in_orange_pos=True, be_locked=False,
-                entry_price=100.0, tp_level=101.5, sl_level=97.8, next_res=101.5, prev_sup=97.8,
+                entry_price=100.0, tp_level=101.5, sl_level=97.5, next_res=101.5, prev_sup=97.5,
                 total_trades=20, win_trades=15, win_rate=75.0, total_profit_pct=350.0,
             )
             res = Coin4hResult("SOLUSDT", "papi", 100.0, 2.0, 200_000_000.0, ev_long, timeframe="4h")
@@ -1077,7 +1077,7 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertIn("Giriş Komisyonu (%0.05)", sent[-1])
 
             pos = trader._state["open_positions"]["SOLUSDT"]
-            # With $100 equity, 7.5% risk, 2.2% stop -> risk_notional=$340.9 -> clamped to max_usd=$200.0 (qty=2.0)
+            # With $100 equity, 7.5% risk, 2.5% stop -> risk_notional=$300 -> clamped to max_usd=$200.0 (qty=2.0)
             self.assertAlmostEqual(pos["notional_usd"], 200.0, places=1)
             # Entry fee = $200 * 0.05% = $0.10 deducted from $100.00 -> $99.90
             self.assertAlmostEqual(pos["entry_fee_usd"], 0.10, places=4)
@@ -1437,7 +1437,7 @@ class TestBinanceTrader(unittest.TestCase):
             assert res_1h is not None
             self.assertEqual(res_1h.timeframe, "1h")
             self.assertAlmostEqual(res_1h.evaluation.next_res, res_1h.price * 1.015, places=4)
-            self.assertAlmostEqual(res_1h.evaluation.prev_sup, res_1h.price * 0.978, places=4)
+            self.assertAlmostEqual(res_1h.evaluation.prev_sup, res_1h.price * 0.975, places=4)
 
             res_1h_sig = Coin4hResult("AVAXUSDT", "papi", 10.0, 4.0, 50_000_000.0, ev_v3, timeframe="1h")
             st_1h = notifier.process_4h_alert_only([res_1h_sig], trader=paper_trader, dual_mode=True)
