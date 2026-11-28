@@ -1424,6 +1424,27 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertAlmostEqual(rec_synced["DODOXUSDT"]["initial_qty"], 2404.0, places=1)
             self.assertAlmostEqual(rec_synced["DODOXUSDT"]["sl_price"], 0.0417 * 1.0015, places=6)
 
+            # 7) Verify 1h timeframe scan runs evaluate_futures_v3_system and formats [1S FUTURES v3]
+            x1h = np.linspace(0, 8 * np.pi, 220)
+            df_1h_wave = _make_ohlcv(100.0 + 15.0 * np.sin(x1h))
+            sc.fetch_klines_cached = lambda sym, interval="1h", **kw: df_1h_wave  # type: ignore[method-assign]
+            res_1h = sc._scan_one_4h_bist(
+                {"symbol": "MICROUSDT", "change_24h": 3.5, "volume_24h_usdt": 5000.0},
+                interval="1h",
+                allow_short_scan=False,
+            )
+            self.assertIsNotNone(res_1h)
+            assert res_1h is not None
+            self.assertEqual(res_1h.timeframe, "1h")
+            self.assertAlmostEqual(res_1h.evaluation.next_res, res_1h.price * 1.01, places=4)
+            self.assertAlmostEqual(res_1h.evaluation.prev_sup, res_1h.price * 0.978, places=4)
+
+            res_1h_sig = Coin4hResult("AVAXUSDT", "papi", 10.0, 4.0, 50_000_000.0, ev_v3, timeframe="1h")
+            st_1h = notifier.process_4h_alert_only([res_1h_sig], trader=paper_trader, dual_mode=True)
+            self.assertEqual(st_1h["long"], 1)
+            self.assertIn("[1S FUTURES v3] KESİN LONG (5/5)", telegram_msgs[-1])
+            self.assertIn("1S Backtest", telegram_msgs[-1])
+
 
 if __name__ == "__main__":
     unittest.main()

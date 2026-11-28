@@ -253,7 +253,7 @@ def _process_silent_real_v3(
     except Exception as exc:
         print(f"  [SESSİZ GERÇEK] manage hatası: {exc}")
 
-    # 1) Confirmed 4H bar exits (-2.20% close stop & TREND BİTTİ) even when paused
+    # 1) Confirmed bar exits (-2.20% close stop & TREND BİTTİ) even when paused
     for res in results:
         pos = real_trader._state.get("open_positions", {}).get(res.symbol)
         if not pos or not pos.get("v3_mode"):
@@ -263,10 +263,11 @@ def _process_silent_real_v3(
         tp1_hit = bool(pos.get("tp1_hit", False))
         close_sl_px = float(pos.get("close_sl_price") or 0.0)
         if ev_curr.prev_bar_open_time > entry_bar_ts:
+            tf_s = "1S" if getattr(res, "timeframe", "1h") == "1h" else "4S"
             v3_reason: str | None = None
             v3_stop = False
             if not tp1_hit and close_sl_px > 0 and ev_curr.prev_bar_close < close_sl_px:
-                v3_reason = "STOP (4S Kapanış -%2.20)"
+                v3_reason = f"STOP ({tf_s} Kapanış -%2.20)"
                 v3_stop = True
             elif ev_curr.prev_bar_real_sell:
                 v3_reason = "TREND BİTTİ (KAPAT)"
@@ -507,24 +508,25 @@ def main() -> None:
     long_min_profit = float(os.getenv("LONG_MIN_PROFIT_PCT", "300.0"))
     effective_poll = min(args.poll_seconds, 60)
 
+    scan_interval = os.getenv("V3_TIMEFRAME", "1h").strip().lower()
+    if scan_interval not in ("1h", "4h"):
+        scan_interval = "1h"
+    tf_badge_tr = "1S" if scan_interval == "1h" else "4S"
+
     enable_short = os.getenv("ENABLE_SHORT", "false").strip().lower() in ("1", "true", "yes")
     short_top_n = int(os.getenv("SHORT_TOP_GAINERS", "20")) or 20
     mode_badge = f"SANAL TEST (${paper_balance:g}, Komisyon %{taker_fee_pct:g}x2)" if paper_mode else "GERÇEK BİNANCE"
     trade_mode_str = (
-        f"{mode_badge} (Max {paper_max_pos if paper_mode else args.max_positions} poz, 4S Futures v3: %50 TP1 + %50 Trailing)"
+        f"{mode_badge} (Max {paper_max_pos if paper_mode else args.max_positions} poz, {tf_badge_tr} Futures v3: %50 TP1 + %50 Trailing)"
         if trader
         else "KAPALI (Sadece Bildirim)"
     )
     print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] 4S (4H) Futures v3 Botu başlatıldı | "
+        f"[{datetime.now().strftime('%H:%M:%S')}] {tf_badge_tr} ({scan_interval.upper()}) Futures v3 Botu başlatıldı | "
         f"Piyasa={args.market.upper()} | OtoAlım={trade_mode_str} | "
-        f"LONG=4S 5/5 (WR>=%{long_min_wr:g}, Getiri>=%{long_min_profit:g}, %50 TP1 + %50 Trailing) | "
+        f"LONG={tf_badge_tr} 5/5 (WR>=%{long_min_wr:g}, Getiri>=%{long_min_profit:g}, %50 TP1 + %50 Trailing) | "
         f"SHORT={'AÇIK' if enable_short else 'KAPALI'} | Periyot={effective_poll}sn"
     )
-
-    scan_interval = os.getenv("SCAN_INTERVAL", "4h").strip().lower()
-    if scan_interval not in ("1h", "4h"):
-        scan_interval = "4h"
 
     while True:
         try:
@@ -636,7 +638,7 @@ def main() -> None:
             t_bal = f"${tradifi_trader.get_account_equity():.2f}" if tradifi_trader else "-"
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
-                f"[4S SADECE LONG]{paused_tag} Kripto: {len(results)} ({duration}s, LONG:{long_now}, Kasa:{c_bal}) | "
+                f"[{tf_badge_tr} SADECE LONG]{paused_tag} Kripto: {len(results)} ({duration}s, LONG:{long_now}, Kasa:{c_bal}) | "
                 f"ABD Borsa: {len(tradifi_results)} ({tradifi_dur}s, LONG:{tradifi_long_now}, Kasa:{t_bal}) | "
                 f"Açılan: {stats['orders_opened'] + tradifi_stats['orders_opened']}, "
                 f"Kapanan: {stats['orders_closed'] + tradifi_stats['orders_closed']}"

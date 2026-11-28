@@ -345,42 +345,10 @@ class Binance4hScanner:
         force_15m: bool = False,
     ) -> Coin4hResult | None:
         sym = coin["symbol"]
-        if interval == "1h":
-            df_1h = self.fetch_klines_cached(
-                sym, interval="1h", initial_limit=1500, pages=4, max_rows=5000
-            )
-            df_1m = self.fetch_klines_cached(
-                sym, interval="1M", initial_limit=24, pages=1, max_rows=30
-            )
-            ev_1h = evaluate_4h_system(
-                df_1h, df_1m=df_1m, pivot_len=7, be_trigger_pct=2.5, ema200_filter=False
-            )
-            if ev_1h is None:
-                return None
-            df_4h = resample_1h_to_4h(df_1h)
-            ev_4h = evaluate_4h_system(
-                df_4h, df_1m=df_1m, pivot_len=7, be_trigger_pct=2.5, ema200_filter=False
-            )
-            prev_chg_24h = 0.0
-            if len(df_1h) >= 49:
-                c_48 = float(df_1h["close"].iloc[-49])
-                c_24 = float(df_1h["close"].iloc[-25])
-                if c_48 > 0:
-                    prev_chg_24h = round((c_24 - c_48) / c_48 * 100.0, 2)
-            return Coin4hResult(
-                symbol=sym,
-                market=self.market,
-                price=ev_1h.price,
-                change_24h=round(coin["change_24h"], 2),
-                volume_24h_usdt=round(coin["volume_24h_usdt"], 0),
-                evaluation=ev_1h,
-                timeframe="1h",
-                long_evaluation=ev_4h,
-                prev_change_24h=prev_chg_24h,
-            )
-
+        eff_tf: TimeframeType = "1h" if interval == "1h" else "4h"
+        # limit=999 costs 5 weight (half of limit=1500's 10 weight!) x 5 pages = 4,995 bars (~5000 TV bars)
         df_ohlcv = self.fetch_klines_cached(
-            sym, interval="4h", initial_limit=1500, pages=4, max_rows=5000
+            sym, interval=eff_tf, initial_limit=999, pages=5, max_rows=5000
         )
         ev = evaluate_futures_v3_system(
             df_ohlcv,
@@ -402,11 +370,20 @@ class Binance4hScanner:
             df_1m = self.fetch_klines_cached(
                 sym, interval="1M", initial_limit=36, pages=1, max_rows=48
             )
-            df_1h_short = self.fetch_klines_cached(
-                sym, interval="1h", initial_limit=350, pages=1, max_rows=450
+            df_1h_short = (
+                df_ohlcv.tail(450).reset_index(drop=True)
+                if eff_tf == "1h"
+                else self.fetch_klines_cached(
+                    sym, interval="1h", initial_limit=350, pages=1, max_rows=450
+                )
+            )
+            df_4h_short = (
+                resample_1h_to_4h(df_ohlcv.tail(1000))
+                if eff_tf == "1h"
+                else df_ohlcv
             )
             in_1h_zone, htf_reason = check_1h_short_zone(
-                df_1h_short, df_4h=df_ohlcv, df_1m=df_1m
+                df_1h_short, df_4h=df_4h_short, df_1m=df_1m
             )
 
         short_15m_ev: ShortPeakEvaluation | None = None
@@ -429,7 +406,7 @@ class Binance4hScanner:
             change_24h=round(coin["change_24h"], 2),
             volume_24h_usdt=round(coin["volume_24h_usdt"], 0),
             evaluation=ev,
-            timeframe="4h",
+            timeframe=eff_tf,
             short_15m_evaluation=short_15m_ev,
         )
 

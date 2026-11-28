@@ -121,7 +121,7 @@ def format_managed_close_message(ev_dict: dict) -> str:
             f"<b>{ev_dict.get('cooldown_minutes', 240)} dk</b> yeni işlem açılmayacak."
         )
     side_tag = f" | <b>{ev_dict['side']}</b>" if ev_dict.get("side") else ""
-    tf_badge = ev_dict.get("tf_label") or "4S (4H)"
+    tf_badge = ev_dict.get("tf_label") or "1S (1H)"
     is_paper = bool(ev_dict.get("is_paper"))
     is_partial = bool(ev_dict.get("is_partial"))
     wname = str(ev_dict.get("wallet_name") or "KRİPTO")
@@ -982,12 +982,15 @@ class TelegramNotifier:
                     ev_curr = res.evaluation
                     tp1_hit = bool(pos.get("tp1_hit", False))
                     close_sl_px = float(pos.get("close_sl_price") or 0.0)
-                    # Confirmed 4H bar checks (matching Pine barstate.isconfirmed!)
+                    # Confirmed bar checks (matching Pine barstate.isconfirmed on 1H or 4H!)
                     if ev_curr.prev_bar_open_time > entry_bar_ts:
+                        is_1h_tf = getattr(res, "timeframe", "1h") == "1h"
+                        tf_s = "1S" if is_1h_tf else "4S"
+                        tf_lbl = "1S (1H)" if is_1h_tf else "4S (4H)"
                         v3_reason: str | None = None
                         v3_is_stop = False
                         if not tp1_hit and close_sl_px > 0 and ev_curr.prev_bar_close < close_sl_px:
-                            v3_reason = "STOP (4S Kapanış -%2.20)"
+                            v3_reason = f"STOP ({tf_s} Kapanış -%2.20)"
                             v3_is_stop = True
                         elif ev_curr.prev_bar_real_sell:
                             v3_reason = "TREND BİTTİ (KAPAT)"
@@ -1010,7 +1013,7 @@ class TelegramNotifier:
                                     ev_close = {
                                         "symbol": res.symbol,
                                         "side": "LONG",
-                                        "tf_label": "4S (4H)",
+                                        "tf_label": tf_lbl,
                                         "reason": v3_reason,
                                         "entry_price": float(pos.get("entry_price") or closed.price),
                                         "exit_price": closed.price,
