@@ -932,7 +932,7 @@ class TelegramNotifier:
     def process_4h_alert_only(
         self,
         results: list[Coin4hResult],
-        min_win_rate: float = 67.0,
+        min_win_rate: float = 65.0,
         min_profit_pct: float = 250.0,
         dry_run: bool = False,
         trader: BinanceTrader | None = None,
@@ -941,7 +941,7 @@ class TelegramNotifier:
         long_entry_window_minutes: int | None = None,
         short_entry_window_minutes: int | None = None,
         short_top_gainers: int = 20,
-        long_min_win_rate: float = 67.0,
+        long_min_win_rate: float = 65.0,
         long_min_profit_pct: float = 250.0,
         enable_short: bool = False,
     ) -> dict:

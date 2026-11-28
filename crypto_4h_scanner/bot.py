@@ -72,8 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--min-win-rate",
         type=float,
-        default=float(os.getenv("MIN_WIN_RATE", "67.0")),
-        help="Minimum coin başarı oranı yüzdesi (varsayılan: 67.0)",
+        default=float(os.getenv("MIN_WIN_RATE", "65.0")),
+        help="Minimum coin başarı oranı yüzdesi (varsayılan: 65.0)",
     )
     p.add_argument(
         "--min-profit-pct",
@@ -504,7 +504,7 @@ def main() -> None:
 
     long_window_min = int(os.getenv("LONG_ENTRY_WINDOW_MINUTES", "0"))
     short_window_min = int(os.getenv("SHORT_ENTRY_WINDOW_MINUTES", "15"))
-    long_min_wr = float(os.getenv("LONG_MIN_WIN_RATE", "67.0"))
+    long_min_wr = float(os.getenv("LONG_MIN_WIN_RATE", "65.0"))
     long_min_profit = float(os.getenv("LONG_MIN_PROFIT_PCT", "250.0"))
     effective_poll = min(args.poll_seconds, 60)
 
