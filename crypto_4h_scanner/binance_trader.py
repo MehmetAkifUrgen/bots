@@ -559,12 +559,30 @@ class BinanceTrader:
         effective_lev = min(self.max_leverage, self.leverage)
 
         if self.high_lev_fixed_usd and not self.paper_mode and self._is_um_futures():
-            # Set highest supported leverage on Binance FIRST so small accounts ($18) easily open $100-$150 x 3 slots
+            # Set highest supported leverage on Binance FIRST so small accounts ($19) easily open $100-$150 x 3 slots
             lev_path = "/papi/v1/um/leverage" if self.market == "papi" else "/fapi/v1/leverage"
-            cand_levs = [lv for lv in (75, 50, 40, 30, 25, 20, 15, 10) if lv <= self.max_leverage]
+            brk_path = "/papi/v1/um/leverageBracket" if self.market == "papi" else "/fapi/v1/leverageBracket"
+            cand_levs: list[int] = []
+            try:
+                brk_res = self._signed_request("GET", brk_path, {"symbol": symbol})
+                brk_item = brk_res[0] if isinstance(brk_res, list) and brk_res else brk_res
+                brackets = brk_item.get("brackets", []) if isinstance(brk_item, dict) else []
+                if brackets:
+                    max_sym_lev = max(
+                        int(b.get("initialLeverage") or 0)
+                        for b in brackets
+                        if float(b.get("notionalCap") or 1e9) >= self.max_usd
+                    )
+                    if max_sym_lev > 0:
+                        cand_levs.append(min(self.max_leverage, max_sym_lev))
+            except Exception:
+                pass
+            for lv in (125, 100, 75, 50, 45, 40, 35, 30, 25, 20, 16, 15, 12, 10, 8, 5):
+                if lv <= self.max_leverage and lv not in cand_levs:
+                    cand_levs.append(lv)
             if not cand_levs:
                 cand_levs = [self.max_leverage]
-            actual_lev = effective_lev
+            actual_lev = 0
             for try_lev in cand_levs:
                 try:
                     lev_res = self._signed_request(
@@ -574,21 +592,26 @@ class BinanceTrader:
                     break
                 except Exception:
                     continue
+            if actual_lev <= 0:
+                self.last_reject_reason = f"{symbol} kaldıraç ayarlanamadı."
+                return None
             effective_lev = max(1, actual_lev)
             rem_slots = max(1, self.max_positions - len(all_open_syms))
-            slot_margin = (free_usdt / rem_slots) * 0.90
+            slot_margin = (free_usdt / rem_slots) * 0.92
             slot_notional = slot_margin * effective_lev
-            max_afford = free_usdt * effective_lev * 0.90
-            if max_afford < 20.0:
-                self.last_reject_reason = f"{self.wallet_name} yetersiz serbest marj (${free_usdt:.2f})."
+            max_afford = free_usdt * effective_lev * 0.95
+            # STRICT MIN $100 .. MAX $150: NEVER open $30 or $50 positions!
+            if max_afford < self.min_usd:
+                self.last_reject_reason = (
+                    f"{self.wallet_name} marj min ${self.min_usd:g} için yetersiz "
+                    f"(Serbest: ${free_usdt:.2f}, {effective_lev}x -> Max ${max_afford:.2f})."
+                )
                 return None
             if slot_notional >= self.min_usd:
                 notional = min(self.max_usd, slot_notional)
-            elif max_afford >= self.min_usd:
-                notional = self.min_usd
             else:
-                notional = max_afford
-            effective_min_usd = min(self.min_usd, notional * 0.90)
+                notional = self.min_usd
+            effective_min_usd = self.min_usd
         else:
             if self.risk_per_trade_pct > 0 and est_sl_pct > 0:
                 equity = self.get_account_equity()
@@ -636,12 +659,20 @@ class BinanceTrader:
                 symbol, {"stepSize": 0.001, "minQty": 0.001, "minNotional": 5.0}
             )
             qty = _round_step(notional / price, rules["stepSize"])
+            if self.high_lev_fixed_usd and qty * price < self.min_usd:
+                bumped_qty = _round_step(qty + rules["stepSize"], rules["stepSize"])
+                max_cap = min(self.max_usd, free_usdt * effective_lev * 0.95)
+                if bumped_qty * price <= max_cap * 1.01:
+                    qty = bumped_qty
             if qty < rules["minQty"]:
                 self.last_reject_reason = f"Miktar minQty altında ({qty:g} < {rules['minQty']:g})."
                 return None
             actual_notional = qty * price
-            if actual_notional < effective_min_usd * 0.90 or actual_notional < rules["minNotional"]:
-                self.last_reject_reason = f"Pozisyon tutarı minNotional altında (${actual_notional:.2f})."
+            min_notional_gate = (
+                self.min_usd * 0.98 if self.high_lev_fixed_usd else effective_min_usd * 0.90
+            )
+            if actual_notional < min_notional_gate or actual_notional < rules["minNotional"]:
+                self.last_reject_reason = f"Pozisyon tutarı min sınırın altında (${actual_notional:.2f} < ${min_notional_gate:.2f})."
                 return None
 
         order_side: Literal["BUY", "SELL"] = "BUY" if pos_side == "LONG" else "SELL"
@@ -999,14 +1030,15 @@ class BinanceTrader:
         except Exception:
             return None
 
-    def _is_bot_opened_position(self, symbol: str, pos_side: str) -> bool:
-        """Check Binance recent orders to see if an untracked live position carries our BOT4H_ tag."""
+    def _inspect_bot_position(self, symbol: str, pos_side: str, current_qty: float) -> tuple[bool, bool, float]:
+        """Return (is_bot_opened, tp1_already_hit, initial_qty) from Binance recent orders."""
         entry_order_side = "BUY" if pos_side.upper() == "LONG" else "SELL"
+        exit_order_side = "SELL" if pos_side.upper() == "LONG" else "BUY"
         path = "/papi/v1/um/allOrders" if self.market == "papi" else "/fapi/v1/allOrders"
         try:
             orders = self._signed_request("GET", path, {"symbol": symbol, "limit": 10})
             if not isinstance(orders, list):
-                return False
+                return False, False, current_qty
             matching = [
                 o
                 for o in orders
@@ -1015,11 +1047,30 @@ class BinanceTrader:
                 and not bool(o.get("reduceOnly", False))
             ]
             if not matching:
-                return False
+                return False, False, current_qty
             latest = max(matching, key=lambda o: int(o.get("updateTime") or o.get("time") or 0))
-            return str(latest.get("clientOrderId") or "").startswith(BOT_CLIENT_ID_PREFIX)
+            is_bot = str(latest.get("clientOrderId") or "").startswith(BOT_CLIENT_ID_PREFIX)
+            if not is_bot:
+                return False, False, current_qty
+            entry_ts = int(latest.get("updateTime") or latest.get("time") or 0)
+            entry_qty = float(latest.get("executedQty") or current_qty)
+            partial_exits = [
+                o
+                for o in orders
+                if str(o.get("side", "")).upper() == exit_order_side
+                and float(o.get("executedQty") or 0.0) > 0
+                and bool(o.get("reduceOnly", False))
+                and int(o.get("updateTime") or o.get("time") or 0) >= entry_ts
+            ]
+            tp1_done = bool(partial_exits) or (entry_qty > 0 and current_qty < entry_qty * 0.75)
+            return True, tp1_done, max(current_qty, entry_qty)
         except Exception:
-            return False
+            return False, False, current_qty
+
+    def _is_bot_opened_position(self, symbol: str, pos_side: str) -> bool:
+        """Check Binance recent orders to see if an untracked live position carries our BOT4H_ tag."""
+        is_bot, _, _ = self._inspect_bot_position(symbol, pos_side, 0.0)
+        return is_bot
 
     def sync_live_positions(self) -> dict[str, dict]:
         """
@@ -1071,11 +1122,12 @@ class BinanceTrader:
                 qty = float(lpos.get("qty") or 0.0)
                 if ep <= 0 or qty <= 0:
                     continue
-                if not self._is_bot_opened_position(sym, pos_side):
+                is_bot, tp1_done, init_qty = self._inspect_bot_position(sym, pos_side, qty)
+                if not is_bot:
                     continue
                 is_long = pos_side == "LONG"
                 sl_px = (
-                    ep * 0.97
+                    (ep * 1.0015 if tp1_done else ep * 0.97)
                     if is_long
                     else ep * (1.0 + self.stop_loss_pct / 100.0)
                 )
@@ -1085,9 +1137,9 @@ class BinanceTrader:
                     "order_id": "recovered",
                     "entry_price": ep,
                     "qty": qty,
-                    "initial_qty": qty,
+                    "initial_qty": init_qty,
                     "notional_usd": round(qty * ep, 2),
-                    "initial_notional_usd": round(qty * ep, 2),
+                    "initial_notional_usd": round(init_qty * ep, 2),
                     "sl_price": sl_px,
                     "close_sl_price": ep * 0.978 if is_long else 0.0,
                     "tp_price": ep * 1.01 if is_long else ep * 0.955,
@@ -1096,10 +1148,10 @@ class BinanceTrader:
                     "trailing_active": False,
                     "use_trailing": False,
                     "be_trigger_pct": 0.0 if is_long else 1.5,
-                    "be_locked": False,
+                    "be_locked": bool(is_long and tp1_done),
                     "allow_wide_sl": is_long,
                     "v3_mode": is_long,
-                    "tp1_hit": False,
+                    "tp1_hit": bool(is_long and tp1_done),
                     "tp1_pct": 1.00,
                     "fee_buffer_pct": 0.15,
                     "trail_dist_pct": 1.10,

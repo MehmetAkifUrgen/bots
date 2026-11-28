@@ -1385,6 +1385,45 @@ class TestBinanceTrader(unittest.TestCase):
             self.assertEqual(r_op_tsla, 0)
             self.assertNotIn("TSLAUSDT", real_trader._state["open_positions"])
 
+            # 5) STRICT MIN $100 CHECK: If free margin ($3.50) * coin max lev (10x) = $33.25 (< $100),
+            #    real_trader MUST REJECT and NEVER open a $30 or $50 position!
+            lev_caps["SUIUSDT"] = 10
+            live_wallet["free"] = 3.50
+            rejected_small = real_trader.open_position(
+                "SUIUSDT", price=10.0, target_usd=150.0, side="LONG", v3_mode=True
+            )
+            self.assertIsNone(rejected_small)
+            self.assertIn("yetersiz", real_trader.last_reject_reason)
+            self.assertNotIn("SUIUSDT", real_trader._state["open_positions"])
+
+            # 6) Recovery check: if a BOT4H_ LONG position (like DODOXUSDT) opened $100 (2400 qty)
+            #    and already sold 50% (1200 qty reduceOnly) at TP1, sync_live_positions restores tp1_hit=True!
+            rec_trader = BinanceTrader(
+                api_key="real_k",
+                api_secret="real_s",
+                market="papi",
+                min_usd=100.0,
+                max_usd=150.0,
+                paper_mode=False,
+                high_lev_fixed_usd=True,
+                state_file=Path(tmp) / "rec_state.json",
+            )
+            rec_trader.get_live_open_positions = lambda: {  # type: ignore[method-assign]
+                "DODOXUSDT": {"symbol": "DODOXUSDT", "qty": 1202.0, "entry_price": 0.0417, "side": "LONG"}
+            }
+            rec_trader._signed_request = lambda method, path, params=None: (  # type: ignore[method-assign]
+                [
+                    {"side": "BUY", "executedQty": "2404", "reduceOnly": False, "clientOrderId": "BOT4H_DODOXUSDT_100", "updateTime": 1000},
+                    {"side": "SELL", "executedQty": "1202", "reduceOnly": True, "clientOrderId": "tp1_fill", "updateTime": 2000},
+                ]
+                if path == "/papi/v1/um/allOrders"
+                else {}
+            )
+            rec_synced = rec_trader.sync_live_positions()
+            self.assertTrue(rec_synced["DODOXUSDT"]["tp1_hit"])
+            self.assertAlmostEqual(rec_synced["DODOXUSDT"]["initial_qty"], 2404.0, places=1)
+            self.assertAlmostEqual(rec_synced["DODOXUSDT"]["sl_price"], 0.0417 * 1.0015, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -60,8 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-leverage",
         type=int,
-        default=int(os.getenv("MAX_LEVERAGE", "75")),
-        help="Maksimum kaldıraç tavanı (varsayılan: 75)",
+        default=int(os.getenv("MAX_LEVERAGE", "125")),
+        help="Maksimum kaldıraç tavanı (varsayılan: 125)",
     )
     p.add_argument(
         "--min-volume",
@@ -367,7 +367,7 @@ def main() -> None:
     real_min_usd = float(os.getenv("REAL_MIN_USD", "100.0"))
     real_max_usd = float(os.getenv("REAL_MAX_USD", "150.0"))
     real_max_pos = int(os.getenv("REAL_MAX_POSITIONS", "3"))
-    real_max_lev = int(os.getenv("REAL_MAX_LEVERAGE", "75"))
+    real_max_lev = int(os.getenv("REAL_MAX_LEVERAGE", "125"))
     taker_fee_pct = float(os.getenv("TAKER_FEE_PCT", "0.05"))
     auto_trade_env = os.getenv("AUTO_TRADE", "true").strip().lower() not in ("0", "false", "no")
     api_key = os.getenv("BINANCE_API_KEY", "")
