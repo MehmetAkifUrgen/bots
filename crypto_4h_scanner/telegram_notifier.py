@@ -932,8 +932,8 @@ class TelegramNotifier:
     def process_4h_alert_only(
         self,
         results: list[Coin4hResult],
-        min_win_rate: float = 65.0,
-        min_profit_pct: float = 300.0,
+        min_win_rate: float = 67.0,
+        min_profit_pct: float = 250.0,
         dry_run: bool = False,
         trader: BinanceTrader | None = None,
         dual_mode: bool = True,
@@ -941,8 +941,8 @@ class TelegramNotifier:
         long_entry_window_minutes: int | None = None,
         short_entry_window_minutes: int | None = None,
         short_top_gainers: int = 20,
-        long_min_win_rate: float = 70.0,
-        long_min_profit_pct: float = 300.0,
+        long_min_win_rate: float = 67.0,
+        long_min_profit_pct: float = 250.0,
         enable_short: bool = False,
     ) -> dict:
         """Process 4H signals: LONG on 4H Pine 5/5 (WR>=65%, Profit>=300%, instant), SHORT on 4H 5/5 + EMA200 (last 15m)."""
